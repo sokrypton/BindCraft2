@@ -19,8 +19,18 @@ bash native/build.sh
 ```
 
 Needs the CUDA toolkit (`nvcc`) and a GPU of compute capability 8.0 or newer
-(A100, A10/A40/3090, L4/L40S, H100). The build is one fat binary over all
-four, takes a couple of minutes and produces `libnative_evoformer.so` here.
+(A100, A10/A40/3090, L4/L40S, H100; Blackwell and later via PTX).
+
+**Not Colab's T4, and not a V100.** The whole numeric chain here is bf16 --
+the save-set, the nine residual steps, every GEMM -- and bf16 arithmetic and
+bf16 tensor cores start at Ampere. Turing and Volta have fp16 tensor cores and
+no bf16 at all. Running there would mean a second numeric chain in fp16, whose
+quarter-sized exponent range over 48 blocks is a real overflow risk, or fp32,
+which gives up the tensor cores that make this fast. So those cards run the
+Evoformer on JAX and the run says so.
+
+The build is one fat binary over every supported architecture, takes a couple
+of minutes and produces `libnative_evoformer.so` here.
 
 **The build is optional.** Without `nvcc`, without the headers, or on an older
 card, `build.sh` says so and exits 0, and BindCraft runs the Evoformer on JAX:

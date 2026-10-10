@@ -362,6 +362,12 @@ def use_model(name: str):
 def install_models(model_parameters: dict, depth: int = 48,
                    dropout: bool = False):
     """Install EVERY model in the pool, one weights directory each."""
+    # THE AVAILABILITY CHECK COMES FIRST.  On a card the kernels cannot serve
+    # -- a Colab T4, say -- the only useful line is the one saying so, and
+    # printing a paragraph about dropout masks before it just buries it.
+    if not available():
+        print(f'native: {why_unavailable()}; staying on JAX')
+        return False
     if dropout:
         print('native: dropout ALLOCATED.  The masks come from a counter-based hash '
               'of (seed, depth, module, index), NOT from threefry, so they do '
@@ -369,9 +375,6 @@ def install_models(model_parameters: dict, depth: int = 48,
               'a stock run are comparable in distribution, never step by '
               'step.  Both the seed and the on/off flag are runtime inputs, '
               'so a stage that turns dropout off costs no recompile.')
-    if not available():
-        print(f'native: {why_unavailable()}; staying on JAX')
-        return False
     _register()
     for name, params in model_parameters.items():
         wd = weights_from_params(params, depth=depth)
