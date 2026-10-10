@@ -206,7 +206,7 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
-    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, native_evoformer: bool=True, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
+    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, evoformer_backend: str='auto', dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
         self.target_pad_length = target_pad_length
         self.multi_chain_binders = multi_chain_binders
@@ -215,9 +215,18 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         self.key = jax.random.PRNGKey(0) if key is None else key
         self.dropout = dropout
         # BC2_NATIVE=1 forces it on whatever the settings say, for a dev run
-        # BC2_NATIVE forces either way for a dev run: =1 on, =0 off.
+        # BC2_NATIVE forces either way for a dev run: =1 native, =0 jax.
         _env = os.environ.get('BC2_NATIVE')
-        self.native_evoformer = (_env == '1') if _env is not None else native_evoformer
+        if _env is not None:
+            evoformer_backend = 'native' if _env == '1' else 'jax'
+        if evoformer_backend not in ('auto', 'native', 'jax'):
+            raise ValueError(
+                f'evoformer_backend must be auto, native or jax, not '
+                f'{evoformer_backend!r}')
+        self.evoformer_backend = evoformer_backend
+        # 'native' INSISTS: it is a request, so a card or build that cannot
+        # serve it should say so rather than quietly run something else.
+        self.native_evoformer = evoformer_backend in ('auto', 'native')
         #for the desperation autotuner only
         self.num_recycle = num_recycle
         self.target_flexibility = target_flexibility
@@ -241,8 +250,8 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             if model_parameters is None:
                 raise ValueError(f'no AlphaFold parameters for {model_name!r} in data_dir {data_dir!r}; run "bindcraft fetch-weights" to download them')
             self.model_parameters[model_name] = model_parameters
-        # NATIVE CUDA TRUNK, opt-in via the `native_evoformer` setting (or
-        # BC2_NATIVE=1).  The weights come from
+        # NATIVE CUDA TRUNK, selected by `evoformer_backend` (auto by
+        # default, or native/jax).  The weights come from
         # the param tree just loaded, so no conversion step and no second copy
         # of the weights -- and a checkpoint this repo has never seen works
         # unchanged.  Only the Evoformer is replaced: it is ~99% of a design
@@ -257,7 +266,12 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             # mask scratch.  Whether the masks apply is traced through the
             # batch like stock's, because bindcraft flips it between stages
             # of one trajectory and a static flag would recompile there.
-            native.install_models(self.model_parameters, dropout=bool(dropout))
+            installed = native.install_models(self.model_parameters, dropout=bool(dropout))
+            if not installed and self.evoformer_backend == 'native':
+                raise RuntimeError(
+                    'evoformer_backend=native was asked for but the kernels '
+                    f'cannot run here: {native.why_unavailable()}. Use '
+                    "evoformer_backend=auto to fall back to JAX silently.")
         self.prediction_compile_cache = CompiledModelCache(max_cache_size)
         self.gradient_compile_cache = CompiledModelCache(max_cache_size)
 

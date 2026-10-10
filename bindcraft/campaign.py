@@ -252,9 +252,11 @@ def run_campaign(settings: dict, project_folder: str, af2_weights: str | None=No
     subbatch_size = campaign_subbatch_size(settings, design_residue_count(settings))
     attention_backend = settings.get('attention_backend', 'auto')
     use_cueq = bool(settings.get('use_cueq', False))
-    # ON BY DEFAULT.  Without the built library this degrades to JAX with a
-    # line saying why, so defaulting on costs nothing where it cannot run.
-    native_evoformer = bool(settings.get('native_evoformer', True))
+    # 'auto' (the default) takes the native kernels when this card and this
+    # build can run them and the JAX trunk when they cannot; 'native' insists
+    # and says loudly if it cannot; 'jax' asks for the JAX trunk.  Named like
+    # attention_backend beside it, because it is the same kind of choice.
+    evoformer_backend = str(settings.get('evoformer_backend', 'auto')).lower()
     length_bucket_size = campaign_length_bucket(settings)
     design_settings = build_design_settings(settings)
     if speaks_for_the_campaign():
@@ -262,10 +264,10 @@ def run_campaign(settings: dict, project_folder: str, af2_weights: str | None=No
     target_lengths = {len(protein) for protein in prepare_targets(design_settings, longest_crop=True).values()}
     target_pad_length = padded_prediction_length(max(target_lengths), length_bucket_size) if len(target_lengths) > 1 else 0  #for multitargeting
     multi_chain_binders = (design_settings.binder_chains,) if design_settings.binder.copies > 1 and design_settings.oligomer_tie == 'symmetric' else ()  #for oligomers
-    alphafold_model = AlphaFoldDesignModel(presets=selected_models.design_models, data_dir=af2_weights, max_cache_size=16, num_recycle=settings.get('design_recycles', DEFAULT_SETTINGS['design_recycles']), models=selected_models.design_models, cyclic_offset_mode=resolve_cyclic_offset_mode(settings), subbatch_size=subbatch_size, attention_backend=attention_backend, use_cueq=use_cueq, native_evoformer=native_evoformer, length_bucket_size=length_bucket_size, multi_chain_binders=multi_chain_binders, target_pad_length=target_pad_length, amino_acid_bias=design_settings.binder.amino_acid_bias)
+    alphafold_model = AlphaFoldDesignModel(presets=selected_models.design_models, data_dir=af2_weights, max_cache_size=16, num_recycle=settings.get('design_recycles', DEFAULT_SETTINGS['design_recycles']), models=selected_models.design_models, cyclic_offset_mode=resolve_cyclic_offset_mode(settings), subbatch_size=subbatch_size, attention_backend=attention_backend, use_cueq=use_cueq, evoformer_backend=evoformer_backend, length_bucket_size=length_bucket_size, multi_chain_binders=multi_chain_binders, target_pad_length=target_pad_length, amino_acid_bias=design_settings.binder.amino_acid_bias)
     refuse_predictor_without_distogram(settings, alphafold_model)
     mpnn_model = ProteinMPNNSequenceModel(data_dir=mpnn_weights, max_cache_size=16, model_name=settings.get('mpnn_model', 'v_48_020'), variant=settings.get('mpnn_variant', 'negative'), omitted_amino_acids=design_settings.binder.omitted_amino_acids, amino_acid_bias=design_settings.binder.amino_acid_bias, multi_chain_binders=multi_chain_binders, length_bucket_size=length_bucket_size, target_pad_length=target_pad_length) if mpnn_weights and (not settings.get('trajectory_only')) else None
-    build_validation_model = lambda validation_models: AlphaFoldDesignModel(presets=validation_models, data_dir=af2_weights, max_cache_size=16, num_recycle=settings.get('validation_recycles', 3), cyclic_offset_mode=resolve_cyclic_offset_mode(settings), subbatch_size=subbatch_size, attention_backend=attention_backend, use_cueq=use_cueq, native_evoformer=native_evoformer, length_bucket_size=length_bucket_size, dropout=False, multi_chain_binders=multi_chain_binders, target_pad_length=target_pad_length)
+    build_validation_model = lambda validation_models: AlphaFoldDesignModel(presets=validation_models, data_dir=af2_weights, max_cache_size=16, num_recycle=settings.get('validation_recycles', 3), cyclic_offset_mode=resolve_cyclic_offset_mode(settings), subbatch_size=subbatch_size, attention_backend=attention_backend, use_cueq=use_cueq, evoformer_backend=evoformer_backend, length_bucket_size=length_bucket_size, dropout=False, multi_chain_binders=multi_chain_binders, target_pad_length=target_pad_length)
     validation_model = build_validation_model(selected_models.validation_models) if mpnn_model else None
     if mpnn_model is None and max_trajectories is None:
         max_trajectories = DEFAULT_TRAJECTORY_ONLY_BUDGET
