@@ -15,7 +15,7 @@ BC2 combines sequence optimisation through [AlphaFold 2](https://www.nature.com/
 On Linux, start in a terminal without an active Python or Conda environment:
 
 ```bash
-git clone https://github.com/PacesaLab/BindCraft2.git
+git clone https://github.com/sokrypton/BindCraft2.git
 cd BindCraft2
 bash install.sh
 source .venv/bin/activate
@@ -23,7 +23,27 @@ source .venv/bin/activate
 
 In a new terminal, return to `BindCraft2` and run `source .venv/bin/activate` again. See the [installation and running guide](docs/source/installation.md) for existing environments, older GPUs, clusters, containers and troubleshooting.
 
-The installer also builds the bundled CUDA Evoformer kernels, which roughly halve a design step and are used by default. They need `nvcc` and a compute-8.0+ GPU; without either, the build is skipped and designs run on JAX as before. Pass `--jax` to any command to ask for the JAX trunk. See [the native kernels](native/README.md).
+### The CUDA Evoformer
+
+`install.sh` also builds the bundled CUDA Evoformer kernels, and designs use them by default. They replace the AlphaFold trunk, which is ~99% of a design step, and roughly halve its wall clock:
+
+| complex length | JAX | CUDA kernels | |
+|---|---|---|---|
+| 224 residues | 2306 ms | 1168 ms | **1.97x** |
+| 128 residues | 720 ms | 387 ms | **1.86x** |
+
+*One gradient step, averaged after a warmup, on an A10 with dropout on.*
+
+They need `nvcc` and an **Ampere or newer GPU** (A100, A10/A40/3090, L4/L40S, H100; Blackwell via PTX). **Colab's T4 and V100 cannot run them** — these are bf16 tensor-core kernels and bf16 does not exist before Ampere — so those cards run the Evoformer on JAX and say so at startup. Nothing fails and nothing is slower than it was; they simply do not get the speedup.
+
+The build is optional in every direction: no CUDA toolkit, no GPU, an older card, or a build you skip all end in the same place, which is the JAX trunk. To choose explicitly:
+
+```bash
+bindcraft design examples/pdl1.json --jax              # the JAX trunk
+bindcraft design examples/pdl1.json --set evoformer_backend=native   # insist on the kernels
+```
+
+`evoformer_backend` takes `auto` (the default: kernels where they run, JAX otherwise), `native` (insist, and error with the reason if they cannot) or `jax`. To rebuild the kernels after changing one, run `bash native/build.sh`. See [the native kernels](native/README.md).
 
 ## Run your first design
 
