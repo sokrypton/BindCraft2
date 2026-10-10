@@ -12,6 +12,8 @@ GETTING_STARTED = """BindCraft designs a binder from one settings file:
     python bindcraft.py examples/pdl1_denovo.json
     python bindcraft.py examples/pdl1_denovo.json number_of_final_designs=1 'binder_lengths=[70,90]'
 
+The Evoformer runs on native CUDA kernels by default; pass --jax for the JAX trunk instead.
+
 Any setting of the file is overridden by naming it that way, and examples/README.md lists the
 campaigns that ship with the repository. Settings, losses and filters are in docs/source/reference.md.
 Every other bindcraft command is reached the same way: rank, score, archive, fetch-weights.
@@ -20,6 +22,14 @@ Every other bindcraft command is reached the same way: rank, score, archive, fet
 def setting_assignments(arguments: list[str]) -> list[str]:
     rewritten, preceding = [], ''
     for argument in arguments:
+        # --jax is the one shorthand: the Evoformer runs on the native CUDA
+        # kernels by default, and this asks for the JAX trunk instead (same
+        # model, about 2x slower).  It is exactly native_evoformer=false,
+        # spelled the way someone reaches for it.
+        if argument == '--jax':
+            rewritten += ['--set', 'native_evoformer=false']
+            preceding = argument
+            continue
         overrides = '=' in argument and (not argument.startswith('-')) and (not preceding.startswith('-'))
         rewritten += ['--set', argument] if overrides else [argument]
         preceding = argument

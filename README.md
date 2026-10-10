@@ -23,6 +23,8 @@ source .venv/bin/activate
 
 In a new terminal, return to `BindCraft2` and run `source .venv/bin/activate` again. See the [installation and running guide](docs/source/installation.md) for existing environments, older GPUs, clusters, containers and troubleshooting.
 
+The installer also builds the bundled CUDA Evoformer kernels, which roughly halve a design step and are used by default. They need `nvcc` and a compute-8.0+ GPU; without either, the build is skipped and designs run on JAX as before. Pass `--jax` to any command to ask for the JAX trunk. See [the native kernels](native/README.md).
+
 ## Run your first design
 
 From the repository root, with the environment active:

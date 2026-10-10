@@ -145,6 +145,35 @@ Exit status 0 is a finished campaign, 2 a refusal printed as `campaign refused:`
 | A module, when the console script is not on `PATH` | `python -m bindcraft.cli design examples/pdl1.json` |
 
 
+## The native Evoformer kernels
+
+The Evoformer trunk runs on bundled CUDA kernels rather than JAX, which roughly
+halves a design step: **1.97x** at 224 tokens and **1.86x** at 128, timed one
+gradient step at a time on an A10 with dropout on. It is on by default.
+
+`install.sh` builds them. By hand, with the environment active:
+
+```bash
+bash native/build.sh
+```
+
+This needs `nvcc` and a card of compute capability 8.0 or newer (A100, A10/A40/
+3090, L4/L40S, H100). **The build is optional and never fails an install**: with
+no CUDA toolkit, no card that new, or no `jax.ffi` headers, `build.sh` says so
+and exits, and campaigns run the trunk on JAX exactly as before. A run that
+wanted the kernels and could not find them prints the path it looked for.
+
+To ask for the JAX trunk on a machine that has them:
+
+```bash
+python bindcraft.py mycampaign.json --jax
+```
+
+The kernels compute the same model, with one difference worth knowing: dropout
+masks come from a counter-based hash rather than JAX's threefry, so a native run
+and a `--jax` run are comparable in distribution but never step by step, even
+from the same seed. See `native/README.md`.
+
 ## GPU and memory controls
 
 A campaign uses **every GPU it can see, without being asked**, and packs several design workers onto each card. Nothing needs configuring for this; the settings to override this behaviour are indicated below.

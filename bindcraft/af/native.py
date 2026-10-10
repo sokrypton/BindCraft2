@@ -22,53 +22,92 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-# WHERE THE KERNELS LIVE.  They are not in this repository: the ~23 .cu/.cuh
-# files and the built library belong to ColabDesign2, and vendoring a second
-# copy here would mean two copies to keep in step.  So this searches for a
-# library built there, and says what it tried when it finds none.
+# WHERE THE KERNELS LIVE.  Vendored, in native/ at the repository root, so a
+# clone of this repository is all you need -- `install.sh` builds them and
+# `native/sync.sh` re-copies from ColabDesign2, where they are developed.
 #
-# BC2_NATIVE_LIB overrides everything; otherwise the search is, in order, a
-# ColabDesign2 checkout beside this one, one under $HOME, and one named by
-# $COLABDESIGN2.  Without a hit the native path is simply absent and
-# bindcraft runs on JAX, which is why install() is a no-op rather than an
-# error -- an environment with no GPU library still runs.
+# BC2_NATIVE_LIB overrides.  Otherwise: the vendored build first, then a
+# ColabDesign2 checkout beside this one or under $HOME, which is what a
+# developer working on the kernels has.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))        # the bindcraft checkout
+_LIBNAME = 'libnative_evoformer.so'
 
 
-def _search(name):
+def _candidates():
+    here = [os.path.join(_REPO, 'native', _LIBNAME)]
     roots = []
     if os.environ.get('COLABDESIGN2'):
         roots.append(os.environ['COLABDESIGN2'])
-    roots += [
-        os.path.join(os.path.dirname(_REPO), 'ColabDesign2'),   # beside us
-        os.path.expanduser('~/ColabDesign2'),
-    ]
-    return [os.path.join(r, 'dev', 'native_block', name) for r in roots]
+    roots += [os.path.join(os.path.dirname(_REPO), 'ColabDesign2'),
+              os.path.expanduser('~/ColabDesign2')]
+    return here + [os.path.join(r, 'dev', 'native_block', _LIBNAME)
+                   for r in roots]
 
 
-def _find(env, name):
-    override = os.environ.get(env)
+def _find_lib():
+    override = os.environ.get('BC2_NATIVE_LIB')
     if override:
         return override
-    for candidate in _search(name):
+    for candidate in _candidates():
         if os.path.exists(candidate):
             return candidate
-    return _search(name)[0]        # a path to name in the error message
+    return _candidates()[0]        # the vendored path, for the error message
 
 
-_LIB = _find('BC2_NATIVE_LIB', 'libnative_evoformer.so')
-_WEIGHTS = _find('BC2_NATIVE_WEIGHTS', 'stack_weights')
+_LIB = _find_lib()
+# ONLY the legacy install() path reads weights from disk.  install_models()
+# materialises them from the live param tree, which is what a campaign uses,
+# so a weights directory is NOT a requirement for the native path to work --
+# requiring one here made native unavailable on every machine without the
+# development harness.
+_WEIGHTS = os.environ.get(
+    'BC2_NATIVE_WEIGHTS',
+    os.path.join(os.path.dirname(_REPO), 'ColabDesign2', 'dev', 'native_block',
+                 'stack_weights'))
+
+
+# THE KERNELS DO NOT RUN ON EVERY NVIDIA GPU.  They are bf16 tensor-core and
+# cp.async code, so compute capability 8.0 is the floor: Ampere (A100, A10,
+# A40, 3090), Ada (L4, L40S, 4090) and Hopper (H100, H200) run them; Turing
+# (T4, 2080) and Volta (V100) do not, and neither does anything older.
+#
+# This matters because the native path is the DEFAULT.  A launch on a card the
+# binary has no image for fails with a CUDA error in the middle of a campaign,
+# which is a much worse outcome than running on JAX -- so the card is checked
+# here, before anything is installed, and a card below the floor simply gets
+# the JAX trunk with a line saying why.
+_MIN_CC = (8, 0)
+
+
+def _device_cc():
+    """(major, minor) of the default JAX GPU, or None if there isn't one."""
+    try:
+        import jax
+        d = jax.devices()[0]
+        if d.platform != 'gpu':
+            return None
+        cc = getattr(d, 'compute_capability', None)
+        if cc is None:
+            return None
+        cc = str(cc)
+        return (tuple(int(x) for x in cc.split('.'))[:2] if '.' in cc
+                else (int(cc[:-1]), int(cc[-1])))
+    except Exception:
+        return None                 # a probe must not be the failure
 
 
 def why_unavailable() -> str:
     """One line saying what is missing, for a run that asked for native."""
     if not os.path.exists(_LIB):
-        return (f'no kernel library at {_LIB} (set BC2_NATIVE_LIB, or build '
-                'it in ColabDesign2/dev/native_block -- see its README)')
-    if not os.path.isdir(_WEIGHTS):
-        return f'no weights directory at {_WEIGHTS} (set BC2_NATIVE_WEIGHTS)'
+        return (f'no kernel library at {_LIB} -- build it with '
+                '`bash native/build.sh` (needs nvcc and a compute-8.0+ GPU)')
+    cc = _device_cc()
+    if cc is not None and cc < _MIN_CC:
+        return (f'this GPU is sm_{cc[0]}{cc[1]} and the kernels need '
+                f'sm_{_MIN_CC[0]}{_MIN_CC[1]} or newer (Ampere and later)')
     return ''
+
 
 _registered = False
 
@@ -133,7 +172,7 @@ def weights_from_params(params, out_dir=None, depth=None):
 
 
 def available() -> bool:
-    return os.path.exists(_LIB) and os.path.isdir(_WEIGHTS)
+    return why_unavailable() == ''
 
 
 def _register():
