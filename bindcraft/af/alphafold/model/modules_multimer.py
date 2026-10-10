@@ -61,6 +61,18 @@ def create_extra_msa_feature(batch, num_extra_msa):
   return jnp.concatenate([msa_1hot, has_deletion, deletion_value],
                          axis=-1), extra_msa_mask
 
+# NATIVE KERNELS, opt-in.  bindcraft/af/native.py sets these to callables and
+# the call site below uses them instead of the JAX stack.  Left as None the
+# file behaves exactly as upstream: this is an INSTALL POINT, not a fork.
+#
+# The boundary is the Evoformer's inputs and outputs, because the trunk is
+# ~99% of a design step's runtime (measured: a JAX trunk-only step at L=128
+# costs 1372 ms against 1382 ms for the whole chain).  Heads and losses stay
+# in JAX, where a new loss term is a Python edit rather than a CUDA rebuild.
+NATIVE_EVOFORMER = None
+NATIVE_EXTRA_MSA_STACK = None
+
+
 class AlphaFoldIteration(hk.Module):
   """A single recycling iteration of AlphaFold architecture.
 
@@ -432,7 +444,15 @@ class EmbeddingsAndEvoformer(hk.Module):
         evoformer_output, _ = evoformer_stack((evoformer_input, safe_subkey))
         return evoformer_output
 
-      evoformer_output = run_evoformer(evoformer_input)
+      if NATIVE_EVOFORMER is not None:
+        # eval_shape FIRST so haiku still creates every parameter: the native
+        # path never calls the modules, and without this their weights are
+        # absent from the param tree and the checkpoint will not load.
+        hk.eval_shape(run_evoformer, evoformer_input)
+        evoformer_output = NATIVE_EVOFORMER(
+            evoformer_input, evoformer_masks, int(c.evoformer_num_block))
+      else:
+        evoformer_output = run_evoformer(evoformer_input)
 
       msa_activations = evoformer_output['msa']
       pair_activations = evoformer_output['pair']

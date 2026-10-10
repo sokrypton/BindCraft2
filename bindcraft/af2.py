@@ -237,6 +237,16 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             if model_parameters is None:
                 raise ValueError(f'no AlphaFold parameters for {model_name!r} in data_dir {data_dir!r}; run "bindcraft fetch-weights" to download them')
             self.model_parameters[model_name] = model_parameters
+        # NATIVE CUDA TRUNK, opt-in via BC2_NATIVE=1.  The weights come from
+        # the param tree just loaded, so no conversion step and no second copy
+        # of the weights -- and a checkpoint this repo has never seen works
+        # unchanged.  Only the Evoformer is replaced: it is ~99% of a design
+        # step, while the losses cost 0.18 ms and 2.25 s of compile, so they
+        # stay in JAX where a new term is a Python edit.
+        if os.environ.get('BC2_NATIVE') == '1' and self.model_parameters:
+            from .af import native
+            first = next(iter(self.model_parameters.values()))
+            native.install(params=first)
         self.prediction_compile_cache = CompiledModelCache(max_cache_size)
         self.gradient_compile_cache = CompiledModelCache(max_cache_size)
 
