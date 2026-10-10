@@ -12,7 +12,7 @@ from bindcraft.model_weights import missing_model_weights, model_weights
 COMMANDS = ('design', 'archive', 'unarchive', 'fetch-weights')
 COMMAND_MODULES = {'filter': 'campaign_filter'}
 CAMPAIGN_PRESETS = Path(__file__).parent.parent / 'settings'
-USAGE = '\n'.join(('usage: bindcraft design <settings.json> [--core NAME] [--modality NAME[,NAME]] [--humanize ...] [--metadata <metadata.json>] [--set KEY=VALUE]...',
+USAGE = '\n'.join(('usage: bindcraft design <settings.json> [--core NAME] [--modality NAME[,NAME]] [--humanize ...] [--metadata <metadata.json>] [--jax] [--set KEY=VALUE]...',
                    '       bindcraft design --list-targets | --list-modalities | --list-properties | --list-core | --list-settings',
                    '       bindcraft score <design.cif> [--binder CHAINS] [--target CHAINS] [--hotspots SPANS]',
                    '       bindcraft rank <campaign folder> [--on METRIC] [--list]',
@@ -49,6 +49,12 @@ def split_setting_overrides(arguments: list[str]) -> tuple[list[str], list[str]]
     for argument in arguments:
         if overridden:
             assignments.append(argument)
+        # --jax is the one shorthand: the Evoformer runs on the bundled CUDA
+        # kernels by default, and this asks for the JAX trunk instead (the
+        # same model, about 2x slower).  It is `--set evoformer_backend=jax`,
+        # spelled the way someone reaches for it.
+        elif argument == '--jax':
+            assignments.append('evoformer_backend=jax')
         elif argument != '--set':
             paths.append(argument)
         overridden = argument == '--set'
@@ -69,6 +75,7 @@ DESIGN_HELP = '\n'.join(('usage: bindcraft design <settings.json> [--modality NA
                          '  --core NAME         a core profile applied under every preset, such as benchmark for a reproducible run',
                          '  --modality NAME     the binder format to design, comma separated to combine (default: binder)',
                          '  --set KEY=VALUE     set one setting, over whatever the presets carry; repeat for more',
+                         '  --jax               run the Evoformer on JAX rather than the bundled CUDA kernels',
                          '  --metadata FILE     fields to record with the campaign, which are not settings',
                          '  --list-targets      print the shipped target names alone, one a line',
                          '  --list-modalities   print the modality names alone, one a line',
