@@ -449,8 +449,14 @@ class EmbeddingsAndEvoformer(hk.Module):
         # path never calls the modules, and without this their weights are
         # absent from the param tree and the checkpoint will not load.
         hk.eval_shape(run_evoformer, evoformer_input)
+        # THE SEED COMES FROM AF2'S OWN KEY CHAIN, not from a counter here.
+        # The native stack regenerates its dropout masks from it, so drawing
+        # it off safe_subkey keeps a design run's randomness reproducible
+        # from the model's seed the way stock's is -- it just draws a
+        # different mask from it than threefry would.
         evoformer_output = NATIVE_EVOFORMER(
-            evoformer_input, evoformer_masks, int(c.evoformer_num_block))
+            evoformer_input, evoformer_masks, int(c.evoformer_num_block),
+            jax.random.bits(safe_subkey.get(), (1,), jnp.uint32))
       else:
         evoformer_output = run_evoformer(evoformer_input)
 
