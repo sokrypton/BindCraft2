@@ -401,8 +401,32 @@ class EmbeddingsAndEvoformer(hk.Module):
       extra_evoformer_stack = layer_stack.layer_stack(
           c.extra_msa_stack_num_block)(
               extra_evoformer_fn)
-      extra_evoformer_output, safe_key = extra_evoformer_stack(
-          (extra_evoformer_input, safe_subkey))
+
+      def run_extra(x):
+        out, _ = extra_evoformer_stack((x, safe_subkey))
+        return out
+
+      if NATIVE_EXTRA_MSA_STACK is not None:
+        # Same deal as the trunk: eval_shape first so haiku still creates the
+        # parameters, then the kernels.  Worth taking even though it is four
+        # blocks and not forty-eight -- layer_stack scans them, so XLA compiles
+        # ONE block body either way, forward and reverse, and the reverse is
+        # 70% of this graph's compile.
+        hk.eval_shape(run_extra, extra_evoformer_input)
+        from ...native import supported_length
+        if supported_length(extra_evoformer_input['pair'].shape[0]):
+          extra_evoformer_output = NATIVE_EXTRA_MSA_STACK(
+              extra_evoformer_input, extra_masks,
+              int(c.extra_msa_stack_num_block),
+              jnp.stack([
+                  jax.random.bits(safe_subkey.get(), (), jnp.uint32),
+                  jnp.asarray(batch["use_dropout"], jnp.uint32).reshape(()),
+              ]))
+        else:
+          extra_evoformer_output = run_extra(extra_evoformer_input)
+      else:
+        extra_evoformer_output, safe_key = extra_evoformer_stack(
+            (extra_evoformer_input, safe_subkey))
 
       pair_activations = extra_evoformer_output['pair']
       # Get the size of the MSA before potentially adding templates, so we
