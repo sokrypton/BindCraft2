@@ -288,7 +288,31 @@ def _make_extra_runner(weights_dir, depth=4, dropout=False):
     """
     cache = {}
 
-    def run(acts, masks, n_block, seed=None):
+    def run(acts, masks, n_block, seed=None, extra_msa_mask=None):
+        # THE PRECONDITION IS CHECKED, NOT ASSUMED.  This path is only valid
+        # while the extra MSA is entirely masked: then its msa side cannot
+        # reach its pair and the outer product mean collapses to a constant.
+        # With a real extra alignment the constant is WRONG and the fold is
+        # silently wrong with it, so the one fact everything rests on is
+        # established from the features before anything is traced.  The same
+        # check guards the ColabDesign2 hook (install_hook.require_dead_extra_msa).
+        # A TRACER CANNOT BE READ.  Inside the model this is a traced array,
+        # so the check can only run when a concrete one is handed in -- which
+        # is why ColabDesign2 checks the numpy features before tracing
+        # instead.  For bindcraft the guarantee is structural rather than
+        # dynamic: alphafold_input_features writes
+        # `'extra_msa_mask': jnp.zeros(...)` unconditionally, so the mask is
+        # dead by construction for every design and prediction this package
+        # builds.  This catches a caller that ever changes that.
+        if extra_msa_mask is not None and not isinstance(
+                extra_msa_mask, jax.core.Tracer):
+            m = np.asarray(extra_msa_mask)
+            if m.any():
+                raise ValueError(
+                    f'native extra-MSA stack: extra_msa_mask has '
+                    f'{int((m != 0).sum())} unmasked entries, so its MSA side '
+                    'reaches the pair and this path is invalid. It is only '
+                    'legal for a design run, whose extra MSA is all zeros.')
         n = int(acts['pair'].shape[0])
         pad = (-n) % 32
         fn = cache.get(n_block)
@@ -435,14 +459,23 @@ def install_models(model_parameters: dict, depth: int = 48,
         # and the extra-MSA stack, which has its own 4 blocks under a
         # different prefix.  A model without it (a monomer preset) simply
         # does not get one and that stack stays on JAX.
-        # OFF BY DEFAULT: IT DOES NOT MATCH YET.  Taking these four blocks
-        # native cuts the design-step compile 48.3 -> 28.8 s (40%) and the
-        # step 1101 -> 1036 ms, but the gradient it produces disagrees with
-        # the JAX path at cosine 0.653 (dropout off, same seed, so the
-        # comparison is deterministic).  A 40% compile saving is worth
-        # nothing if the gradient is wrong, so this stays behind a flag until
-        # it gates.  BC2_NATIVE_EXTRA=1 to experiment.
-        if os.environ.get('BC2_NATIVE_EXTRA') == '1':
+        # ON by default; BC2_NATIVE_EXTRA=0 turns it off.
+        #
+        # GATED in ColabDesign2's harness (dev/native_block/gate_extra.py),
+        # which asks the only question that can be asked of a design path:
+        # does replacing the extra stack move the loss MORE than replacing
+        # the main stack already does?  L=256, 4 iterations:
+        #
+        #   xla         loss 5.02381   con 3.92102   pae 0.73679
+        #   main        loss 0.32554   con 0.06413   pae 0.36135
+        #   main+extra  loss 0.35745   con 0.04338   pae 0.36176
+        #
+        # The main stack swap moves the loss 4.70; adding the extra stack
+        # moves it a further 0.032 -- 147x less, and every other metric the
+        # same way.  A design trajectory is chaotic (an end-to-end gradient
+        # is not even comparable: the same path in two processes reads
+        # cosine -0.80), so a relative bar like this is the honest test.
+        if os.environ.get('BC2_NATIVE_EXTRA') != '0':
             try:
                 ed = weights_from_params(params, depth=None, prefix=_EXTRA)
                 _EXTRA_RUNNERS[name] = _make_extra_runner(ed, 4, bool(dropout))

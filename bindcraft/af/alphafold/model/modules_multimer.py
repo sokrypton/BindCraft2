@@ -421,7 +421,10 @@ class EmbeddingsAndEvoformer(hk.Module):
               jnp.stack([
                   jax.random.bits(safe_subkey.get(), (), jnp.uint32),
                   jnp.asarray(batch["use_dropout"], jnp.uint32).reshape(()),
-              ]))
+              ]),
+              # the mask this path's validity rests on, so the runner can
+              # refuse rather than silently substitute the wrong constant
+              extra_msa_mask=batch.get('extra_msa_mask'))
         else:
           extra_evoformer_output = run_extra(extra_evoformer_input)
       else:
