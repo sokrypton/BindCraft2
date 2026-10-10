@@ -120,6 +120,11 @@ _MAIN = 'alphafold/alphafold_iteration/evoformer/evoformer_iteration'
 # the only module it does not share is msa_column_GLOBAL_attention, which the
 # pair-only path never runs.
 _EXTRA = 'alphafold/alphafold_iteration/evoformer/extra_msa_stack'
+# The TEMPLATE pair stack: two 64-channel iterations, its own weights under
+# the template embedding.  Templates are the largest remaining piece of the
+# design step's XLA compile once the extra-MSA stack is native.
+_TPL = ('alphafold/alphafold_iteration/evoformer/template_embedding/'
+        'single_template_embedding/template_embedding_iteration')
 
 
 def weights_from_params(params, out_dir=None, depth=None, prefix=_MAIN):
@@ -190,7 +195,9 @@ def _register():
     # convention: XLA_FFI_DEFINE_HANDLER_SYMBOL(NativeEvoformerFwd, ...)
     # exports exactly `NativeEvoformerFwd`.  Checked with nm, not guessed.
     for target, symbol in (('native_evoformer_fwd', 'NativeEvoformerFwd'),
-                           ('native_evoformer_bwd', 'NativeEvoformerBwd')):
+                           ('native_evoformer_bwd', 'NativeEvoformerBwd'),
+                           ('template_pair_stack_fwd', 'TemplatePairStackFwd'),
+                           ('template_pair_stack_bwd', 'TemplatePairStackBwd')):
         jax.ffi.register_ffi_target(
             target, jax.ffi.pycapsule(getattr(lib, symbol)), platform='CUDA')
     _registered = True
@@ -198,6 +205,7 @@ def _register():
 
 _MODEL_RUNNERS = {}
 _EXTRA_RUNNERS = {}
+_TPL_RUNNERS = {}
 
 
 def supported_length(n: int) -> bool:
@@ -269,6 +277,60 @@ def _make_runner(weights_dir, depth=48, dropout=False):
             p, m = p[:n, :n], m[:, :n]
         return {'pair': p.astype(acts['pair'].dtype),
                 'msa': m.astype(acts['msa'].dtype)}
+
+    return run
+
+
+def _make_tpl_runner(weights_dir, depth=2, dropout=False):
+    """AF2's template pair stack, as two native 64-channel iterations.
+
+    Same shape of win as the extra-MSA stack and for the same reason: two
+    blocks or forty-eight, layer_stack scans them so XLA compiles ONE block
+    body, and 70% of that cost is the reverse pass.
+    """
+    drop = np.int64(1 if dropout else 0)
+
+    def raw(act, mask, seed):
+        n = act.shape[0]
+        out = jax.ffi.ffi_call(
+            'template_pair_stack_fwd',
+            (jax.ShapeDtypeStruct(act.shape, jnp.float32),
+             # the save-set is the INPUT: the backward replays from it rather
+             # than keeping each module's state, see tplstack.cuh
+             jax.ShapeDtypeStruct((n * n * 64,), jnp.bfloat16)),
+            vmap_method='sequential')
+        return out(act, mask, seed, depth=np.int64(depth), dropout=drop,
+                   weights_dir=weights_dir)
+
+    @jax.custom_vjp
+    def stack(act, mask, seed):
+        return raw(act, mask, seed)[0]
+
+    def fwd(act, mask, seed):
+        o, save = raw(act, mask, seed)
+        return o, (mask, save, seed)
+
+    def bwd(res, g):
+        mask, save, seed = res
+        out = jax.ffi.ffi_call(
+            'template_pair_stack_bwd',
+            jax.ShapeDtypeStruct(g.shape, jnp.float32),
+            vmap_method='sequential')
+        dact = out(g, mask, save, seed, depth=np.int64(depth), dropout=drop,
+                   weights_dir=weights_dir)
+        return (dact, jnp.zeros_like(mask),
+                np.zeros(seed.shape, dtype=jax.dtypes.float0))
+
+    stack.defvjp(fwd, bwd)
+
+    def run(act, mask, n_block, seed=None):
+        if int(n_block) != depth:
+            raise ValueError(f'template stack built for depth {depth}, '
+                             f'asked for {int(n_block)}')
+        if seed is None:
+            seed = jnp.zeros((2,), jnp.uint32)
+        return stack(act.astype(jnp.float32), mask.astype(jnp.float32),
+                     seed.astype(jnp.uint32).reshape((2,))).astype(act.dtype)
 
     return run
 
@@ -434,6 +496,7 @@ def use_model(name: str):
             'pool so each model gets its own directory.')
     modules_multimer.NATIVE_EVOFORMER = run
     modules_multimer.NATIVE_EXTRA_MSA_STACK = _EXTRA_RUNNERS.get(name)
+    modules_multimer.NATIVE_TEMPLATE_STACK = _TPL_RUNNERS.get(name)
 
 
 def install_models(model_parameters: dict, depth: int = 48,
@@ -479,6 +542,13 @@ def install_models(model_parameters: dict, depth: int = 48,
             try:
                 ed = weights_from_params(params, depth=None, prefix=_EXTRA)
                 _EXTRA_RUNNERS[name] = _make_extra_runner(ed, 4, bool(dropout))
+            except KeyError:
+                pass
+        # and the template pair stack, two blocks under its own prefix
+        if os.environ.get('BC2_NATIVE_TEMPLATE') == '1':
+            try:
+                td = weights_from_params(params, depth=None, prefix=_TPL)
+                _TPL_RUNNERS[name] = _make_tpl_runner(td, 2, bool(dropout))
             except KeyError:
                 pass
     first = next(iter(model_parameters))

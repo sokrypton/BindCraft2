@@ -71,6 +71,7 @@ def create_extra_msa_feature(batch, num_extra_msa):
 # in JAX, where a new loss term is a Python edit rather than a CUDA rebuild.
 NATIVE_EVOFORMER = None
 NATIVE_EXTRA_MSA_STACK = None
+NATIVE_TEMPLATE_STACK = None
 
 
 class AlphaFoldIteration(hk.Module):
@@ -734,7 +735,28 @@ class SingleTemplateEmbedding(hk.Module):
     template_stack = layer_stack.layer_stack(
         c.template_pair_stack.num_block)(
             template_iteration_fn)
-    act, safe_key = template_stack((act, safe_subkey))
+
+    def run_template(x):
+      out, _ = template_stack((x, safe_subkey))
+      return out
+
+    if NATIVE_TEMPLATE_STACK is not None:
+      # eval_shape first so haiku still creates the parameters, as the trunk
+      # and the extra-MSA stack do.  Templates are the largest remaining
+      # piece of the design step's compile once the extra stack is native.
+      hk.eval_shape(run_template, act)
+      from ...native import supported_length
+      if supported_length(act.shape[0]):
+        act = NATIVE_TEMPLATE_STACK(
+            act, padding_mask_2d, int(c.template_pair_stack.num_block),
+            jnp.stack([
+                jax.random.bits(safe_subkey.get(), (), jnp.uint32),
+                jnp.asarray(use_dropout, jnp.uint32).reshape(()),
+            ]))
+      else:
+        act = run_template(act)
+    else:
+      act, safe_key = template_stack((act, safe_subkey))
 
     act = common_modules.LayerNorm(
         axis=[-1],
