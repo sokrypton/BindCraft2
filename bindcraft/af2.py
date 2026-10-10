@@ -206,7 +206,7 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
-    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, native_evoformer: bool=False, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
+    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, native_evoformer: bool=True, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
         self.target_pad_length = target_pad_length
         self.multi_chain_binders = multi_chain_binders
@@ -215,7 +215,9 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         self.key = jax.random.PRNGKey(0) if key is None else key
         self.dropout = dropout
         # BC2_NATIVE=1 forces it on whatever the settings say, for a dev run
-        self.native_evoformer = native_evoformer or os.environ.get('BC2_NATIVE') == '1'
+        # BC2_NATIVE forces either way for a dev run: =1 on, =0 off.
+        _env = os.environ.get('BC2_NATIVE')
+        self.native_evoformer = (_env == '1') if _env is not None else native_evoformer
         #for the desperation autotuner only
         self.num_recycle = num_recycle
         self.target_flexibility = target_flexibility

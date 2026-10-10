@@ -142,6 +142,15 @@ else
   echo "bindcraft: jax did not start here, which is normal on a login node; check inside your allocation with"
   echo "  python -c 'import jax; print(jax.devices())'"
 fi
+# The native Evoformer kernels, which roughly halve a design step.  Optional
+# by construction: build.sh exits 0 when there is no nvcc, no jax headers or a
+# card older than compute 8.0, and BindCraft then runs the trunk on JAX.  So
+# this never fails an install -- it only ever makes one faster.
+if [[ $accelerator == cuda* ]]; then
+  bash "$(dirname "$0")/native/build.sh" || \
+    echo "bindcraft: the kernel build did not finish; designs will run on JAX" >&2
+fi
+
 echo
 echo "bindcraft: installed, designing on $accelerator."
 [[ -n "${VIRTUAL_ENV:-}${CONDA_PREFIX:-}" ]] || echo "  source .venv/bin/activate            # once per terminal"

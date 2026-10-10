@@ -252,7 +252,9 @@ def run_campaign(settings: dict, project_folder: str, af2_weights: str | None=No
     subbatch_size = campaign_subbatch_size(settings, design_residue_count(settings))
     attention_backend = settings.get('attention_backend', 'auto')
     use_cueq = bool(settings.get('use_cueq', False))
-    native_evoformer = bool(settings.get('native_evoformer', False))
+    # ON BY DEFAULT.  Without the built library this degrades to JAX with a
+    # line saying why, so defaulting on costs nothing where it cannot run.
+    native_evoformer = bool(settings.get('native_evoformer', True))
     length_bucket_size = campaign_length_bucket(settings)
     design_settings = build_design_settings(settings)
     if speaks_for_the_campaign():
