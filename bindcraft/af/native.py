@@ -114,14 +114,7 @@ def _register():
 _MODEL_RUNNERS = {}
 
 
-# Whether the installed stacks carry AF2's Evoformer dropout.  It is a
-# STRUCTURAL choice -- it changes what the stack allocates and is an FFI
-# attribute, so flipping it rebuilds -- while the per-step SEED is a runtime
-# input, so a design loop reseeds for the price of a 4-byte copy.
-_DROPOUT = False
-
-
-def _make_runner(weights_dir, depth=48):
+def _make_runner(weights_dir, depth=48, dropout=False):
     """A hook callable bound to ONE weights directory."""
     cache = {}
 
@@ -135,7 +128,8 @@ def _make_runner(weights_dir, depth=48):
                 'unaligned one faults inside cuBLASLt.')
         fn = cache.get(n_block)
         if fn is None:
-            fn = cache[n_block] = _make_stack(int(n_block), weights_dir)
+            fn = cache[n_block] = _make_stack(int(n_block), weights_dir,
+                                              dropout)
         if seed is None:
             seed = jnp.zeros((2,), jnp.uint32)   # [seed, enabled]
         p, m = fn(acts['pair'].astype(jnp.float32),
@@ -149,7 +143,7 @@ def _make_runner(weights_dir, depth=48):
     return run
 
 
-def _make_stack(depth, weights_dir):
+def _make_stack(depth, weights_dir, dropout=False):
     """Build the custom_vjp for ONE (depth, weights) pair.
 
     depth and weights_dir are CLOSED OVER, not passed: custom_vjp requires
@@ -158,7 +152,13 @@ def _make_stack(depth, weights_dir):
     installed model, not per-call values.
     """
 
-    dropout = np.int64(1 if _DROPOUT else 0)
+    # PER RUNNER, never module-level.  One campaign installs twice -- the
+    # design pool with dropout, the validation pool without -- into the same
+    # registry, and the stacks are built lazily on first trace, i.e. after
+    # both installs.  A global would hand the design pool whichever flag the
+    # LAST install carried, and the stack would quietly compute the rate-0
+    # model while every log line still said dropout was on.
+    dropout = np.int64(1 if dropout else 0)
 
     def raw(pair, msa, pair_mask, msa_mask, seed):
         out = jax.ffi.ffi_call(
@@ -238,8 +238,6 @@ def use_model(name: str):
 def install_models(model_parameters: dict, depth: int = 48,
                    dropout: bool = False):
     """Install EVERY model in the pool, one weights directory each."""
-    global _DROPOUT
-    _DROPOUT = bool(dropout)
     if dropout:
         print('native: dropout ALLOCATED.  The masks come from a counter-based hash '
               'of (seed, depth, module, index), NOT from threefry, so they do '
@@ -253,7 +251,7 @@ def install_models(model_parameters: dict, depth: int = 48,
     _register()
     for name, params in model_parameters.items():
         wd = weights_from_params(params, depth=depth)
-        _MODEL_RUNNERS[name] = _make_runner(wd)
+        _MODEL_RUNNERS[name] = _make_runner(wd, depth, bool(dropout))
     first = next(iter(model_parameters))
     use_model(first)
     print(f'native: installed {len(_MODEL_RUNNERS)} model(s): '
