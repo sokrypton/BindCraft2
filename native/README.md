@@ -38,11 +38,15 @@ the same model, about twice as slow. Nothing fails.
 
 ## Using it
 
-On by default. To turn it off:
+`evoformer_backend` picks the trunk: `auto` (the default) takes these kernels
+where the card and build allow and the JAX trunk otherwise, `native` insists
+and errors if they cannot run here, `jax` asks for the JAX trunk.
+
+To run on JAX:
 
 ```bash
 python bindcraft.py mycampaign.json --jax
-python bindcraft.py mycampaign.json native_evoformer=false   # the same thing
+python bindcraft.py mycampaign.json evoformer_backend=jax    # the same thing
 ```
 
 ## What it is not

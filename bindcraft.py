@@ -24,10 +24,10 @@ def setting_assignments(arguments: list[str]) -> list[str]:
     for argument in arguments:
         # --jax is the one shorthand: the Evoformer runs on the native CUDA
         # kernels by default, and this asks for the JAX trunk instead (same
-        # model, about 2x slower).  It is exactly native_evoformer=false,
+        # model, about 2x slower).  It is exactly evoformer_backend=jax,
         # spelled the way someone reaches for it.
         if argument == '--jax':
-            rewritten += ['--set', 'native_evoformer=false']
+            rewritten += ['--set', 'evoformer_backend=jax']
             preceding = argument
             continue
         overrides = '=' in argument and (not argument.startswith('-')) and (not preceding.startswith('-'))
