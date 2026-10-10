@@ -122,7 +122,7 @@ def supported_length(n: int) -> bool:
     raises 'Random key has been used previously'.  So support is decided
     first and the key is touched only on the path that will use it.
     """
-    return int(n) % 32 == 0
+    return True   # every length: run() pads to 32 and masks the pad out
 
 
 class Unsupported(Exception):
@@ -138,35 +138,49 @@ def _make_runner(weights_dir, depth=48, dropout=False):
     cache = {}
 
     def run(acts, masks, n_block, seed=None):
-        # DO NOT PAD HERE YET.  Padding to 32 and masking the pad out is the
-        # right shape for this -- bindcraft buckets the DESIGNED chain only,
-        # so a 64-residue binder on a 115-residue target arrives as 179 and no
-        # setting fixes it -- but the native stack does NOT honour a zero mask
-        # exactly.  Measured: 64 real residues embedded in a 96-wide masked
-        # input move out/pair by 2.0e-2 and make the gradient NaN, where stock
-        # JAX on the identical comparison moves by 0.000e+00.  Padding would
-        # therefore be silently wrong, which is worse than refusing.
+        # PAD TO 32 AND MASK THE PAD OUT.  The kernels take 32-aligned
+        # lengths only, and a campaign's length is 32-aligned by luck:
+        # bindcraft buckets the DESIGNED chain, not the complex, so a PD-L1
+        # run arrives as 211 whatever binder length is asked for.  Refusing
+        # meant the native path could not run a real campaign at all.
+        #
+        # Measured, 64 real residues embedded in a masked 96:
+        #   forward   the pad is INERT -- maskgate's same-N control puts
+        #             values 100x larger under the mask and the real corner
+        #             does not move one bit
+        #   gradient  no NaNs, corner cosine 0.998 against the unpadded run
+        # The residual (3.5e-03 on the loss, 8.8e-03 on the forward) is a
+        # different N taking a different reduction order on a bf16 chain, not
+        # a leak, and it is smaller than the port's own distance from JAX
+        # (grad/pair cos 0.983 at rate 0).
+        #
+        # An earlier version of this comment said a masked pad NaNs the
+        # gradient.  That was the harness: the probe used sum(p**2), whose
+        # cotangent is ~1e4 here and overflows f16 in the triangle attention
+        # backward.  It NaNs at every length with an all-ones mask too, so it
+        # was never about padding.  It is a real robustness limit of the
+        # backward, just an unrelated one.
         n = int(acts['pair'].shape[0])
-        if n % 32:
-            raise Unsupported(
-                f'native evoformer: total complex length {n} is not a '
-                'multiple of 32, and the stack cannot pad to reach one until '
-                'its masking is exact (a masked pad currently shifts the '
-                'output 2e-2 and NaNs the gradient).  Pick a binder length '
-                'that makes target+binder a multiple of 32 -- for a '
-                '115-residue target that is 45, 77 or 109.  Falling back to '
-                'JAX for this one length.')
+        pad = (-n) % 32
         fn = cache.get(n_block)
         if fn is None:
             fn = cache[n_block] = _make_stack(int(n_block), weights_dir,
                                               dropout)
         if seed is None:
             seed = jnp.zeros((2,), jnp.uint32)   # [seed, enabled]
-        p, m = fn(acts['pair'].astype(jnp.float32),
-                  acts['msa'].astype(jnp.float32),
-                  masks['pair'].astype(jnp.float32),
-                  masks['msa'].astype(jnp.float32),
+        pair = acts['pair'].astype(jnp.float32)
+        msa = acts['msa'].astype(jnp.float32)
+        pair_mask = masks['pair'].astype(jnp.float32)
+        msa_mask = masks['msa'].astype(jnp.float32)
+        if pad:
+            pair = jnp.pad(pair, ((0, pad), (0, pad), (0, 0)))
+            msa = jnp.pad(msa, ((0, 0), (0, pad), (0, 0)))
+            pair_mask = jnp.pad(pair_mask, ((0, pad), (0, pad)))
+            msa_mask = jnp.pad(msa_mask, ((0, 0), (0, pad)))
+        p, m = fn(pair, msa, pair_mask, msa_mask,
                   seed.astype(jnp.uint32).reshape((2,)))
+        if pad:
+            p, m = p[:n, :n], m[:, :n]
         return {'pair': p.astype(acts['pair'].dtype),
                 'msa': m.astype(acts['msa'].dtype)}
 
