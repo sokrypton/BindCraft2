@@ -115,9 +115,14 @@ _registered = False
 # on the SAME paths the checkpoint does, so the two differ only in how the
 # stacked leading axis is spelled.
 _MAIN = 'alphafold/alphafold_iteration/evoformer/evoformer_iteration'
+# The EXTRA-MSA stack is the same EvoformerIteration with its own 4 blocks of
+# weights.  Its pair track is identical to the main stack's in name and shape;
+# the only module it does not share is msa_column_GLOBAL_attention, which the
+# pair-only path never runs.
+_EXTRA = 'alphafold/alphafold_iteration/evoformer/extra_msa_stack'
 
 
-def weights_from_params(params, out_dir=None, depth=None):
+def weights_from_params(params, out_dir=None, depth=None, prefix=_MAIN):
     """Write a native weights manifest from a LIVE haiku param tree.
 
     WHY THIS EXISTS: the stack loads its weights from a directory that
@@ -133,9 +138,9 @@ def weights_from_params(params, out_dir=None, depth=None):
     import hashlib
     import tempfile
 
-    mods = {k: v for k, v in params.items() if k.startswith(_MAIN)}
+    mods = {k: v for k, v in params.items() if k.startswith(prefix)}
     if not mods:
-        raise KeyError(f'no {_MAIN}* in these params')
+        raise KeyError(f'no {prefix}* in these params')
     if depth is None:
         depth = min(int(np.asarray(a).shape[0])
                     for d in mods.values() for a in d.values())
@@ -155,7 +160,7 @@ def weights_from_params(params, out_dir=None, depth=None):
     total = 0
     with open(os.path.join(out, 'manifest.txt'), 'w') as fh:
         for mod in sorted(mods):
-            path = mod[len(_MAIN) + 1:] if len(mod) > len(_MAIN) else ''
+            path = mod[len(prefix) + 1:] if len(mod) > len(prefix) else ''
             for pname in sorted(mods[mod]):
                 w = np.asarray(mods[mod][pname], np.float32)
                 for b in range(depth):
@@ -192,6 +197,7 @@ def _register():
 
 
 _MODEL_RUNNERS = {}
+_EXTRA_RUNNERS = {}
 
 
 def supported_length(n: int) -> bool:
@@ -267,7 +273,48 @@ def _make_runner(weights_dir, depth=48, dropout=False):
     return run
 
 
-def _make_stack(depth, weights_dir, dropout=False):
+def _make_extra_runner(weights_dir, depth=4, dropout=False):
+    """The extra-MSA stack, pair-only.
+
+    Four blocks of the same triangle ops as the main trunk, and in XLA they
+    cost about what the 48-block trunk would: layer_stack scans them, so the
+    compiler sees ONE block body either way, forward and reverse.  Taking them
+    native removes that body from the graph.
+
+    The caller discards this stack's msa output (modules_multimer keeps only
+    `extra_evoformer_output['pair']`), and its msa side cannot reach its pair
+    because bindcraft's extra_msa_mask is all zeros -- so a dummy msa goes in
+    and whatever comes back is handed straight back unused.
+    """
+    cache = {}
+
+    def run(acts, masks, n_block, seed=None):
+        n = int(acts['pair'].shape[0])
+        pad = (-n) % 32
+        fn = cache.get(n_block)
+        if fn is None:
+            fn = cache[n_block] = _make_stack(int(n_block), weights_dir,
+                                              dropout, pair_only=True)
+        if seed is None:
+            seed = jnp.zeros((2,), jnp.uint32)
+        pair = acts['pair'].astype(jnp.float32)
+        pair_mask = masks['pair'].astype(jnp.float32)
+        if pad:
+            pair = jnp.pad(pair, ((0, pad), (0, pad), (0, 0)))
+            pair_mask = jnp.pad(pair_mask, ((0, pad), (0, pad)))
+        # the stack's msa inputs are read but cannot affect the pair here
+        dummy_msa = jnp.zeros((1, pair.shape[0], 256), jnp.float32)
+        dummy_mask = jnp.zeros((1, pair.shape[0]), jnp.float32)
+        p, _ = fn(pair, dummy_msa, pair_mask, dummy_mask,
+                  seed.astype(jnp.uint32).reshape((2,)))
+        if pad:
+            p = p[:n, :n]
+        return {'pair': p.astype(acts['pair'].dtype), 'msa': acts['msa']}
+
+    return run
+
+
+def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
     """Build the custom_vjp for ONE (depth, weights) pair.
 
     depth and weights_dir are CLOSED OVER, not passed: custom_vjp requires
@@ -283,6 +330,11 @@ def _make_stack(depth, weights_dir, dropout=False):
     # LAST install carried, and the stack would quietly compute the rate-0
     # model while every log line still said dropout was on.
     dropout = np.int64(1 if dropout else 0)
+    # PAIR-ONLY is how the extra-MSA stack runs: its msa side cannot reach
+    # its pair (extra_msa_mask is all zeros in design), so the four MSA
+    # modules are skipped and the outer product mean collapses to a
+    # constant.  See the comment in block.cuh.
+    pair_only = np.int64(1 if pair_only else 0)
 
     def raw(pair, msa, pair_mask, msa_mask, seed):
         out = jax.ffi.ffi_call(
@@ -294,7 +346,7 @@ def _make_stack(depth, weights_dir, dropout=False):
             vmap_method='sequential')
         return out(pair, msa, pair_mask, msa_mask, seed,
                    depth=np.int64(depth), save=np.int64(1),
-                   pair_only=np.int64(0), own_save=np.int64(0),
+                   pair_only=pair_only, own_save=np.int64(0),
                    opm_first=np.int64(1), dropout=dropout,
                    weights_dir=weights_dir)
 
@@ -323,7 +375,7 @@ def _make_stack(depth, weights_dir, dropout=False):
              jax.ShapeDtypeStruct(gm.shape, jnp.float32)),
             vmap_method='sequential')
         dpair, dmsa = out(gp, gm, pair_mask, msa_mask, psave, msave, seed,
-                          depth=np.int64(depth), pair_only=np.int64(0),
+                          depth=np.int64(depth), pair_only=pair_only,
                           own_save=np.int64(0), opm_first=np.int64(1),
                           dropout=dropout, weights_dir=weights_dir)
         # ONE COTANGENT PER PRIMAL ARGUMENT.  The primal takes four
@@ -357,6 +409,7 @@ def use_model(name: str):
             f'have {sorted(_MODEL_RUNNERS)}. install_models() takes the whole '
             'pool so each model gets its own directory.')
     modules_multimer.NATIVE_EVOFORMER = run
+    modules_multimer.NATIVE_EXTRA_MSA_STACK = _EXTRA_RUNNERS.get(name)
 
 
 def install_models(model_parameters: dict, depth: int = 48,
@@ -379,6 +432,22 @@ def install_models(model_parameters: dict, depth: int = 48,
     for name, params in model_parameters.items():
         wd = weights_from_params(params, depth=depth)
         _MODEL_RUNNERS[name] = _make_runner(wd, depth, bool(dropout))
+        # and the extra-MSA stack, which has its own 4 blocks under a
+        # different prefix.  A model without it (a monomer preset) simply
+        # does not get one and that stack stays on JAX.
+        # OFF BY DEFAULT: IT DOES NOT MATCH YET.  Taking these four blocks
+        # native cuts the design-step compile 48.3 -> 28.8 s (40%) and the
+        # step 1101 -> 1036 ms, but the gradient it produces disagrees with
+        # the JAX path at cosine 0.653 (dropout off, same seed, so the
+        # comparison is deterministic).  A 40% compile saving is worth
+        # nothing if the gradient is wrong, so this stays behind a flag until
+        # it gates.  BC2_NATIVE_EXTRA=1 to experiment.
+        if os.environ.get('BC2_NATIVE_EXTRA') == '1':
+            try:
+                ed = weights_from_params(params, depth=None, prefix=_EXTRA)
+                _EXTRA_RUNNERS[name] = _make_extra_runner(ed, 4, bool(dropout))
+            except KeyError:
+                pass
     first = next(iter(model_parameters))
     use_model(first)
     print(f'native: installed {len(_MODEL_RUNNERS)} model(s): '
