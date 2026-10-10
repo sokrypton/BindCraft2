@@ -477,6 +477,7 @@ A sweep needs `max_trajectories`, divides its budget between arms, and disables 
 | `subbatch_size` | `auto` | Split large calculations to reduce memory; an integer fixes the chunk size, `null` disables chunking. |
 | `attention_backend` | `auto` | Choose attention implementation; leave automatic unless diagnosing performance. |
 | `use_cueq` | false | Enable optional cuEquivariance kernels when installed. |
+| `native_evoformer` | false | Run the Evoformer trunk on the native CUDA kernels instead of JAX. Needs a ColabDesign2 checkout with `dev/native_block/libnative_evoformer.so` built; without one the run says why and stays on JAX. |
 | `auto_multi_gpu` | true | Use the visible GPU allocation automatically; false keeps a single process. |
 | `workers_per_gpu`, `max_workers_per_gpu` | `auto`, 8 | Set or cap concurrent design workers per card. |
 | `design_workers` | Unset | Cap total workers across the allocation. |
