@@ -449,21 +449,33 @@ class EmbeddingsAndEvoformer(hk.Module):
         # path never calls the modules, and without this their weights are
         # absent from the param tree and the checkpoint will not load.
         hk.eval_shape(run_evoformer, evoformer_input)
-        # THE SEED COMES FROM AF2'S OWN KEY CHAIN, not from a counter here.
-        # The native stack regenerates its dropout masks from it, so drawing
-        # it off safe_subkey keeps a design run's randomness reproducible
-        # from the model's seed the way stock's is -- it just draws a
-        # different mask from it than threefry would.
-        evoformer_output = NATIVE_EVOFORMER(
-            evoformer_input, evoformer_masks, int(c.evoformer_num_block),
-            # [seed, enabled].  `use_dropout` is TRACED -- bindcraft flips it
-            # between stages of one trajectory -- so it has to cross as a
-            # value, not as a static flag that would recompile the stack at
-            # every stage boundary.
-            jnp.stack([
-                jax.random.bits(safe_subkey.get(), (), jnp.uint32),
-                jnp.asarray(batch["use_dropout"], jnp.uint32).reshape(()),
-            ]))
+        from ...native import supported_length
+        # DECIDE SUPPORT BEFORE DRAWING THE SEED.  The kernels take 32-aligned
+        # lengths only, and a campaign hits several lengths (the complex, the
+        # binder alone, the validation fold), so one unsupported length used
+        # to kill the whole run.  The check is at TRACE time, once per
+        # compiled function, and it has to come first: drawing the seed
+        # consumes safe_subkey, and the JAX fallback cannot be handed a key
+        # that has already been used.
+        if supported_length(evoformer_input['pair'].shape[0]):
+          # THE SEED COMES FROM AF2'S OWN KEY CHAIN, not from a counter here,
+          # so a design run stays reproducible from the model's seed -- it
+          # just draws a different mask from it than threefry would.
+          evoformer_output = NATIVE_EVOFORMER(
+              evoformer_input, evoformer_masks, int(c.evoformer_num_block),
+              # [seed, enabled].  `use_dropout` is TRACED -- bindcraft flips
+              # it between stages of one trajectory -- so it crosses as a
+              # value, not as a static flag that would recompile the stack at
+              # every stage boundary.
+              jnp.stack([
+                  jax.random.bits(safe_subkey.get(), (), jnp.uint32),
+                  jnp.asarray(batch["use_dropout"], jnp.uint32).reshape(()),
+              ]))
+        else:
+          print(f'native: complex length '
+                f'{evoformer_input["pair"].shape[0]} is not a multiple of 32; '
+                'this one length runs on JAX', flush=True)
+          evoformer_output = run_evoformer(evoformer_input)
       else:
         evoformer_output = run_evoformer(evoformer_input)
 
