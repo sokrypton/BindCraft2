@@ -206,7 +206,7 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
-    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
+    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, native_evoformer: bool=False, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
         self.target_pad_length = target_pad_length
         self.multi_chain_binders = multi_chain_binders
@@ -214,6 +214,8 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         self.models = self.presets if models is None else tuple(models)
         self.key = jax.random.PRNGKey(0) if key is None else key
         self.dropout = dropout
+        # BC2_NATIVE=1 forces it on whatever the settings say, for a dev run
+        self.native_evoformer = native_evoformer or os.environ.get('BC2_NATIVE') == '1'
         #for the desperation autotuner only
         self.num_recycle = num_recycle
         self.target_flexibility = target_flexibility
@@ -237,13 +239,14 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             if model_parameters is None:
                 raise ValueError(f'no AlphaFold parameters for {model_name!r} in data_dir {data_dir!r}; run "bindcraft fetch-weights" to download them')
             self.model_parameters[model_name] = model_parameters
-        # NATIVE CUDA TRUNK, opt-in via BC2_NATIVE=1.  The weights come from
+        # NATIVE CUDA TRUNK, opt-in via the `native_evoformer` setting (or
+        # BC2_NATIVE=1).  The weights come from
         # the param tree just loaded, so no conversion step and no second copy
         # of the weights -- and a checkpoint this repo has never seen works
         # unchanged.  Only the Evoformer is replaced: it is ~99% of a design
         # step, while the losses cost 0.18 ms and 2.25 s of compile, so they
         # stay in JAX where a new term is a Python edit.
-        if os.environ.get('BC2_NATIVE') == '1' and self.model_parameters:
+        if self.native_evoformer and self.model_parameters:
             from .af import native
             # EVERY model in the pool gets its own weights, because
             # _sample_design_model picks one per step and a single installed
@@ -415,7 +418,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         reference_templates = {state_name: concatenate_chain_arrays(state_chain_names, reference_states[state_name], 'atoms', 'atom_mask', 'flags', 'residue_index') for state_name, state_chain_names, _ in reference_shapes}
         weights = {name: jnp.asarray(entry.weight, dtype=jnp.float32) for name, entry in losses.items()}
         frozen_interfaces = frozen_interface_arguments(losses, shared_chains)
-        if os.environ.get('BC2_NATIVE') == '1':
+        if self.native_evoformer:
             from .af import native
             native.use_model(model)   # bind THIS model's weights before tracing
         compiled_sequence_gradients = self._compiled_sequence_gradients(model, complex_shapes, reference_shapes, losses)

@@ -22,12 +22,53 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-_LIB = os.environ.get(
-    'BC2_NATIVE_LIB',
-    '/home/ubuntu/ColabDesign2/dev/native_block/libnative_evoformer.so')
-_WEIGHTS = os.environ.get(
-    'BC2_NATIVE_WEIGHTS',
-    '/home/ubuntu/ColabDesign2/dev/native_block/stack_weights')
+# WHERE THE KERNELS LIVE.  They are not in this repository: the ~23 .cu/.cuh
+# files and the built library belong to ColabDesign2, and vendoring a second
+# copy here would mean two copies to keep in step.  So this searches for a
+# library built there, and says what it tried when it finds none.
+#
+# BC2_NATIVE_LIB overrides everything; otherwise the search is, in order, a
+# ColabDesign2 checkout beside this one, one under $HOME, and one named by
+# $COLABDESIGN2.  Without a hit the native path is simply absent and
+# bindcraft runs on JAX, which is why install() is a no-op rather than an
+# error -- an environment with no GPU library still runs.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(os.path.dirname(_HERE))        # the bindcraft checkout
+
+
+def _search(name):
+    roots = []
+    if os.environ.get('COLABDESIGN2'):
+        roots.append(os.environ['COLABDESIGN2'])
+    roots += [
+        os.path.join(os.path.dirname(_REPO), 'ColabDesign2'),   # beside us
+        os.path.expanduser('~/ColabDesign2'),
+    ]
+    return [os.path.join(r, 'dev', 'native_block', name) for r in roots]
+
+
+def _find(env, name):
+    override = os.environ.get(env)
+    if override:
+        return override
+    for candidate in _search(name):
+        if os.path.exists(candidate):
+            return candidate
+    return _search(name)[0]        # a path to name in the error message
+
+
+_LIB = _find('BC2_NATIVE_LIB', 'libnative_evoformer.so')
+_WEIGHTS = _find('BC2_NATIVE_WEIGHTS', 'stack_weights')
+
+
+def why_unavailable() -> str:
+    """One line saying what is missing, for a run that asked for native."""
+    if not os.path.exists(_LIB):
+        return (f'no kernel library at {_LIB} (set BC2_NATIVE_LIB, or build '
+                'it in ColabDesign2/dev/native_block -- see its README)')
+    if not os.path.isdir(_WEIGHTS):
+        return f'no weights directory at {_WEIGHTS} (set BC2_NATIVE_WEIGHTS)'
+    return ''
 
 _registered = False
 
@@ -290,7 +331,7 @@ def install_models(model_parameters: dict, depth: int = 48,
               'step.  Both the seed and the on/off flag are runtime inputs, '
               'so a stage that turns dropout off costs no recompile.')
     if not available():
-        print('native: library missing, staying on JAX')
+        print(f'native: {why_unavailable()}; staying on JAX')
         return False
     _register()
     for name, params in model_parameters.items():
