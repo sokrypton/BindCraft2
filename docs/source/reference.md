@@ -477,7 +477,7 @@ A sweep needs `max_trajectories`, divides its budget between arms, and disables 
 | `subbatch_size` | `auto` | Split large calculations to reduce memory; an integer fixes the chunk size, `null` disables chunking. |
 | `attention_backend` | `auto` | Choose attention implementation; leave automatic unless diagnosing performance. |
 | `use_cueq` | false | Enable optional cuEquivariance kernels when installed. |
-| `evoformer_backend` | auto | Which Evoformer trunk to run: `auto` takes the bundled CUDA kernels where the card and build allow and the JAX trunk otherwise, `native` insists on the kernels and errors if they cannot run here, `jax` asks for the JAX trunk. The kernels are ~2x faster (1.97x at 224 tokens, 1.86x at 128) and need an Ampere or newer GPU. `--jax` on the command line is `evoformer_backend=jax`. |
+| `evoformer_backend` | auto | Which Evoformer trunk to run: `auto` takes the bundled CUDA kernels where the card and build allow and the JAX trunk otherwise, `native` insists on the kernels and errors if they cannot run here, `jax` asks for the JAX trunk. The kernels are ~2x faster per step and cut the first step's compile from 55 s to 21 s at 224 tokens; they need an Ampere or newer GPU. `--jax` on the command line is `evoformer_backend=jax`. |
 | `auto_multi_gpu` | true | Use the visible GPU allocation automatically; false keeps a single process. |
 | `workers_per_gpu`, `max_workers_per_gpu` | `auto`, 8 | Set or cap concurrent design workers per card. |
 | `design_workers` | Unset | Cap total workers across the allocation. |

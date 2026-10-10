@@ -34,6 +34,10 @@ In a new terminal, return to `BindCraft2` and run `source .venv/bin/activate` ag
 
 *One gradient step, averaged after a warmup, on an A10 with dropout on.*
 
+They also cut the wait before the first step, by taking the extra-MSA and
+template stacks out of XLA as well: **55.4 s to 21.0 s** at 224 residues, of
+which the compile itself is 48.3 s to 15.8 s.
+
 They need `nvcc` and an **Ampere or newer GPU** (A100, A10/A40/3090, L4/L40S, H100; Blackwell via PTX). **Colab's T4 and V100 cannot run them** — these are bf16 tensor-core kernels and bf16 does not exist before Ampere — so those cards run the Evoformer on JAX and say so at startup. Nothing fails and nothing is slower than it was; they simply do not get the speedup.
 
 The build is optional in every direction: no CUDA toolkit, no GPU, an older card, or a build you skip all end in the same place, which is the JAX trunk. To choose explicitly:

@@ -147,9 +147,25 @@ Exit status 0 is a finished campaign, 2 a refusal printed as `campaign refused:`
 
 ## The native Evoformer kernels
 
-The Evoformer trunk runs on bundled CUDA kernels rather than JAX, which roughly
-halves a design step: **1.97x** at 224 tokens and **1.86x** at 128, timed one
-gradient step at a time on an A10 with dropout on. It is on by default.
+The Evoformer trunk, the extra-MSA stack and the template pair stack all run
+on bundled CUDA kernels rather than JAX. It is on by default, and it buys two
+different things:
+
+**Every step is faster** — **1.97x** at 224 tokens, **1.86x** at 128, timed one
+gradient step at a time on an A10 with dropout on.
+
+**The wait before the first step is much shorter.** AlphaFold's trunk is a
+48-block scan, and XLA compiles one block body whether a stack has 2 blocks or
+48 — with the reverse pass, which is 70% of that cost. Moving those stacks out
+of XLA removes their compile entirely:
+
+| | first gradient step | of which XLA |
+|---|---|---|
+| JAX | 55.4 s | 48.3 s |
+| + native trunk and extra-MSA stack | 34.9 s | 28.9 s |
+| + native template stack | **21.0 s** | **15.8 s** |
+
+*L=224 on an A10. A campaign pays this once per length it designs at.*
 
 `install.sh` builds them. By hand, with the environment active:
 

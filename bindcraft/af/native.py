@@ -544,8 +544,24 @@ def install_models(model_parameters: dict, depth: int = 48,
                 _EXTRA_RUNNERS[name] = _make_extra_runner(ed, 4, bool(dropout))
             except KeyError:
                 pass
-        # and the template pair stack, two blocks under its own prefix
-        if os.environ.get('BC2_NATIVE_TEMPLATE') == '1':
+        # and the template pair stack, two blocks under its own prefix.
+        # ON by default; BC2_NATIVE_TEMPLATE=0 turns it off.
+        #
+        # Judged on the bar gate_extra.py sets and the extra-MSA stack was
+        # enabled on: does replacing this move the loss MORE than replacing
+        # the main stack already does?  L=224, dropout off, one process each:
+        #
+        #   all XLA                        loss 3.987596
+        #   native trunk, templates JAX    loss 4.006162 / 4.007646 / 4.007384
+        #   native trunk + native templates     4.015828
+        #
+        # The same configuration in two processes differs by 2.6e-04, so that
+        # is the floor.  The main stack swap moves the loss 1.85e-02; adding
+        # the template stack moves it a further 8.7e-03 -- about half, and it
+        # also has what the extra-MSA stack never had: a module-level gate
+        # against a JAX oracle on the real checkpoint (tplblock, fwd
+        # 0.999952 / bwd 0.997982).
+        if os.environ.get('BC2_NATIVE_TEMPLATE') != '0':
             try:
                 td = weights_from_params(params, depth=None, prefix=_TPL)
                 _TPL_RUNNERS[name] = _make_tpl_runner(td, 2, bool(dropout))
