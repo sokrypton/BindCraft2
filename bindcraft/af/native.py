@@ -111,6 +111,44 @@ def _register():
     _registered = True
 
 
+_MODEL_RUNNERS = {}
+
+
+# Whether the installed stacks carry AF2's Evoformer dropout.  It is a
+# STRUCTURAL choice -- it changes what the stack allocates and is an FFI
+# attribute, so flipping it rebuilds -- while the per-step SEED is a runtime
+# input, so a design loop reseeds for the price of a 4-byte copy.
+_DROPOUT = False
+
+
+def _make_runner(weights_dir, depth=48):
+    """A hook callable bound to ONE weights directory."""
+    cache = {}
+
+    def run(acts, masks, n_block, seed=None):
+        n = int(acts['pair'].shape[0])
+        if n % 32:
+            raise ValueError(
+                f'native evoformer: length {n} is not a multiple of 32. '
+                'Use length_bucket_size=32 (the default) or pad; the kernels '
+                'have only ever been gated on 32-aligned lengths and an '
+                'unaligned one faults inside cuBLASLt.')
+        fn = cache.get(n_block)
+        if fn is None:
+            fn = cache[n_block] = _make_stack(int(n_block), weights_dir)
+        if seed is None:
+            seed = jnp.zeros((1,), jnp.uint32)
+        p, m = fn(acts['pair'].astype(jnp.float32),
+                  acts['msa'].astype(jnp.float32),
+                  masks['pair'].astype(jnp.float32),
+                  masks['msa'].astype(jnp.float32),
+                  seed.astype(jnp.uint32).reshape((1,)))
+        return {'pair': p.astype(acts['pair'].dtype),
+                'msa': m.astype(acts['msa'].dtype)}
+
+    return run
+
+
 def _make_stack(depth, weights_dir):
     """Build the custom_vjp for ONE (depth, weights) pair.
 
@@ -120,7 +158,9 @@ def _make_stack(depth, weights_dir):
     installed model, not per-call values.
     """
 
-    def raw(pair, msa, pair_mask, msa_mask):
+    dropout = np.int64(1 if _DROPOUT else 0)
+
+    def raw(pair, msa, pair_mask, msa_mask, seed):
         out = jax.ffi.ffi_call(
             'native_evoformer_fwd',
             (jax.ShapeDtypeStruct(pair.shape, jnp.float32),
@@ -128,38 +168,96 @@ def _make_stack(depth, weights_dir):
              jax.ShapeDtypeStruct((depth,) + pair.shape, jnp.bfloat16),
              jax.ShapeDtypeStruct((depth,) + msa.shape, jnp.float32)),
             vmap_method='sequential')
-        return out(pair, msa, pair_mask, msa_mask,
+        return out(pair, msa, pair_mask, msa_mask, seed,
                    depth=np.int64(depth), save=np.int64(1),
                    pair_only=np.int64(0), own_save=np.int64(0),
-                   opm_first=np.int64(1), weights_dir=weights_dir)
+                   opm_first=np.int64(1), dropout=dropout,
+                   weights_dir=weights_dir)
 
     @jax.custom_vjp
-    def stack(pair, msa, pair_mask, msa_mask):
-        p, m, _, _ = raw(pair, msa, pair_mask, msa_mask)
+    def stack(pair, msa, pair_mask, msa_mask, seed):
+        p, m, _, _ = raw(pair, msa, pair_mask, msa_mask, seed)
         return p, m
 
-    def fwd(pair, msa, pair_mask, msa_mask):
-        p, m, psave, msave = raw(pair, msa, pair_mask, msa_mask)
+    def fwd(pair, msa, pair_mask, msa_mask, seed):
+        p, m, psave, msave = raw(pair, msa, pair_mask, msa_mask, seed)
         # THE SAVE-SET CROSSES AS A REAL VALUE, not as state held inside the
         # stack.  JAX dispatches asynchronously, so a second forward can
         # overtake the first backward -- a wrong gradient rather than an error.
-        return (p, m), (pair_mask, msa_mask, psave, msave)
+        # THE SEED CROSSES TOO.  The backward regenerates the masks rather
+        # than storing them, so it must be handed the same seed the forward
+        # drew -- a different one silently scales the delta's cotangent by a
+        # mask the forward never applied.
+        return (p, m), (pair_mask, msa_mask, psave, msave, seed)
 
     def bwd(res, g):
-        pair_mask, msa_mask, psave, msave = res
+        pair_mask, msa_mask, psave, msave, seed = res
         gp, gm = g
         out = jax.ffi.ffi_call(
             'native_evoformer_bwd',
             (jax.ShapeDtypeStruct(gp.shape, jnp.float32),
              jax.ShapeDtypeStruct(gm.shape, jnp.float32)),
             vmap_method='sequential')
-        return out(gp, gm, pair_mask, msa_mask, psave, msave,
-                   depth=np.int64(depth), pair_only=np.int64(0),
-                   own_save=np.int64(0), opm_first=np.int64(1),
-                   weights_dir=weights_dir)
+        dpair, dmsa = out(gp, gm, pair_mask, msa_mask, psave, msave, seed,
+                          depth=np.int64(depth), pair_only=np.int64(0),
+                          own_save=np.int64(0), opm_first=np.int64(1),
+                          dropout=dropout, weights_dir=weights_dir)
+        # ONE COTANGENT PER PRIMAL ARGUMENT.  The primal takes four
+        # (pair, msa, pair_mask, msa_mask); the masks are not differentiated,
+        # so they get explicit zeros rather than being omitted -- custom_vjp
+        # checks the pytree structure, not just the differentiable subset.
+        # the seed is an integer input, so its cotangent is float0 -- the
+        # dtype JAX uses for "this argument has no tangent space at all",
+        # which zeros_like on a uint32 array does NOT produce
+        return (dpair, dmsa, jnp.zeros_like(pair_mask), jnp.zeros_like(msa_mask),
+                np.zeros(seed.shape, dtype=jax.dtypes.float0))
 
     stack.defvjp(fwd, bwd)
     return stack
+
+
+def use_model(name: str):
+    """Point the hook at a PARTICULAR model's weights.
+
+    bc2 samples a model per step out of its pool (_sample_design_model), and a
+    single installed weights directory would serve model_1's weights for every
+    one of them -- silently, across a whole campaign.  af2.py calls this before
+    building the compiled function for a model, and the closure captured at
+    trace time is the right one because that function is cached per model.
+    """
+    from .alphafold.model import modules_multimer
+    run = _MODEL_RUNNERS.get(name)
+    if run is None:
+        raise KeyError(
+            f'native: no weights installed for model {name!r}; '
+            f'have {sorted(_MODEL_RUNNERS)}. install_models() takes the whole '
+            'pool so each model gets its own directory.')
+    modules_multimer.NATIVE_EVOFORMER = run
+
+
+def install_models(model_parameters: dict, depth: int = 48,
+                   dropout: bool = False):
+    """Install EVERY model in the pool, one weights directory each."""
+    global _DROPOUT
+    _DROPOUT = bool(dropout)
+    if dropout:
+        print('native: dropout ON.  The masks come from a counter-based hash '
+              'of (seed, depth, module, index), NOT from threefry, so they do '
+              'not match what stock JAX would have drawn -- a native run and '
+              'a stock run are comparable in distribution, never step by '
+              'step.  The seed is a runtime input, so it costs no recompile.')
+    if not available():
+        print('native: library missing, staying on JAX')
+        return False
+    _register()
+    for name, params in model_parameters.items():
+        wd = weights_from_params(params, depth=depth)
+        _MODEL_RUNNERS[name] = _make_runner(wd)
+    first = next(iter(model_parameters))
+    use_model(first)
+    print(f'native: installed {len(_MODEL_RUNNERS)} model(s): '
+          f'{sorted(_MODEL_RUNNERS)}')
+    return True
 
 
 def install(depth: int = 48, weights_dir: str = None, params=None):
