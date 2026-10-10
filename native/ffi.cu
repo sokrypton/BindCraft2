@@ -29,6 +29,7 @@
 #include <mutex>
 
 #include "stack.cuh"
+#include "tplstack.cuh"
 #if NE_CUPTI
 #include "cupti_prof.cuh"
 #endif
@@ -314,6 +315,91 @@ ffi::Error BwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct_pair,
   return ffi::Error::Success();
 }
 
+
+// ---------------------------------------------------------------- templates
+//
+// AF2's TEMPLATE PAIR STACK, the two 64-channel iterations.  A separate entry
+// point rather than another mode of the Evoformer one: different width,
+// different depth, no MSA side and no keep tiers, and its backward replays
+// from the saved input instead of taking a save-set apart.
+struct TKey {
+  int N, depth;
+  std::string dir;
+  bool operator<(const TKey& o) const {
+    return std::tie(N, depth, dir) < std::tie(o.N, o.depth, o.dir);
+  }
+};
+std::map<TKey, tplstack::TplStack*> g_tpl;
+
+tplstack::TplStack* tpl_get(int N, int depth, const std::string& dir) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  TKey k{N, depth, dir};
+  auto it = g_tpl.find(k);
+  if (it != g_tpl.end()) return it->second;
+  Oracle*& w = g_weights[dir];
+  if (!w) w = new Oracle(dir);
+  auto* t = new tplstack::TplStack();
+  t->alloc(N, depth);
+  t->setWeights(*w);
+  g_tpl[k] = t;
+  return t;
+}
+
+ffi::Error TplFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> pair,
+                      ffi::Buffer<ffi::F32> pair_mask,
+                      ffi::Buffer<ffi::U32> seed, int64_t depth,
+                      int64_t dropout, std::string_view weights_dir,
+                      ffi::Result<ffi::Buffer<ffi::F32>> out,
+                      ffi::Result<ffi::Buffer<ffi::BF16>> save) {
+  auto d = pair.dimensions();
+  if (d.size() != 3 || d[2] != tplstack::CZ)
+    return ffi::Error::InvalidArgument("template pair must be [N,N,64]");
+  int N = (int)d[0];
+  auto* t = tpl_get(N, (int)depth, std::string(weights_dir));
+  t->setStream(stream);
+  t->setDropout(dropout != 0, seed.typed_data());
+  size_t np = t->pairElems();
+  int g = (int)((np + 255) / 256);
+  // the stack is bf16 throughout, as every other one here is
+  static __nv_bfloat16* in = nullptr;
+  static size_t in_n = 0;
+  if (in_n < np) {
+    if (in) CU(cudaFree(in));
+    CU(cudaMalloc(&in, np * 2)); in_n = np;
+  }
+  toBf16K<<<g, 256, 0, stream>>>(in, pair.typed_data(), np);
+  t->forward(in, pair_mask.typed_data(),
+             reinterpret_cast<__nv_bfloat16*>(save->typed_data()));
+  bf16ToF32OutK<<<g, 256, 0, stream>>>(t->out(), out->typed_data(), np);
+  return ffi::Error::Success();
+}
+
+ffi::Error TplBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct,
+                      ffi::Buffer<ffi::F32> pair_mask,
+                      ffi::Buffer<ffi::BF16> save,
+                      ffi::Buffer<ffi::U32> seed, int64_t depth,
+                      int64_t dropout, std::string_view weights_dir,
+                      ffi::Result<ffi::Buffer<ffi::F32>> dpair) {
+  auto d = ct.dimensions();
+  int N = (int)d[0];
+  auto* t = tpl_get(N, (int)depth, std::string(weights_dir));
+  t->setStream(stream);
+  t->setDropout(dropout != 0, seed.typed_data());
+  size_t np = t->pairElems();
+  int g = (int)((np + 255) / 256);
+  static __nv_bfloat16* ctb = nullptr;
+  static size_t ct_n = 0;
+  if (ct_n < np) {
+    if (ctb) CU(cudaFree(ctb));
+    CU(cudaMalloc(&ctb, np * 2)); ct_n = np;
+  }
+  toBf16K<<<g, 256, 0, stream>>>(ctb, ct.typed_data(), np);
+  t->backward(ctb, pair_mask.typed_data(),
+              reinterpret_cast<const __nv_bfloat16*>(save.typed_data()));
+  bf16ToF32OutK<<<g, 256, 0, stream>>>(t->dpair(), dpair->typed_data(), np);
+  return ffi::Error::Success();
+}
+
 }  // namespace
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -356,3 +442,29 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    TemplatePairStackFwd, TplFwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair  [N,N,64]
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair_mask [N,N]
+        .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled], runtime
+        .Attr<int64_t>("depth")
+        .Attr<int64_t>("dropout")
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>()      // out   [N,N,64]
+        .Ret<ffi::Buffer<ffi::BF16>>());   // save: the input, for the replay
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    TemplatePairStackBwd, TplBwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // ct    [N,N,64]
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair_mask
+        .Arg<ffi::Buffer<ffi::BF16>>()     // save
+        .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled]
+        .Attr<int64_t>("depth")
+        .Attr<int64_t>("dropout")
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>());    // dpair [N,N,64]
