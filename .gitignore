@@ -50,3 +50,6 @@ Thumbs.db
 
 # Anything created by Claude
 .claude/
+
+# campaign outputs
+results/
