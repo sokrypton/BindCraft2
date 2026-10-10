@@ -137,12 +137,12 @@ def _make_runner(weights_dir, depth=48):
         if fn is None:
             fn = cache[n_block] = _make_stack(int(n_block), weights_dir)
         if seed is None:
-            seed = jnp.zeros((1,), jnp.uint32)
+            seed = jnp.zeros((2,), jnp.uint32)   # [seed, enabled]
         p, m = fn(acts['pair'].astype(jnp.float32),
                   acts['msa'].astype(jnp.float32),
                   masks['pair'].astype(jnp.float32),
                   masks['msa'].astype(jnp.float32),
-                  seed.astype(jnp.uint32).reshape((1,)))
+                  seed.astype(jnp.uint32).reshape((2,)))
         return {'pair': p.astype(acts['pair'].dtype),
                 'msa': m.astype(acts['msa'].dtype)}
 
@@ -241,11 +241,12 @@ def install_models(model_parameters: dict, depth: int = 48,
     global _DROPOUT
     _DROPOUT = bool(dropout)
     if dropout:
-        print('native: dropout ON.  The masks come from a counter-based hash '
+        print('native: dropout ALLOCATED.  The masks come from a counter-based hash '
               'of (seed, depth, module, index), NOT from threefry, so they do '
               'not match what stock JAX would have drawn -- a native run and '
               'a stock run are comparable in distribution, never step by '
-              'step.  The seed is a runtime input, so it costs no recompile.')
+              'step.  Both the seed and the on/off flag are runtime inputs, '
+              'so a stage that turns dropout off costs no recompile.')
     if not available():
         print('native: library missing, staying on JAX')
         return False
