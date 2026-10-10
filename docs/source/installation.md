@@ -158,7 +158,13 @@ bash native/build.sh
 ```
 
 This needs `nvcc` and a card of compute capability 8.0 or newer (A100, A10/A40/
-3090, L4/L40S, H100). **The build is optional and never fails an install**: with
+3090, L4/L40S, H100). Blackwell and later work too, via PTX.
+
+**Colab's free T4 is not one of them, nor is a V100.** These are bf16
+tensor-core kernels and bf16 does not exist before Ampere, so Turing and Volta
+run the Evoformer on JAX. A campaign there is correct and no slower than it
+was before any of this existed -- it simply does not get the speedup. The run
+says so in one line at startup. **The build is optional and never fails an install**: with
 no CUDA toolkit, no card that new, or no `jax.ffi` headers, `build.sh` says so
 and exits, and campaigns run the trunk on JAX exactly as before. A run that
 wanted the kernels and could not find them prints the path it looked for.
