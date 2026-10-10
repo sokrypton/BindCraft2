@@ -329,8 +329,25 @@ def _make_tpl_runner(weights_dir, depth=2, dropout=False):
                              f'asked for {int(n_block)}')
         if seed is None:
             seed = jnp.zeros((2,), jnp.uint32)
-        return stack(act.astype(jnp.float32), mask.astype(jnp.float32),
-                     seed.astype(jnp.uint32).reshape((2,))).astype(act.dtype)
+        # PAD TO 32, as the trunk and the extra-MSA stack do.  The kernels
+        # are only gated on 32-aligned lengths and an unaligned one fails
+        # inside cuBLASLt -- which is not hypothetical: without this a PD-L1
+        # campaign died at its real length of 211 with
+        #     trimul_body.cuh:1014 cublas: 14
+        # while every measurement here passed, because they were all run at
+        # 224.  A benchmark length that happens to be aligned will never find
+        # this; a campaign finds it immediately.
+        n = int(act.shape[0])
+        pad = (-n) % 32
+        a = act.astype(jnp.float32)
+        m = mask.astype(jnp.float32)
+        if pad:
+            a = jnp.pad(a, ((0, pad), (0, pad), (0, 0)))
+            m = jnp.pad(m, ((0, pad), (0, pad)))
+        out = stack(a, m, seed.astype(jnp.uint32).reshape((2,)))
+        if pad:
+            out = out[:n, :n]
+        return out.astype(act.dtype)
 
     return run
 
