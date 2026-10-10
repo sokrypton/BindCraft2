@@ -114,18 +114,48 @@ def _register():
 _MODEL_RUNNERS = {}
 
 
+def supported_length(n: int) -> bool:
+    """Can the kernels take this complex length?
+
+    Asked BEFORE the hook draws its seed.  Drawing consumes haiku's SafeKey,
+    and a key that has been used cannot be handed to the JAX fallback -- it
+    raises 'Random key has been used previously'.  So support is decided
+    first and the key is touched only on the path that will use it.
+    """
+    return int(n) % 32 == 0
+
+
+class Unsupported(Exception):
+    """This length cannot go through the kernels; the caller should use JAX.
+
+    Raised at TRACE time, not per step, so the fallback costs nothing at
+    runtime -- the hook picks a path once per compiled function.
+    """
+
+
 def _make_runner(weights_dir, depth=48, dropout=False):
     """A hook callable bound to ONE weights directory."""
     cache = {}
 
     def run(acts, masks, n_block, seed=None):
+        # DO NOT PAD HERE YET.  Padding to 32 and masking the pad out is the
+        # right shape for this -- bindcraft buckets the DESIGNED chain only,
+        # so a 64-residue binder on a 115-residue target arrives as 179 and no
+        # setting fixes it -- but the native stack does NOT honour a zero mask
+        # exactly.  Measured: 64 real residues embedded in a 96-wide masked
+        # input move out/pair by 2.0e-2 and make the gradient NaN, where stock
+        # JAX on the identical comparison moves by 0.000e+00.  Padding would
+        # therefore be silently wrong, which is worse than refusing.
         n = int(acts['pair'].shape[0])
         if n % 32:
-            raise ValueError(
-                f'native evoformer: length {n} is not a multiple of 32. '
-                'Use length_bucket_size=32 (the default) or pad; the kernels '
-                'have only ever been gated on 32-aligned lengths and an '
-                'unaligned one faults inside cuBLASLt.')
+            raise Unsupported(
+                f'native evoformer: total complex length {n} is not a '
+                'multiple of 32, and the stack cannot pad to reach one until '
+                'its masking is exact (a masked pad currently shifts the '
+                'output 2e-2 and NaNs the gradient).  Pick a binder length '
+                'that makes target+binder a multiple of 32 -- for a '
+                '115-residue target that is 45, 77 or 109.  Falling back to '
+                'JAX for this one length.')
         fn = cache.get(n_block)
         if fn is None:
             fn = cache[n_block] = _make_stack(int(n_block), weights_dir,
