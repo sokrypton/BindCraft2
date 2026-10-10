@@ -245,8 +245,14 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         # stay in JAX where a new term is a Python edit.
         if os.environ.get('BC2_NATIVE') == '1' and self.model_parameters:
             from .af import native
-            first = next(iter(self.model_parameters.values()))
-            native.install(params=first)
+            # EVERY model in the pool gets its own weights, because
+            # _sample_design_model picks one per step and a single installed
+            # directory would serve model_1's weights for all of them.
+            # dropout decides only whether the native stack ALLOCATES its
+            # mask scratch.  Whether the masks apply is traced through the
+            # batch like stock's, because bindcraft flips it between stages
+            # of one trajectory and a static flag would recompile there.
+            native.install_models(self.model_parameters, dropout=bool(dropout))
         self.prediction_compile_cache = CompiledModelCache(max_cache_size)
         self.gradient_compile_cache = CompiledModelCache(max_cache_size)
 
@@ -409,6 +415,9 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         reference_templates = {state_name: concatenate_chain_arrays(state_chain_names, reference_states[state_name], 'atoms', 'atom_mask', 'flags', 'residue_index') for state_name, state_chain_names, _ in reference_shapes}
         weights = {name: jnp.asarray(entry.weight, dtype=jnp.float32) for name, entry in losses.items()}
         frozen_interfaces = frozen_interface_arguments(losses, shared_chains)
+        if os.environ.get('BC2_NATIVE') == '1':
+            from .af import native
+            native.use_model(model)   # bind THIS model's weights before tracing
         compiled_sequence_gradients = self._compiled_sequence_gradients(model, complex_shapes, reference_shapes, losses)
         gradient_arguments = (self.model_parameters[model], self.key, sequences, state_templates, reference_templates, weights, frozen_interfaces, jnp.asarray(self.dropout), jnp.asarray(softmax_weight), jnp.asarray(one_hot_weight), jnp.asarray(temperature), jnp.asarray(logit_scale))
         with one_worker_compiles((model, complex_shapes, reference_shapes, tuple(sorted(losses)))):

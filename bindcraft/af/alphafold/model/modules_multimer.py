@@ -456,7 +456,14 @@ class EmbeddingsAndEvoformer(hk.Module):
         # different mask from it than threefry would.
         evoformer_output = NATIVE_EVOFORMER(
             evoformer_input, evoformer_masks, int(c.evoformer_num_block),
-            jax.random.bits(safe_subkey.get(), (1,), jnp.uint32))
+            # [seed, enabled].  `use_dropout` is TRACED -- bindcraft flips it
+            # between stages of one trajectory -- so it has to cross as a
+            # value, not as a static flag that would recompile the stack at
+            # every stage boundary.
+            jnp.stack([
+                jax.random.bits(safe_subkey.get(), (), jnp.uint32),
+                jnp.asarray(batch["use_dropout"], jnp.uint32).reshape(()),
+            ]))
       else:
         evoformer_output = run_evoformer(evoformer_input)
 
