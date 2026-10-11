@@ -494,84 +494,33 @@ installed, so set them before starting a run.
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `BC2_NATIVE_EXTRA` | on | The extra-MSA stack. `0` returns it to JAX. |
-| `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
-| `BC2_NATIVE_EMBED` | on | The embedder's four input Linears and the relative-position gather. `0` turns it off. |
-| `BC2_NATIVE_POST` | on | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `0` returns it to JAX. |
-| `BC2_NATIVE_TPLEMBED` | on (see below) | The WHOLE template embedding -- the query LayerNorm, the ninth projection, both stack blocks, `output_layer_norm`, the relu and `output_linear` -- in one call. `0` turns it off. It supersedes `BC2_NATIVE_TEMPLATE`, which covers only the two blocks in the middle, without disabling it. Needs exactly one template and the harvested constant; without either it falls back to JAX silently. |
+| `BC2_NATIVE_DISABLE` | unset | **Debugging only.** Comma separated list of native pieces to leave on JAX while the rest stay native: `extra`, `template`, `tplembed`, `post`, `embed`. For bisecting a bad campaign, never for speed -- all-on is the fastest configuration measured. An unknown name is refused rather than ignored. |
 
-`BC2_NATIVE_POST` is the newest of the three. At 179 tokens with a cold cache
-it takes the design graph's compile from 17.0 s to 7.7 s and the first
-gradient from 21.9 s to 12.4 s, for 1.1% more time per step. It carries AF2's
-structure-module dropout and is gated against AF2 on the real checkpoint.
+ONE SWITCH, NOT FIVE.  `evoformer_backend` in the settings file (or
+`--set evoformer_backend=jax`, or `BC2_NATIVE=0`) turns the whole native
+path on or off, and that is the only control a normal run needs.  The five
+separate variables this replaced -- `BC2_NATIVE_EXTRA`, `_TEMPLATE`,
+`_TPLEMBED`, `_POST`, `_EMBED` -- are REFUSED if set, with a message saying
+where the setting went, so a script carrying one learns rather than quietly
+getting the opposite of what it asked for.
 
-It is on because it clears the same bar the other two did: adding it moves
-pLDDT 1.9e-05 and the gradient norm 18.7%, where replacing the main Evoformer
-stack — which the default already does — moves them 2.8e-04 and 48.9%. The
-gradient move is real rather than noise, just smaller than one the model
-already accepts; `native/post_trunk_gate.py` reproduces the table. What no
-single run can tell you is whether it changes design *outcomes*: two
-trajectories with identical settings differ by more than the backends do, so
-if you are comparing results across versions, hold this fixed.
-
-THERE IS NO SPEED REASON TO TURN ANY OF THESE OFF.  One flag off at a time
+THERE IS NO SPEED REASON TO DISABLE ANY PIECE.  One flag off at a time
 against an all-on baseline, N=179, four timed steps after warmup:
 
 | off | step | what the native piece does |
 | --- | --- | --- |
 | nothing (all on) | 755.5 ms +- 0.4 | -- |
-| `BC2_NATIVE_TEMPLATE` | 762.1 ms +- 1.2 | saves 6.6 ms |
-| `BC2_NATIVE_EMBED` | 761.3 ms +- 0.7 | saves 5.8 ms |
-| `BC2_NATIVE_POST` | 755.2 ms +- 0.6 | +0.3 ms, inside the noise |
-| `BC2_NATIVE_TPLEMBED` | 753.4 ms +- 1.1 | +2.1 ms, 0.3%, for -2.2 s compile |
+| `template` | 762.1 ms +- 1.2 | saves 6.6 ms |
+| `embed` | 761.3 ms +- 0.7 | saves 5.8 ms |
+| `post` | 755.2 ms +- 0.6 | +0.3 ms, inside the noise |
+| `tplembed` | 753.4 ms +- 1.1 | +2.1 ms, 0.3%, for -2.2 s compile |
 
 All-on is the fastest configuration bar a 0.3% give-back on the template
 embedding.  EARLIER PER-PIECE NUMBERS IN THE NOTES ARE STALE -- the
 post-trunk step was once +1.1% and the structure module measured 1.17x to
-1.50x slower than XLA standalone; neither survives in the composition.  The
-flags are kill switches now, not a performance dial.
+1.50x slower than XLA standalone; neither survives in the composition.
 
-`BC2_NATIVE_TPLEMBED` IS ON BY REQUEST, NOT BY THE MEASUREMENT -- the
-campaign below could not separate it from the JAX path, and is recorded so
-nobody mistakes the default for evidence. Design-loss
-compile drops 6.4 -> 4.2 s with it on and the step does not move, so the
-case for it is purely compile. Paired hPDL1 campaigns, 3 trajectories each,
-the same three trajectory hashes:
-
-| trajectory | on | off |
-| --- | --- | --- |
-| c4dd0ffbc9d291dc | rejected at screen 0.64 / 0.60 | passed all five stages |
-| 707d3e7f0f7e5c8c | rejected at mutate 0.49 / 0.76 | passed all five stages |
-| 5245753cc9f283a6 | rejected at harden 0.19 / 0.63 | rejected at screen 0.40 / 0.58 |
-| accepted | 0 / 3 | 0 / 3 |
-
-Neither arm accepted anything, so there is no acceptance difference to read.
-On stage depth it is 2-1 to off.
-
-PART OF THAT WAS AN RNG BUG OF OUR OWN, since fixed: `hk.eval_shape` was
-handed the real SafeKey, forcing an extra split so the native arm drew
-different dropout masks from the JAX arm by construction. With the reference
-pass on a throwaway key, the same three trajectories re-run:
-
-| trajectory | on, before | on, after | off |
-| --- | --- | --- | --- |
-| c4dd0ffbc9d291dc | rejected at screen 0.64 | anneal 0.81, rejected at harden | passed all five |
-| 707d3e7f0f7e5c8c | rejected at mutate 0.49 | harden 0.59, rejected at mutate 0.55 | passed all five |
-| 5245753cc9f283a6 | rejected at harden 0.19 | rejected at anneal 0.28 | rejected at screen 0.40 |
-| accepted | 0 / 3 | 0 / 3 | 0 / 3 |
-
-The fix improved the native arm's absolute depth on two of three, and the
-comparison against off stayed 2-1.  Nothing accepted in ANY arm, so the
-target and settings are simply hard here and three trajectories cannot
-separate the two.  Nobody has run enough of them to settle it; the flag is on regardless,
-so if a campaign ever looks wrong this is the first thing to turn off
-(`BC2_NATIVE_TPLEMBED=0`).
-
-With dropout OFF, where the masks cannot differ, one paired trajectory had
-them equivalent and the native arm accepted (0.80 / 0.90 against 0.79 /
-0.93). So the suspicion is specifically about the DROPOUT path, and that is
-where to look before this is turned on.
-
-`BC2_NATIVE_EMBED` is off because the measurement says so, not out of
+The embedder is on because the measurement says so, not out of
 caution. It saves 0.8 s of compile — a tenth — and moves pLDDT 1.4e-04 and
 the gradient norm 18.1%, which is seven times the post-trunk step's move for
 a twelfth of the saving. The move has a cause rather than a bug: that block

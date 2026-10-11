@@ -214,7 +214,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         self.models = self.presets if models is None else tuple(models)
         self.key = jax.random.PRNGKey(0) if key is None else key
         self.dropout = dropout
-        # BC2_NATIVE=1 forces it on whatever the settings say, for a dev run
+
         # BC2_NATIVE forces either way for a dev run: =1 native, =0 jax.
         _env = os.environ.get('BC2_NATIVE')
         if _env is not None:
