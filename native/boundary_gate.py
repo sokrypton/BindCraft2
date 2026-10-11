@@ -12,6 +12,7 @@ inert while still returning a number, which no quality metric would catch.
 """
 import os
 import sys
+import zlib
 
 for _k in list(os.environ):
     if _k.startswith('BC2_NATIVE'):
@@ -82,8 +83,14 @@ def main():
             capture(protein_states, predictions)
             v = jnp.asarray(seen[field], jnp.float32)
             # a weighted sum, so a symmetric field does not cancel to zero
+            # NOT hash(field): Python randomises string hashing per
+            # process, so the probe would differ between runs.  It does not
+            # matter to THIS gate, which asks whether a gradient is finite
+            # and nonzero rather than whether two runs agree -- but the
+            # same idiom in dev/native_block/ds_grad.py made pure JAX
+            # disagree with itself at cos -0.66, so it does not stay here.
             w = jnp.asarray(
-                np.random.RandomState(abs(hash(field)) % 2**31)
+                np.random.RandomState(zlib.crc32(field.encode()) % 2**31)
                 .randn(*v.shape), jnp.float32)
             return jnp.sum(v * w)
         return f
