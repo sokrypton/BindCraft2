@@ -718,6 +718,8 @@ ffi::Error TeFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> query,
 }
 
 ffi::Error TeBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct,
+                     ffi::Buffer<ffi::F32> query,
+                     ffi::Buffer<ffi::F32> act_const,
                      ffi::Buffer<ffi::F32> pair_mask,
                      ffi::Buffer<ffi::BF16> save, ffi::Buffer<ffi::U32> seed,
                      int64_t depth, int64_t dropout,
@@ -726,7 +728,10 @@ ffi::Error TeBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct,
   int N = (int)ct.dimensions()[0];
   auto* m = te_get(N, (int)depth, std::string(weights_dir), stream);
   m->setDropout(dropout != 0, seed.typed_data());
-  m->backward(ct.typed_data(), pair_mask.typed_data(),
+  // query and act_const come in so the backward can REPLAY the forward; see
+  // the note on TemplateEmbedding::backward for why it must.
+  m->backward(ct.typed_data(), query.typed_data(), act_const.typed_data(),
+              pair_mask.typed_data(),
               reinterpret_cast<const __nv_bfloat16*>(save.typed_data()),
               dquery->typed_data());
   return ffi::Error::Success();
@@ -882,6 +887,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     ffi::Ffi::Bind()
         .Ctx<ffi::PlatformStream<cudaStream_t>>()
         .Arg<ffi::Buffer<ffi::F32>>()      // d out
+        .Arg<ffi::Buffer<ffi::F32>>()      // query     [N,N,128]
+        .Arg<ffi::Buffer<ffi::F32>>()      // act_const [N,N,64]
         .Arg<ffi::Buffer<ffi::F32>>()      // pair_mask
         .Arg<ffi::Buffer<ffi::BF16>>()     // save
         .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled]

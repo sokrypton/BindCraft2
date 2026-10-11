@@ -776,17 +776,22 @@ def _make_tplembed_runner(weights_dir, depth=2, dropout=False):
 
     def fwd(q, ac, pm, seed):
         o, save = raw(q, ac, pm, seed)
-        return o, (pm, save, seed)
+        # q AND ac ARE KEPT.  The backward replays the forward from them --
+        # everything it would otherwise read is member state in the C++
+        # object, and a design step runs forwards for every state and every
+        # recycle before any backward, so that state is never the right one.
+        return o, (q, ac, pm, save, seed)
 
     def bwd(res, g):
-        pm, save, seed = res
+        q, ac, pm, save, seed = res
         n = g.shape[0]
         dq = jax.ffi.ffi_call(
             'native_tplembed_bwd',
             jax.ShapeDtypeStruct((n, n, CQ), jnp.float32),
             vmap_method='sequential')(
-                g.astype(jnp.float32), pm, save, seed, depth=np.int64(depth),
-                dropout=drop, weights_dir=weights_dir)
+                g.astype(jnp.float32), q, ac, pm, save, seed,
+                depth=np.int64(depth), dropout=drop,
+                weights_dir=weights_dir)
         return (dq, jnp.zeros((n, n, CT), jnp.float32), jnp.zeros_like(pm),
                 np.zeros(seed.shape, dtype=jax.dtypes.float0))
 
