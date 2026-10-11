@@ -964,6 +964,40 @@ def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
     return stack
 
 
+# ONE SWITCH, NOT FIVE.  `evoformer_backend` (auto|native|jax, in the
+# settings file or `--set`) is the user-facing control: it turns the whole
+# native path on or off, and nothing below is meant to be part of a normal
+# run.  BC2_NATIVE_DISABLE is a DEBUGGING escape hatch -- a comma separated
+# list of pieces to leave on JAX while the rest stay native -- for bisecting
+# a bad campaign, not a performance dial.  There is no speed reason to use
+# it: all-on is the fastest configuration measured (native/flag_sweep.py).
+_PIECES = ('extra', 'template', 'tplembed', 'post', 'embed')
+# the five that used to be separate.  They are REFUSED rather than ignored:
+# someone with BC2_NATIVE_POST=0 in a script should learn that it moved, not
+# silently get the opposite of what they asked for.
+_RETIRED = {'BC2_NATIVE_EXTRA': 'extra', 'BC2_NATIVE_TEMPLATE': 'template',
+            'BC2_NATIVE_TPLEMBED': 'tplembed', 'BC2_NATIVE_POST': 'post',
+            'BC2_NATIVE_EMBED': 'embed'}
+
+
+def _disabled_pieces():
+    for old, piece in _RETIRED.items():
+        if os.environ.get(old) is not None:
+            raise ValueError(
+                f'{old} no longer exists.  To turn the whole native path '
+                f'off use evoformer_backend=jax (or BC2_NATIVE=0); to leave '
+                f'just this piece on JAX for debugging use '
+                f'BC2_NATIVE_DISABLE={piece}.')
+    raw = os.environ.get('BC2_NATIVE_DISABLE', '')
+    names = {n.strip().lower() for n in raw.split(',') if n.strip()}
+    unknown = names - set(_PIECES)
+    if unknown:
+        raise ValueError(
+            f'BC2_NATIVE_DISABLE: unknown piece(s) {sorted(unknown)}; '
+            f'known are {list(_PIECES)}')
+    return names
+
+
 def use_model(name: str):
     """Point the hook at a PARTICULAR model's weights.
 
@@ -1015,13 +1049,19 @@ def install_models(model_parameters: dict, depth: int = 48,
               'step.  Both the seed and the on/off flag are runtime inputs, '
               'so a stage that turns dropout off costs no recompile.')
     _register()
+    # read once, and REFUSE a retired flag here rather than per model
+    _off = _disabled_pieces()
+    if _off:
+        print(f'native: DEBUG -- leaving {sorted(_off)} on JAX '
+              f'(BC2_NATIVE_DISABLE).  all-on is the fastest configuration; '
+              f'this is for bisecting, not for speed.')
     for name, params in model_parameters.items():
         wd = weights_from_params(params, depth=depth)
         _MODEL_RUNNERS[name] = _make_runner(wd, depth, bool(dropout))
         # and the extra-MSA stack, which has its own 4 blocks under a
         # different prefix.  A model without it (a monomer preset) simply
         # does not get one and that stack stays on JAX.
-        # ON by default; BC2_NATIVE_EXTRA=0 turns it off.
+        # On with the native path; BC2_NATIVE_DISABLE=extra for debugging.
         #
         # GATED in ColabDesign2's harness (dev/native_block/gate_extra.py),
         # which asks the only question that can be asked of a design path:
@@ -1037,14 +1077,14 @@ def install_models(model_parameters: dict, depth: int = 48,
         # same way.  A design trajectory is chaotic (an end-to-end gradient
         # is not even comparable: the same path in two processes reads
         # cosine -0.80), so a relative bar like this is the honest test.
-        if os.environ.get('BC2_NATIVE_EXTRA') != '0':
+        if 'extra' not in _off:
             try:
                 ed = weights_from_params(params, depth=None, prefix=_EXTRA)
                 _EXTRA_RUNNERS[name] = _make_extra_runner(ed, 4, bool(dropout))
             except KeyError:
                 pass
         # and the template pair stack, two blocks under its own prefix.
-        # ON by default; BC2_NATIVE_TEMPLATE=0 turns it off.
+        # On with the native path; BC2_NATIVE_DISABLE=template for debugging.
         #
         # Judged on the bar gate_extra.py sets and the extra-MSA stack was
         # enabled on: does replacing this move the loss MORE than replacing
@@ -1060,27 +1100,28 @@ def install_models(model_parameters: dict, depth: int = 48,
         # also has what the extra-MSA stack never had: a module-level gate
         # against a JAX oracle on the real checkpoint (tplblock, fwd
         # 0.999952 / bwd 0.997982).
-        if os.environ.get('BC2_NATIVE_TEMPLATE') != '0':
+        if 'template' not in _off:
             try:
                 td = weights_from_params(params, depth=None, prefix=_TPL)
                 _TPL_RUNNERS[name] = _make_tpl_runner(td, 2, bool(dropout))
             except KeyError:
                 pass
-        # the WHOLE template embedding rather than just its two blocks.  ON
-        # by default; BC2_NATIVE_TPLEMBED=0 turns it off.  It supersedes the
+        # the WHOLE template embedding rather than just its two blocks.  On
+        # with the native path; BC2_NATIVE_DISABLE=tplembed for debugging.
+        # It supersedes the
         # stack runner above WITHOUT disabling it: this one returns before
         # SingleTemplateEmbedding runs, so the stack cannot execute twice,
         # and leaving the stack runner installed keeps any state that
         # declines the embedding -- more than one template, no harvested
         # constant -- on the native stack rather than dropping it to XLA.
         #
-        # TURNED ON BY REQUEST, NOT BY THE MEASUREMENT.  Compile goes
+        # ON BY REQUEST, NOT BY THE MEASUREMENT.  Compile goes
         # 6.4 -> 4.2 s and the step does not move.  Paired hPDL1 campaigns
         # could not separate it from the JAX path: nothing was accepted in
         # ANY arm, including pure JAX, so three trajectories had no
         # resolution; on stage depth it was 2-1 to off.  See the reference
         # table for the numbers.
-        if os.environ.get('BC2_NATIVE_TPLEMBED') != '0':
+        if 'tplembed' not in _off:
             try:
                 ted = tplembed_weights_from_params(params)
                 _TPE_RUNNERS[name] = _make_tplembed_runner(ted, 2,
@@ -1092,7 +1133,7 @@ def install_models(model_parameters: dict, depth: int = 48,
                       f'{name}: {e}')
         # and the post-trunk step: the structure module and the four heads,
         # and the post-trunk step: the structure module and the four heads in
-        # one call.  ON by default; BC2_NATIVE_POST=0 turns it off.
+        # one call.  On with the native path; BC2_NATIVE_DISABLE=post to debug.
         #
         # It carries AF2's two dropout sites (folding_multimer.FoldIteration
         # lines 428 and 449, rate 0.1 elementwise on the act after each
@@ -1116,7 +1157,7 @@ def install_models(model_parameters: dict, depth: int = 48,
         # floor -- just smaller than one the default already makes.  And it
         # takes the design graph's compile from 17.0 s to 7.7 s at 179
         # tokens for 1.1% more time a step.
-        if os.environ.get('BC2_NATIVE_POST') != '0':
+        if 'post' not in _off:
             # LOUD, not silent.  The other two stacks swallow a KeyError
             # because a preset that lacks them is a normal thing; asking for
             # this one explicitly and silently not getting it is not, and a
@@ -1129,7 +1170,7 @@ def install_models(model_parameters: dict, depth: int = 48,
             except KeyError as e:
                 print(f'native: post-trunk NOT installed for {name}: {e}')
         # and the embedder: the four input Linears and the relative-position
-        # gather.  ON by default; BC2_NATIVE_EMBED=0 turns it off.
+        # gather.  On with the native path; BC2_NATIVE_DISABLE=embed to debug.
         #
         # Off because it is not yet judged.  The module gate is exact against
         # AF2 (~1e-07 on both outputs and both gradients at N=179, four
@@ -1140,7 +1181,7 @@ def install_models(model_parameters: dict, depth: int = 48,
         # afterwards in JAX instead of in between.  Both are sound -- the sum
         # is the same and f32 is the more accurate side -- but 'sound' is an
         # argument, and the bar here is a measurement.
-        if os.environ.get('BC2_NATIVE_EMBED') != '0':
+        if 'embed' not in _off:
             try:
                 ed2 = embed_weights_from_params(params)
                 _EMB_RUNNERS[name] = _make_embed_runner(ed2)
