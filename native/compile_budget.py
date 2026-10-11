@@ -22,6 +22,28 @@
 # the only large piece left, and it is 4.6x what the embedder was worth.  The
 # recycle terms are worth nothing, which is why folding them into the native
 # embedder instead of adding them after it would buy nothing.
+#
+# AND MOST OF THAT 3.7 s IS A CONSTANT.  SingleTemplateEmbedding.
+# construct_input builds nine features and projects each with its own Linear;
+# EIGHT of the nine depend only on the template -- its aatype, atom positions
+# and atom mask -- and not on the designed sequence.  Designed residues are
+# masked to aatype 21 whatever they currently are, so changing them changes
+# nothing.  Measured, not argued: calling target_template_features twice with
+# the designed half of the sequence altered returns all seven tensors BIT
+# IDENTICAL.
+#
+# So make_backbone_affine, the rigid inverse and normalisation, pseudo_beta_fn,
+# dgram_from_positions, the one-hots, the masks and eight of the nine
+# projections are recompiled into every design graph to recompute a value that
+# cannot change.  Only template_pair_embedding_8, on query_embedding, varies.
+#
+# Hoisting them -- computing act_const once per (target, flags, length) and
+# passing the [N, N, 64] result in -- would remove most of the 3.7 s with NO
+# numerical change at all, which no amount of porting can match.  It is left
+# as a recommendation rather than done here because it restructures the design
+# loop rather than adding an opt-in fast path, and because the modes that can
+# legitimately change a template mid-campaign (induced fit, multitarget target
+# swaps, redesign) decide whether the cache key is the target or the step.
 import os, sys, time, logging, shutil
 ARM = sys.argv[1]
 cache = f'/tmp/claude-1000/budget_{ARM}'
