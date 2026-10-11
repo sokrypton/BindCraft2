@@ -29,9 +29,10 @@
 # threefry, so the two are comparable in distribution only and no single
 # forward can be compared at all.
 import os, sys
-MODE = sys.argv[1]                      # xla | main | main+post
+MODE = sys.argv[1]            # xla | main | main+post | main+post+embed
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['BC2_NATIVE_POST'] = '1' if MODE == 'main+post' else '0'
+os.environ['BC2_NATIVE_POST'] = '1' if MODE.startswith('main+post') else '0'
+os.environ['BC2_NATIVE_EMBED'] = '1' if MODE.endswith('+embed') else '0'
 sys.path.insert(0, '/home/ubuntu/bc2')
 import numpy as np, jax
 from bindcraft.af2 import AlphaFoldDesignModel as AF2
@@ -59,6 +60,7 @@ g = np.concatenate([np.asarray(v, np.float64).ravel()
 out = {k: float(np.asarray(m[k]).mean()) for k in
        ('plddt', 'ptm', 'pae') if k in m}
 out['|grad|'] = float(np.linalg.norm(g))
-print(f'{MODE:<10} post_native={mm.NATIVE_POST_TRUNK is not None} '
-      f'traces={mm.NATIVE_POST_TRUNK_TRACES[0]}  ' +
+print(f'{MODE:<16} post={mm.NATIVE_POST_TRUNK is not None} '
+      f'embed={mm.NATIVE_EMBEDDER is not None} '
+      f'traces={mm.NATIVE_POST_TRUNK_TRACES[0]}/{mm.NATIVE_EMBEDDER_TRACES[0]}  ' +
       '  '.join(f'{k} {v:.6f}' for k, v in out.items()))

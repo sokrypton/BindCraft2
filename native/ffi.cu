@@ -31,6 +31,7 @@
 #include "stack.cuh"
 #include "tplstack.cuh"
 #include "structmod.cuh"
+#include "embed.cuh"
 #include "heads.cuh"
 #if NE_CUPTI
 #include "cupti_prof.cuh"
@@ -580,6 +581,89 @@ ffi::Error SmBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
   return ffi::Error::Success();
 }
 
+
+// ---------------------------------------------------------------------------
+// The embedder: sequence features -> the msa and pair the trunk consumes.
+//
+// This is the other end of the design step.  With the trunk and the
+// post-trunk step already native, it is most of what XLA still compiles that
+// is not a loss -- and it is where the gradient REACHES THE SEQUENCE, since
+// everything downstream hands its cotangent back through these four Linears.
+//
+// NO REPLAY AND NO SAVE SET, unlike both stacks and the post-trunk step: this
+// backward is a pure function of the cotangents, target_feat and the weights.
+// Nothing the forward computed is read again, so both calls are re-entrant
+// with nothing carried between them.  The relative-position term contributes
+// no gradient at all -- it is a gather from integer features.
+// ---------------------------------------------------------------------------
+struct EKey {
+  int N, S;
+  std::string dir;
+  cudaStream_t stream;
+  bool operator<(const EKey& o) const {
+    return std::tie(N, S, dir, stream) <
+           std::tie(o.N, o.S, o.dir, o.stream);
+  }
+};
+std::map<EKey, embed::Embed*> g_emb;
+
+embed::Embed* emb_get(int N, int S, const std::string& dir,
+                      cudaStream_t stream) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  EKey k{N, S, dir, stream};
+  auto it = g_emb.find(k);
+  if (it != g_emb.end()) return it->second;
+  Oracle*& w = g_weights[dir];
+  if (!w) w = new Oracle(dir);
+  auto* m = new embed::Embed();
+  m->alloc(N, S, stream);
+  m->setWeights(*w);
+  g_emb[k] = m;
+  return m;
+}
+
+ffi::Error EmbFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> tf,
+                      ffi::Buffer<ffi::F32> mf,
+                      ffi::Buffer<ffi::F32> residue_index,
+                      ffi::Buffer<ffi::F32> asym_id,
+                      ffi::Buffer<ffi::F32> entity_id,
+                      ffi::Buffer<ffi::F32> sym_id,
+                      std::string_view weights_dir,
+                      ffi::Result<ffi::Buffer<ffi::F32>> msa,
+                      ffi::Result<ffi::Buffer<ffi::F32>> pair) {
+  auto d = tf.dimensions();
+  if (d.size() != 2 || d[1] != embed::NAA)
+    return ffi::Error::InvalidArgument("target_feat must be [N,21]");
+  auto dm = mf.dimensions();
+  if (dm.size() != 3 || dm[2] != embed::NMSA_F)
+    return ffi::Error::InvalidArgument("msa_feat must be [S,N,49]");
+  int N = (int)d[0], S = (int)dm[0];
+  auto* m = emb_get(N, S, std::string(weights_dir), stream);
+  m->forward(tf.typed_data(), mf.typed_data(), residue_index.typed_data(),
+             asym_id.typed_data(), entity_id.typed_data(),
+             sym_id.typed_data());
+  CU(cudaMemcpyAsync(msa->typed_data(), m->msa,
+                     (size_t)S * N * embed::CM * 4, cudaMemcpyDeviceToDevice,
+                     stream));
+  CU(cudaMemcpyAsync(pair->typed_data(), m->pair,
+                     (size_t)N * N * embed::CZ * 4, cudaMemcpyDeviceToDevice,
+                     stream));
+  return ffi::Error::Success();
+}
+
+ffi::Error EmbBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> dmsa,
+                      ffi::Buffer<ffi::F32> dpair, ffi::Buffer<ffi::F32> tf,
+                      std::string_view weights_dir,
+                      ffi::Result<ffi::Buffer<ffi::F32>> dtf,
+                      ffi::Result<ffi::Buffer<ffi::F32>> dmf) {
+  auto dm = dmsa.dimensions();
+  int S = (int)dm[0], N = (int)dm[1];
+  auto* m = emb_get(N, S, std::string(weights_dir), stream);
+  m->backward(dmsa.typed_data(), dpair.typed_data(), nullptr, tf.typed_data(),
+              dtf->typed_data(), dmf->typed_data());
+  return ffi::Error::Success();
+}
+
 }  // namespace
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -684,3 +768,29 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>()      // dsingle [N,384]
         .Ret<ffi::Buffer<ffi::F32>>());    // dpair   [N,N,128]
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    EmbedderFwd, EmbFwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // target_feat   [N,21]
+        .Arg<ffi::Buffer<ffi::F32>>()      // msa_feat      [S,N,49]
+        .Arg<ffi::Buffer<ffi::F32>>()      // residue_index [N]
+        .Arg<ffi::Buffer<ffi::F32>>()      // asym_id       [N]
+        .Arg<ffi::Buffer<ffi::F32>>()      // entity_id     [N]
+        .Arg<ffi::Buffer<ffi::F32>>()      // sym_id        [N]
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>()      // msa  [S,N,256]
+        .Ret<ffi::Buffer<ffi::F32>>());    // pair [N,N,128]
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    EmbedderBwd, EmbBwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // d msa
+        .Arg<ffi::Buffer<ffi::F32>>()      // d pair
+        .Arg<ffi::Buffer<ffi::F32>>()      // target_feat, the one input the
+                                           // backward still needs
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>()      // d target_feat [N,21]
+        .Ret<ffi::Buffer<ffi::F32>>());    // d msa_feat    [S,N,49]
