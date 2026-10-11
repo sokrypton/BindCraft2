@@ -50,6 +50,16 @@ __global__ void pairInitK(const float* __restrict__ left,
                           const float* __restrict__ asym_id,
                           const float* __restrict__ entity_id,
                           const float* __restrict__ sym_id,
+                          // OPTIONAL [N,N] precomputed offsets.  bc2 does not
+                          // use residue_index[i]-residue_index[j]: it passes
+                          // its own `offset` feature (cyclic_sequence_offsets),
+                          // and modules_multimer prefers batch['offset']
+                          // whenever it is present -- which, in bc2, is
+                          // always.  Computing the difference here instead
+                          // gives a DIFFERENT relative encoding on any cyclic
+                          // design and matches everywhere else, so it would
+                          // gate green and be wrong exactly where it matters.
+                          const int32_t* __restrict__ off_mat,
                           float* __restrict__ pair, int N) {
   size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= (size_t)N * N * CZ) return;
@@ -57,7 +67,8 @@ __global__ void pairInitK(const float* __restrict__ left,
   size_t ij = idx / CZ;
   int j = (int)(ij % N), i = (int)(ij / N);
 
-  int off = (int)residue_index[i] - (int)residue_index[j];
+  int off = off_mat ? off_mat[ij]
+                    : (int)residue_index[i] - (int)residue_index[j];
   bool same_asym = asym_id[i] == asym_id[j];
   int clipped = off + MAX_REL;
   clipped = clipped < 0 ? 0 : (clipped > 2 * MAX_REL ? 2 * MAX_REL : clipped);
@@ -221,7 +232,7 @@ struct Embed {
   // `tf` is target_feat ALREADY PADDED to NAA; `mf` is msa_feat [S, N, 49]
   void forward(const float* tf, const float* mf, const float* residue_index,
                const float* asym_id, const float* entity_id,
-               const float* sym_id) {
+               const float* sym_id, const int32_t* off_mat = nullptr) {
     size_t nm = (size_t)N * CM, sm = (size_t)S * N * CM;
     gemm(N, CM, NAA, tf, w1d, pre1d);
     addRowBiasK<<<(int)((nm + 255) / 256), 256, 0, st>>>(pre1d, b1d, CM, nm);
@@ -238,7 +249,7 @@ struct Embed {
         right, br, CZ, (size_t)N * CZ);
     pairInitK<<<(int)(((size_t)N * N * CZ + 255) / 256), 256, 0, st>>>(
         left, right, wpos, bpos, residue_index, asym_id, entity_id, sym_id,
-        pair, N);
+        off_mat, pair, N);
 
   }
 

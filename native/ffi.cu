@@ -31,6 +31,11 @@
 #include "stack.cuh"
 #include "tplstack.cuh"
 #include "tplembed.cuh"
+#include "seqfeat.cuh"
+#include "inputfeat.cuh"
+#include "confidence.cuh"
+#include "kabsch.cuh"
+#include "design_step.cuh"
 #include "structmod.cuh"
 #include "embed.cuh"
 #include "heads.cuh"
@@ -896,3 +901,389 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("dropout")
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>());    // d query [N,N,128]
+
+// ===================== the glue, gated one piece at a time ==============
+// Each of these is checked as a FORMULA in numpy first (seqfeat_formula.py
+// and friends) and only then compiled, because the template embedding
+// proved the maths is where the error lives.
+
+ffi::Error SeqFeatImpl(cudaStream_t st, ffi::Buffer<ffi::F32> seq,
+                       ffi::Buffer<ffi::U8> flags, ffi::Buffer<ffi::F32> bias,
+                       float sw, float ohw, float temp, float ls,
+                       float omitted_half,
+                       ffi::Result<ffi::Buffer<ffi::F32>> feat,
+                       ffi::Result<ffi::Buffer<ffi::F32>> prof) {
+  const int N = (int)seq.dimensions()[0];
+  seqfeat::Scalars sc{sw, ohw, temp, ls};
+  const float* b = bias.element_count() ? bias.typed_data() : nullptr;
+  seqfeat::seqFeatK<<<(N + 127) / 128, 128, 0, st>>>(
+      seq.typed_data(), flags.typed_data(), b, sc, omitted_half,
+      feat->typed_data(), prof->typed_data(), N);
+  return ffi::Error::Success();
+}
+
+ffi::Error ConfidenceImpl(cudaStream_t st, ffi::Buffer<ffi::F32> lddt,
+                          ffi::Buffer<ffi::F32> pae_l,
+                          ffi::Buffer<ffi::F32> centres,
+                          ffi::Buffer<ffi::F32> tm_bin,
+                          ffi::Buffer<ffi::F32> expres,
+                          ffi::Buffer<ffi::F32> smask,
+                          ffi::Buffer<ffi::S32> asym,
+                          ffi::Buffer<ffi::S32> n,
+                          ffi::Result<ffi::Buffer<ffi::F32>> plddt,
+                          ffi::Result<ffi::Buffer<ffi::F32>> pae,
+                          ffi::Result<ffi::Buffer<ffi::F32>> ptm,
+                          ffi::Result<ffi::Buffer<ffi::F32>> iptm,
+                          ffi::Result<ffi::Buffer<ffi::F32>> iptm_pr,
+                          ffi::Result<ffi::Buffer<ffi::F32>> expres_ca,
+                          ffi::Result<ffi::Buffer<ffi::F32>> scratch) {
+  const int NMAX = (int)pae_l.dimensions()[0];
+  const int PB = (int)pae_l.dimensions()[2];
+  const size_t np = (size_t)NMAX * NMAX;
+  float* err = scratch->typed_data();          // [NMAX*NMAX] x2 + [NMAX]
+  float* tm = err + np;
+  float* per = tm + np;
+  confidence::plddtK<<<(NMAX + 127) / 128, 128, 0, st>>>(
+      lddt.typed_data(), n.typed_data(), plddt->typed_data(), NMAX);
+  confidence::paeTermK<<<(int)((np + 127) / 128), 128, 0, st>>>(
+      pae_l.typed_data(), centres.typed_data(), tm_bin.typed_data(),
+      n.typed_data(), err, tm, NMAX, PB);
+  confidence::symmetriseK<<<(int)((np + 127) / 128), 128, 0, st>>>(
+      err, n.typed_data(), pae->typed_data(), NMAX);
+  confidence::perAlignmentK<<<NMAX, 32, 0, st>>>(
+      tm, smask.typed_data(), asym.typed_data(), 0, n.typed_data(), per, NMAX);
+  confidence::weightedMaxK<<<1, 32, 0, st>>>(
+      per, smask.typed_data(), n.typed_data(), ptm->typed_data(), NMAX);
+  confidence::perAlignmentK<<<NMAX, 32, 0, st>>>(
+      tm, smask.typed_data(), asym.typed_data(), 1, n.typed_data(),
+      iptm_pr->typed_data(), NMAX);
+  confidence::weightedMaxK<<<1, 32, 0, st>>>(
+      iptm_pr->typed_data(), smask.typed_data(), n.typed_data(),
+      iptm->typed_data(), NMAX);
+  confidence::expresCaK<<<(NMAX + 127) / 128, 128, 0, st>>>(
+      expres.typed_data(), n.typed_data(), expres_ca->typed_data(), NMAX);
+  return ffi::Error::Success();
+}
+
+ffi::Error KabschImpl(cudaStream_t st, ffi::Buffer<ffi::F32> pred,
+                      ffi::Buffer<ffi::F32> pmask, ffi::Buffer<ffi::F32> tmpl,
+                      ffi::Buffer<ffi::F32> tmask, ffi::Buffer<ffi::U8> flags,
+                      ffi::Buffer<ffi::S32> n,
+                      ffi::Result<ffi::Buffer<ffi::F32>> out,
+                      ffi::Result<ffi::Buffer<ffi::F32>> scratch) {
+  const int NMAX = (int)pred.dimensions()[0];
+  float* stats = scratch->typed_data();        // [15] then [9]
+  float* R = stats + 15;
+  kabsch::covK<<<1, 32, 0, st>>>(pred.typed_data(), tmpl.typed_data(),
+                                 tmask.typed_data(), flags.typed_data(),
+                                 n.typed_data(), stats, NMAX);
+  kabsch::rotationK<<<1, 32, 0, st>>>(stats, R);
+  kabsch::applyK<<<(int)(((size_t)NMAX * 37 + 127) / 128), 128, 0, st>>>(
+      pred.typed_data(), pmask.typed_data(), stats, R, n.typed_data(),
+      out->typed_data(), NMAX);
+  return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    GlueSeqFeat, SeqFeatImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::U8>>()
+        .Arg<ffi::Buffer<ffi::F32>>()
+        .Attr<float>("sw").Attr<float>("ohw").Attr<float>("temp")
+        .Attr<float>("ls").Attr<float>("omitted_half")
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    GlueConfidence, ConfidenceImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    GlueKabsch, KabschImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::U8>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>());
+
+ffi::Error GlueBwdImpl(cudaStream_t st, ffi::Buffer<ffi::F32> seq,
+                       ffi::Buffer<ffi::U8> flags, ffi::Buffer<ffi::F32> bias,
+                       ffi::Buffer<ffi::F32> d_feat,
+                       ffi::Buffer<ffi::F32> d_prof,
+                       float sw, float ohw, float temp, float ls,
+                       float omitted_half,
+                       ffi::Result<ffi::Buffer<ffi::F32>> d_seq) {
+  const int N = (int)seq.dimensions()[0];
+  seqfeat::Scalars sc{sw, ohw, temp, ls};
+  const float* b = bias.element_count() ? bias.typed_data() : nullptr;
+  seqfeat::seqFeatBwdK<<<(N + 127) / 128, 128, 0, st>>>(
+      seq.typed_data(), flags.typed_data(), b, sc, omitted_half,
+      d_feat.typed_data(), d_prof.typed_data(), d_seq->typed_data(), N);
+  return ffi::Error::Success();
+}
+
+ffi::Error ConfBwdImpl(cudaStream_t st, ffi::Buffer<ffi::F32> lddt,
+                       ffi::Buffer<ffi::F32> pae_l,
+                       ffi::Buffer<ffi::F32> centres,
+                       ffi::Buffer<ffi::F32> expres,
+                       ffi::Buffer<ffi::F32> g_plddt,
+                       ffi::Buffer<ffi::F32> g_pae,
+                       ffi::Buffer<ffi::F32> g_expres,
+                       ffi::Buffer<ffi::S32> n,
+                       ffi::Result<ffi::Buffer<ffi::F32>> d_lddt,
+                       ffi::Result<ffi::Buffer<ffi::F32>> d_pae,
+                       ffi::Result<ffi::Buffer<ffi::F32>> d_expres) {
+  const int NMAX = (int)pae_l.dimensions()[0];
+  const int PB = (int)pae_l.dimensions()[2];
+  const size_t np = (size_t)NMAX * NMAX;
+  confidence::plddtBwdK<<<(NMAX + 127) / 128, 128, 0, st>>>(
+      lddt.typed_data(), g_plddt.typed_data(), n.typed_data(),
+      d_lddt->typed_data(), NMAX);
+  // pae WRITES; ptm/iptm would accumulate after it -- see confidence.cuh
+  confidence::paeBwdK<<<(int)((np + 127) / 128), 128, 0, st>>>(
+      pae_l.typed_data(), centres.typed_data(), g_pae.typed_data(),
+      n.typed_data(), d_pae->typed_data(), NMAX, PB);
+  confidence::expresCaBwdK<<<(int)(((size_t)NMAX * 37 + 127) / 128), 128, 0, st>>>(
+      expres.typed_data(), g_expres.typed_data(), n.typed_data(),
+      d_expres->typed_data(), NMAX);
+  return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    GlueSeqFeatBwd, GlueBwdImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::U8>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>()
+        .Attr<float>("sw").Attr<float>("ohw").Attr<float>("temp")
+        .Attr<float>("ls").Attr<float>("omitted_half")
+        .Ret<ffi::Buffer<ffi::F32>>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    GlueConfBwd, ConfBwdImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>());
+
+// ===================== the whole design step in one call ===============
+struct DsKey {
+  int nmax, recycles, msa_rows;
+  std::string trunk, extra, tpl, post, emb;
+  cudaStream_t st;
+  bool operator<(const DsKey& o) const {
+    return std::tie(nmax, recycles, msa_rows, trunk, extra, tpl, post, emb, st)
+         < std::tie(o.nmax, o.recycles, o.msa_rows, o.trunk, o.extra, o.tpl,
+                    o.post, o.emb, o.st);
+  }
+};
+static std::map<DsKey, design_step::DesignStep*> g_ds;
+
+design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
+                                tpl1d::Tables t1) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto it = g_ds.find(k);
+  if (it != g_ds.end()) return it->second;
+  auto* m = new design_step::DesignStep();
+  design_step::Plan p{};
+  p.nmax = k.nmax; p.recycles = k.recycles; p.msa_rows = k.msa_rows;
+  p.trunk_depth = 48; p.extra_depth = 4; p.tpl_depth = 2; p.sm_depth = 8;
+  m->alloc(p, k.st);
+  auto W = [&](const std::string& d) -> Oracle& {
+    Oracle*& w = g_weights[d];
+    if (!w) w = new Oracle(d);
+    return *w;
+  };
+  m->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post), W(k.emb), t, t1);
+  g_ds[k] = m;
+  return m;
+}
+
+ffi::Error DesignStepImpl(
+    cudaStream_t st,
+    ffi::Buffer<ffi::F32> sequence, ffi::Buffer<ffi::F32> atoms,
+    ffi::Buffer<ffi::F32> atom_mask, ffi::Buffer<ffi::U8> flags,
+    ffi::Buffer<ffi::S32> residue_index, ffi::Buffer<ffi::S32> asym_id,
+    ffi::Buffer<ffi::S32> entity_id, ffi::Buffer<ffi::S32> interface_asym,
+    ffi::Buffer<ffi::F32> seq_mask, ffi::Buffer<ffi::F32> act_const,
+    ffi::Buffer<ffi::S32> n, ffi::Buffer<ffi::U32> seed,
+    ffi::Buffer<ffi::F32> t14m, ffi::Buffer<ffi::F32> t37m,
+    ffi::Buffer<ffi::S32> t1437, ffi::Buffer<ffi::S32> t3714,
+    ffi::Buffer<ffi::S32> chi_idx, ffi::Buffer<ffi::F32> chi_mask,
+    ffi::Buffer<ffi::F32> scalars,
+    int64_t recycles, int64_t msa_rows,
+    std::string_view trunk_dir, std::string_view extra_dir,
+    std::string_view tpl_dir, std::string_view post_dir,
+    std::string_view emb_dir,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_atoms,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_plddt,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_pae,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_ptm,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_iptm,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_iptm_pr,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_expres,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_dgram) {
+  const int NMAX = (int)sequence.dimensions()[0];
+  inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
+                      t1437.typed_data(), t3714.typed_data()};
+  tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, std::string(trunk_dir),
+          std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
+          std::string(emb_dir), st};
+  auto* m = ds_get(k, t, t1);
+  m->st = st;
+
+  design_step::Inputs in{};
+  in.sequence = sequence.typed_data();
+  in.atoms = atoms.typed_data();
+  in.atom_mask = atom_mask.typed_data();
+  in.flags = flags.typed_data();
+  in.residue_index = residue_index.typed_data();
+  in.asym_id = asym_id.typed_data();
+  in.entity_id = entity_id.typed_data();
+  in.interface_asym = interface_asym.typed_data();
+  in.seq_mask = seq_mask.typed_data();
+  in.act_const = act_const.typed_data();
+  in.n = n.typed_data();                 // RUNTIME length, read on device
+  in.seed = seed.typed_data();
+  in.scalars = scalars.typed_data();   // [4], on the device, NOT attributes
+
+  design_step::Outputs out{};
+  out.atoms = out_atoms->typed_data();
+  out.plddt = out_plddt->typed_data();
+  out.pae = out_pae->typed_data();
+  out.ptm = out_ptm->typed_data();
+  out.iptm = out_iptm->typed_data();
+  out.iptm_per_residue = out_iptm_pr->typed_data();
+  out.expres_ca = out_expres->typed_data();
+  out.distogram = out_dgram->typed_data();
+
+  m->forward(in, out, /*want_save*/true);
+  return ffi::Error::Success();
+}
+
+// THE BACKWARD IS A FORWARD TOO.  design_step's backward reads what the
+// forward left -- the head logits, the per-alignment vector, the Kabsch
+// rotation -- so a backward-only custom call has to run the forward first,
+// into the scratch outputs the step carries for exactly this.  It is not a
+// replay-free shortcut: the components inside still replay, which is what
+// makes recycling safe (see the Cotangents note in design_step.cuh).
+ffi::Error DesignStepBwdImpl(
+    cudaStream_t st,
+    ffi::Buffer<ffi::F32> sequence, ffi::Buffer<ffi::F32> atoms,
+    ffi::Buffer<ffi::F32> atom_mask, ffi::Buffer<ffi::U8> flags,
+    ffi::Buffer<ffi::S32> residue_index, ffi::Buffer<ffi::S32> asym_id,
+    ffi::Buffer<ffi::S32> entity_id, ffi::Buffer<ffi::S32> interface_asym,
+    ffi::Buffer<ffi::F32> seq_mask, ffi::Buffer<ffi::F32> act_const,
+    ffi::Buffer<ffi::S32> n, ffi::Buffer<ffi::U32> seed,
+    ffi::Buffer<ffi::F32> t14m, ffi::Buffer<ffi::F32> t37m,
+    ffi::Buffer<ffi::S32> t1437, ffi::Buffer<ffi::S32> t3714,
+    ffi::Buffer<ffi::S32> chi_idx, ffi::Buffer<ffi::F32> chi_mask,
+    ffi::Buffer<ffi::F32> ct_atoms, ffi::Buffer<ffi::F32> ct_plddt,
+    ffi::Buffer<ffi::F32> ct_pae, ffi::Buffer<ffi::F32> ct_ptm,
+    ffi::Buffer<ffi::F32> ct_iptm, ffi::Buffer<ffi::F32> ct_iptm_pr,
+    ffi::Buffer<ffi::F32> ct_expres, ffi::Buffer<ffi::F32> ct_dgram,
+    ffi::Buffer<ffi::F32> scalars,
+    int64_t recycles, int64_t msa_rows,
+    std::string_view trunk_dir, std::string_view extra_dir,
+    std::string_view tpl_dir, std::string_view post_dir,
+    std::string_view emb_dir,
+    ffi::Result<ffi::Buffer<ffi::F32>> d_sequence) {
+  const int NMAX = (int)sequence.dimensions()[0];
+  inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
+                      t1437.typed_data(), t3714.typed_data()};
+  tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, std::string(trunk_dir),
+          std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
+          std::string(emb_dir), st};
+  auto* m = ds_get(k, t, t1);
+  m->st = st;
+
+  design_step::Inputs in{};
+  in.sequence = sequence.typed_data();
+  in.atoms = atoms.typed_data();
+  in.atom_mask = atom_mask.typed_data();
+  in.flags = flags.typed_data();
+  in.residue_index = residue_index.typed_data();
+  in.asym_id = asym_id.typed_data();
+  in.entity_id = entity_id.typed_data();
+  in.interface_asym = interface_asym.typed_data();
+  in.seq_mask = seq_mask.typed_data();
+  in.act_const = act_const.typed_data();
+  in.n = n.typed_data();
+  in.seed = seed.typed_data();
+  in.scalars = scalars.typed_data();
+
+  m->forward(in, m->scratch, /*want_save*/true);
+
+  design_step::Cotangents ct{};
+  ct.atoms = ct_atoms.typed_data();
+  ct.plddt = ct_plddt.typed_data();
+  ct.pae = ct_pae.typed_data();
+  ct.ptm = ct_ptm.typed_data();
+  ct.iptm = ct_iptm.typed_data();
+  ct.iptm_per_residue = ct_iptm_pr.typed_data();
+  ct.expres_ca = ct_expres.typed_data();
+  ct.distogram = ct_dgram.typed_data();
+  m->backward(in, ct, d_sequence->typed_data());
+  return ffi::Error::Success();
+}
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    NativeDesignStepBwd, DesignStepBwdImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::U8>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::U32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // the four design scalars [4]
+        .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
+        .Attr<std::string_view>("trunk_dir")
+        .Attr<std::string_view>("extra_dir")
+        .Attr<std::string_view>("tpl_dir")
+        .Attr<std::string_view>("post_dir")
+        .Attr<std::string_view>("emb_dir")
+        .Ret<ffi::Buffer<ffi::F32>>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    NativeDesignStep, DesignStepImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::U8>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::U32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // the four design scalars [4]
+        .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
+        .Attr<std::string_view>("trunk_dir")
+        .Attr<std::string_view>("extra_dir")
+        .Attr<std::string_view>("tpl_dir")
+        .Attr<std::string_view>("post_dir")
+        .Attr<std::string_view>("emb_dir")
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>());

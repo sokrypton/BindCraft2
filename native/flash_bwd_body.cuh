@@ -478,6 +478,27 @@ __global__ void rowDotK(const half* __restrict__ dO, const half* __restrict__ O,
 // are cheaper than a 134 MB write plus a 134 MB read, dS need not exist at all.
 // The contention is N_b deep (every batch row hits the same [h][i][j]) against
 // the 2-4 of dK/dV, which is why it has to be measured rather than assumed.
+// 2^40.  Resolution 9.1e-13 against dnbb values that live around 1e-3 to
+// 1e-6, so the fixed point carries far more than the bf16 the gradient is
+// stored in; and the int64 range saturates only at a SUM of 8.4e6, which a
+// finite gradient does not reach.  `nbbSat` counts any term that would have
+// overflowed, so the choice cannot fail silently -- it is read and reported
+// rather than assumed.
+__device__ __forceinline__ long long nbbFixed(float v, unsigned* sat) {
+  const double scaled = (double)v * 1099511627776.0;   // 2^40
+  if (!(scaled > -9.0e18 && scaled < 9.0e18)) {
+    if (sat) atomicAdd(sat, 1u);
+    return scaled > 0 ? 9000000000000000000LL : -9000000000000000000LL;
+  }
+  return (long long)scaled;
+}
+
+__global__ void nbbFromFixedK(const long long* __restrict__ src,
+                              float* __restrict__ dst, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = (float)((double)src[i] / 1099511627776.0);
+}
+
 template <bool DO_DV = true, bool DO_DK = true, bool DO_DS = true,
           bool NBB_ATOMIC = false>
 __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
@@ -490,6 +511,13 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
     // gradient at stride `tot`, instead of three f32 buffers that a later pass
     // has to read (100 MB) and narrow (50 MB).  dK/dV use the bf16x2 atomic,
     // so the accumulation rounds per add -- gated, not assumed.
+    // DETERMINISTIC dnbb.  `dnbbI` is the same tensor in int64 fixed point:
+    // every one of the N pair rows atomicAdds into the same [h][i][j], so
+    // with floats the ORDER decides the low bits and two identical runs
+    // return different gradients (measured: a design trajectory diverges by
+    // step 1).  INTEGER addition IS associative, so the fixed-point sum is
+    // the same whatever order the blocks arrive in.  See NBB_SCALE.
+    long long* __restrict__ dnbbI = nullptr,
     __nv_bfloat16* __restrict__ dcomb = nullptr, int tot = 0,
     // dQ STRAIGHT OUT AS BF16, separately from dK/dV.  `dcomb` above is an
     // all-or-nothing switch and the measurement that rejected it was about
@@ -743,8 +771,17 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
             }
             if (NBB_ATOMIC) {
               size_t o = ((size_t)h * N + i) * N + j;
+              if (dnbbI) {
+                if (j < N)
+                  atomicAdd((unsigned long long*)&dnbbI[o],
+                            (unsigned long long)nbbFixed(v0, nullptr));
+                if (j + 1 < N)
+                  atomicAdd((unsigned long long*)&dnbbI[o + 1],
+                            (unsigned long long)nbbFixed(v1, nullptr));
+              } else {
               if (j < N) atomicAdd(&dnbb[o], v0);
               if (j + 1 < N) atomicAdd(&dnbb[o + 1], v1);
+              }
             }
           }
           *slot = __floats2half2_rn(v0, v1);
@@ -764,7 +801,12 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
           if (i < N && j < N) {
             float v = __half2float(Ps[(size_t)row * LDH + lane]);
             if (DO_DS) dS[(((size_t)b * H + h) * N + i) * N + j] = __float2bfloat16(v);
-            if (NBB_ATOMIC) atomicAdd(&dnbb[((size_t)h * N + i) * N + j], v);
+            if (NBB_ATOMIC) {
+              const size_t o = ((size_t)h * N + i) * N + j;
+              if (dnbbI) atomicAdd((unsigned long long*)&dnbbI[o],
+                                   (unsigned long long)nbbFixed(v, nullptr));
+              else atomicAdd(&dnbb[o], v);
+            }
           }
         }
       }
@@ -778,7 +820,12 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
           float p = __half2float(Ps[(size_t)row * LDH + lane]);
           v = p * (Ss[(size_t)row * LDF + lane] - DS[row]);
           if (DO_DS) dS[(((size_t)b * H + h) * N + i) * N + j] = __float2bfloat16(v);
-          if (NBB_ATOMIC) atomicAdd(&dnbb[((size_t)h * N + i) * N + j], v);
+          if (NBB_ATOMIC) {
+            const size_t o = ((size_t)h * N + i) * N + j;
+            if (dnbbI) atomicAdd((unsigned long long*)&dnbbI[o],
+                                 (unsigned long long)nbbFixed(v, nullptr));
+            else atomicAdd(&dnbb[o], v);
+          }
         }
         Ps[(size_t)row * LDH + lane] = __float2half(v);
       }
