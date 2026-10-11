@@ -495,15 +495,21 @@ installed, so set them before starting a run.
 | --- | --- | --- |
 | `BC2_NATIVE_EXTRA` | on | The extra-MSA stack. `0` returns it to JAX. |
 | `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
-| `BC2_NATIVE_POST` | **off** | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `1` turns it on. |
+| `BC2_NATIVE_POST` | on | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `0` returns it to JAX. |
 
-`BC2_NATIVE_POST` is opt-in because it is new, not because it is known to be
-worse. At 179 tokens with a cold cache it takes the design graph's compile
-from 17.0 s to 7.7 s and the first gradient from 21.9 s to 12.4 s, for 1.1%
-more time per step. It carries AF2's structure-module dropout, and it is gated
-against AF2 on the real checkpoint. What has not been established is whether
-it changes design outcomes: a single trajectory cannot say, because two runs
-of the same settings differ by more than the backends do.
+`BC2_NATIVE_POST` is the newest of the three. At 179 tokens with a cold cache
+it takes the design graph's compile from 17.0 s to 7.7 s and the first
+gradient from 21.9 s to 12.4 s, for 1.1% more time per step. It carries AF2's
+structure-module dropout and is gated against AF2 on the real checkpoint.
+
+It is on because it clears the same bar the other two did: adding it moves
+pLDDT 1.9e-05 and the gradient norm 18.7%, where replacing the main Evoformer
+stack — which the default already does — moves them 2.8e-04 and 48.9%. The
+gradient move is real rather than noise, just smaller than one the model
+already accepts; `native/post_trunk_gate.py` reproduces the table. What no
+single run can tell you is whether it changes design *outcomes*: two
+trajectories with identical settings differ by more than the backends do, so
+if you are comparing results across versions, hold this fixed.
 
 
 Worker packing is limited by GPU memory, host memory and the campaign's attempt budget; sweep fan-out uses the budget of one arm. A trajectory-only run uses one worker per GPU. Lengths can be divided among workers, so faster length groups can appear more often in results. See [execution and environment overrides](installation.md#gpu-and-memory-controls) for scheduling, caches and GPU visibility.

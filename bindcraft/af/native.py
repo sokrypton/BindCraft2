@@ -734,14 +734,32 @@ def install_models(model_parameters: dict, depth: int = 48,
         # and the post-trunk step: the structure module and the four heads,
         # in one call.  OFF by default; BC2_NATIVE_POST=1 turns it on.
         #
-        # The native structure module now carries AF2's two dropout sites
-        # (folding_multimer.FoldIteration lines 428 and 449, rate 0.1
-        # elementwise on the act after each residual), so this installs
-        # whether or not design dropout is on.  It was guarded until it did:
-        # without them the path was not a faster structure module but a
-        # different one, and use_dropout is a runtime value so the hook
-        # cannot decline at trace time.
-        if os.environ.get('BC2_NATIVE_POST') == '1':
+        # and the post-trunk step: the structure module and the four heads in
+        # one call.  ON by default; BC2_NATIVE_POST=0 turns it off.
+        #
+        # It carries AF2's two dropout sites (folding_multimer.FoldIteration
+        # lines 428 and 449, rate 0.1 elementwise on the act after each
+        # residual).  It was guarded until it did: without them the path was
+        # not a faster structure module but a different one, and use_dropout
+        # is a runtime value so the hook cannot decline at trace time.
+        #
+        # Judged on the bar the extra-MSA and template stacks were enabled on
+        # -- does adding it move the model MORE than replacing the main stack
+        # already does?  native/post_trunk_gate.py, N=179, dropout off:
+        #
+        #   xla        plddt 0.450951  |grad| 10.6216
+        #   main       plddt 0.451231  |grad|  5.4268
+        #   main+post  plddt 0.451212  |grad|  4.4129
+        #   main+post  plddt 0.451212  |grad|  4.4118   <- the floor
+        #   main       plddt 0.451235  |grad|  5.4032   <- the floor
+        #
+        # The main stack swap moves pLDDT 2.8e-04 and the gradient norm
+        # 48.9%; adding this moves them a further 1.9e-05 and 18.7%, 15x and
+        # 5x less.  The gradient move is REAL -- 18.7% against a 0.025%
+        # floor -- just smaller than one the default already makes.  And it
+        # takes the design graph's compile from 17.0 s to 7.7 s at 179
+        # tokens for 1.1% more time a step.
+        if os.environ.get('BC2_NATIVE_POST') != '0':
             # LOUD, not silent.  The other two stacks swallow a KeyError
             # because a preset that lacks them is a normal thing; asking for
             # this one explicitly and silently not getting it is not, and a
