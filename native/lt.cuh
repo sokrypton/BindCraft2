@@ -190,10 +190,24 @@ struct Lt {
   // It costs a little accuracy -- forward 6.94e-03 -> 8.73e-03, grad/pair
   // 9.94e-02 -> 1.12e-01 -- because a different algorithm accumulates in a
   // different order; that is well inside the band the design cares about.
-  // NO_LT_TUNE turns it off.
+  // OFF BY DEFAULT, AND THAT IS A REPRODUCIBILITY DECISION.
+  //
+  // This is an autotuner, and it has the same failure XLA's has: it times
+  // candidates with CUDA events and keeps the fastest, so WHICH ONE WINS
+  // DEPENDS ON WHAT ELSE THE CARD WAS DOING.  A second process picks
+  // differently, accumulates in a different order, and returns a different
+  // gradient -- measured at rel 1.5e-02, which was enough to send two
+  // identical design trajectories to different sequences (27 of 64
+  // positions agreeing after ten steps).
+  //
+  // It is not a trade worth making: a native fwd+bwd measured 604.4 ms
+  // against 598.7 with it on at 192 residues (+0.95%), and 84.9 against
+  // 85.6 at 64.  About one per cent, for two runs that agree bit for bit.
+  //
+  // LT_TUNE=1 turns it back on.  NO_LT_TUNE still works and is now a no-op.
   void tune(Plan& p, const void* A, const void* B, void* D, cudaStream_t stream) {
     p.tuned = true;
-    if (p.ncand < 2 || getenv("NO_LT_TUNE")) return;
+    if (p.ncand < 2 || !getenv("LT_TUNE") || getenv("NO_LT_TUNE")) return;
     cudaEvent_t t0, t1;
     CU(cudaEventCreate(&t0)); CU(cudaEventCreate(&t1));
     float alpha = 1.f, beta = 0.f, best = 1e30f;

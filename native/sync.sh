@@ -16,14 +16,21 @@ if [ ! -d "$SRC" ]; then
   exit 1
 fi
 
-FILES=$(ls ./*.cu ./*.cuh | xargs -n1 basename)
+# ENUMERATE FROM THE SOURCE, not from here.  Listing the local files means a
+# header that is NEW in ColabDesign2 never arrives, and the first symptom is
+# the build failing on an include that was added upstream months ago --
+# which is exactly how this copy ended up unbuildable (`fatal error:
+# seqfeat.cuh: No such file or directory`) while reporting itself in step.
+FILES=$(ls "$SRC"/*.cu "$SRC"/*.cuh | xargs -n1 basename)
 CHECK=0
 [ "${1:-}" = "--check" ] && CHECK=1
 
 drift=0
 for f in $FILES; do
-  if [ ! -f "$SRC/$f" ]; then
-    echo "sync: $f is no longer in ColabDesign2"; drift=1; continue
+  if [ ! -f "$f" ]; then
+    echo "sync: $f is NEW in ColabDesign2"; drift=1
+    [ "$CHECK" = 0 ] && cp "$SRC/$f" "$f"
+    continue
   fi
   if ! cmp -s "$f" "$SRC/$f"; then
     echo "sync: $f differs"; drift=1

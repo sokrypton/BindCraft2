@@ -659,6 +659,20 @@ __global__ void toBf16K(__nv_bfloat16* __restrict__ dst,
   if (i < n) dst[i] = __float2bfloat16(src[i]);
 }
 
+// ROUND IN PLACE TO bf16 PRECISION, staying f32.
+//
+// AF2 multimer runs its whole embedder region under
+// `utils.bfloat16_context()` -- global_config.bfloat16 is True -- so every
+// Linear, every LayerNorm and every `+=` between the input features and the
+// extra-MSA stack lands on a bf16 grid.  A port that keeps f32 there is
+// MORE accurate and still WRONG as a drop-in: the trunk amplifies the
+// difference, and bc2's own native embedder hook rounds its f32 result back
+// (`msa_activations.astype(dtype)`) for exactly this reason.
+__global__ void roundBf16K(float* __restrict__ x, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = __bfloat162float(__float2bfloat16(x[i]));
+}
+
 // THE ADD AND THE NARROWING ARE ONE KERNEL.  Every module is handed a bf16
 // view of the f32 activation, and doing that in its own pass costs a 33.6 MB
 // read plus a 16.8 MB write every time -- in the forward, again in the

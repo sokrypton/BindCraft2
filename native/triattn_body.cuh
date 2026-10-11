@@ -608,6 +608,11 @@ struct TriAttn {
   float* lseF;                        // its row log-sum-exp, in the log2 domain
   half* davH;
   float *dQf, *dKf, *dVf, *lseD, *dnbbF;  // f32: dK, dV and dnbb arrive by atomics
+  // dnbb's int64 fixed-point twin; see nbbFixed in flash_bwd_body.cuh.
+  // NE_NONDET_NBB=1 goes back to the float atomics, which are 1.4e-02
+  // nondeterministic run to run and were the reason a design trajectory
+  // could not be reproduced.
+  long long* dnbbI = nullptr;
   __nv_bfloat16 *wcat, *wcatT, *wcatS, *bcat, *wo, *woT, *bo;
   float *mu, *rstd;
   // the ENDING node is the same computation on the transposed pair.  The old
@@ -680,6 +685,7 @@ struct TriAttn {
     CU(cudaMalloc(&dVf, mc * 4));
     CU(cudaMalloc(&lseD, (size_t)N * H * N * 4));
     CU(cudaMalloc(&dnbbF, (size_t)H * M * 4));
+    if (!envOn("NE_NONDET_NBB")) CU(cudaMalloc(&dnbbI, (size_t)H * M * 8));
     CU(cudaMalloc(&mu, M * 4)); CU(cudaMalloc(&rstd, M * 4));
 
   }
@@ -709,7 +715,7 @@ struct TriAttn {
                     (void*)dKf, (void*)dVf, (void*)dnbbF})
       if (p) CU(cudaFree(p));
     dcomb = o.dcomb; dag = o.dag; dx = o.dx; davH = o.davH;
-    dKf = o.dKf; dVf = o.dVf; dnbbF = o.dnbbF;
+    dKf = o.dKf; dVf = o.dVf; dnbbF = o.dnbbF; dnbbI = o.dnbbI;
   }
 
   void setWeights(Oracle& o, const std::string& P) {
@@ -935,10 +941,12 @@ struct TriAttn {
         CU(cudaMemsetAsync(dKf, 0, mc * 4, st));
         CU(cudaMemsetAsync(dVf, 0, mc * 4, st));
         CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * M * 4, st));
+        if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
       } else {
         zeroFast(dKf, mc * 4, st);
         zeroFast(dVf, mc * 4, st);
         zeroFast(dnbbF, (size_t)H * M * 4, st);
+        if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
       }
     }
     {
@@ -984,17 +992,21 @@ struct TriAttn {
         PROF_STEP("ta.b flashBwd",
           TA_FB::flashBwdK<false, false, false, true><<<g, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
             qkvgH, 4 * C, biasH, davH, lseF, lseD, mask, nullptr, dQf, dKf, dVf, N, H,
-            dnbbF, nullptr, 0, dcomb, TOT));
+            dnbbF, dnbbI, nullptr, 0, dcomb, TOT));
       } else if (envOn("NO_DNBB")) {
         PROF_STEP("ta.b flashBwd",
           TA_FB::flashBwdK<true, true, false, false><<<g, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
             qkvgH, 4 * C, biasH, davH, lseF, lseD, mask, nullptr, dQf, dKf, dVf, N, H,
-            nullptr, nullptr, 0, dcomb, TOT));
+            nullptr, nullptr, nullptr, 0, dcomb, TOT));
       } else
       PROF_STEP("ta.b flashBwd",
         TA_FB::flashBwdK<true, true, false, true><<<g, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
           qkvgH, 4 * C, biasH, davH, lseF, lseD, mask, nullptr, dQf, dKf, dVf, N, H,
-          dnbbF, nullptr, 0, dcomb, TOT));
+          dnbbF, dnbbI, nullptr, 0, dcomb, TOT));
+    // fixed point -> float, once, in a kernel nothing else races with
+    if (dnbbI)
+      TA_FB::nbbFromFixedK<<<(int)(((size_t)H * M + 255) / 256), 256, 0, st>>>(
+          dnbbI, dnbbF, (size_t)H * M);
     }
     // TA_SPLIT runs the old scatter-then-GEMM pair, which is the A/B this was
     // decided on and the fallback if a card ever disagrees.

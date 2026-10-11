@@ -195,6 +195,10 @@ struct MsaRow {
   __nv_bfloat16 *x, *pn, *comb, *nbb, *ag, *out, *dcomb, *dag, *dnbbB, *dx, *dpn;
   half *qkvgH, *biasH, *avH, *davH, *outH;
   float *mu, *rstd, *pmu, *prstd, *lseF, *Dv, *dQf, *dKf, *dVf, *dnbbF;
+  // dnbb's int64 fixed-point twin -- the float atomics are order-dependent
+  // and that is what stopped a design trajectory reproducing.  See
+  // nbbFixed in flash_bwd_body.cuh; NE_NONDET_NBB=1 restores them.
+  long long* dnbbI = nullptr;
   // dynamic loss scaling for the f16 attention backward: [0] scales the
   // cotangent down, [1] scales the three gradients back up.  See common.cuh.
   float* lscale = nullptr;
@@ -246,6 +250,8 @@ struct MsaRow {
     CU(cudaMalloc(&Dv, (size_t)S * H * N * 4));
     CU(cudaMalloc(&dQf, Mm * W * 4)); CU(cudaMalloc(&dKf, Mm * W * 4));
     CU(cudaMalloc(&dVf, Mm * W * 4)); CU(cudaMalloc(&dnbbF, (size_t)H * Mp * 4));
+    if (!envOn("NE_NONDET_NBB"))
+      CU(cudaMalloc(&dnbbI, (size_t)H * Mp * 8));
     CU(cudaMalloc(&lscale, 2 * 4)); CU(cudaMalloc(&lmax, 4));
   }
 
@@ -335,6 +341,7 @@ struct MsaRow {
     CU(cudaMemsetAsync(dKf, 0, Mm * W * 4, st));
     CU(cudaMemsetAsync(dVf, 0, Mm * W * 4, st));
     CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * Mp * 4, st));
+    if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * Mp * 8, st));
     static bool once = false;
     if (!once) {
       CU(cudaFuncSetAttribute((const void*)fb::flashBwdK<true, true, false, true>,
@@ -344,7 +351,11 @@ struct MsaRow {
     }
     dim3 g((N + fb::BM - 1) / fb::BM, H, S);
     fb::flashBwdK<true, true, false, true><<<g, 32 * fb::WARPS, fb::bwdSmem(), st>>>(
-        qkvgH, TOT, biasH, davH, lseF, Dv, mask, nullptr, dQf, dKf, dVf, N, H, dnbbF);
+        qkvgH, TOT, biasH, davH, lseF, Dv, mask, nullptr, dQf, dKf, dVf, N, H,
+        dnbbF, dnbbI);
+    if (dnbbI)
+      fb::nbbFromFixedK<<<(int)(((size_t)H * Mp + 255) / 256), 256, 0, st>>>(
+          dnbbI, dnbbF, (size_t)H * Mp);
     // and unscale the three gradients the kernel produced, before anything
     // reads them
     scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dQf, lscale, 1, nmw);

@@ -55,7 +55,45 @@ def _find_lib():
     return _candidates()[0]        # the vendored path, for the error message
 
 
+def _refuse_if_stale(lib: str) -> None:
+    """A STALE .so IS WORSE THAN A MISSING ONE.
+
+    ColabDesign2's backend.py says so and refuses; this loader did not, and
+    picked the first file that existed.  That is not hypothetical: a
+    thirteen-hour-old library served a whole afternoon of measurements
+    while the fixes under test sat in the sources next to it, and the only
+    symptom was that the numbers did not move.
+
+    Sources beside the library are the evidence.  A vendored .so shipped
+    without them cannot be checked and is left alone.
+    """
+    src_dir = os.path.dirname(os.path.abspath(lib))
+    try:
+        built = os.path.getmtime(lib)
+        newer = [f for f in os.listdir(src_dir)
+                 if f.endswith(('.cu', '.cuh'))
+                 and os.path.getmtime(os.path.join(src_dir, f)) > built]
+    except OSError:
+        return
+    if not newer:
+        return
+    raise RuntimeError(
+        f'{lib} is older than {len(newer)} of its sources '
+        f'({", ".join(sorted(newer)[:4])}{"..." if len(newer) > 4 else ""}).\n'
+        f'It would run code that is not the code in the tree.  Rebuild it:\n'
+        f'  cd {src_dir} && nvcc -O3 -std=c++17 \\\n'
+        f'    -gencode arch=compute_80,code=sm_80 \\\n'
+        f'    -gencode arch=compute_86,code=sm_86 \\\n'
+        f'    -gencode arch=compute_90,code=sm_90 \\\n'
+        f'    --compiler-options -fPIC -shared -I. \\\n'
+        f"    -I$(python -c 'import jax.ffi;print(jax.ffi.include_dir())') \\\n"
+        f'    ffi.cu -lcublas -lcublasLt -o {os.path.basename(lib)}\n'
+        f'BC2_NATIVE_LIB_STALE_OK=1 runs it anyway.')
+
+
 _LIB = _find_lib()
+if os.path.exists(_LIB) and not os.environ.get('BC2_NATIVE_LIB_STALE_OK'):
+    _refuse_if_stale(_LIB)
 # ONLY the legacy install() path reads weights from disk.  install_models()
 # materialises them from the live param tree, which is what a campaign uses,
 # so a weights directory is NOT a requirement for the native path to work --
