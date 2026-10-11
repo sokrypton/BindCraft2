@@ -526,11 +526,24 @@ the same three trajectory hashes:
 | accepted | 0 / 3 | 0 / 3 |
 
 Neither arm accepted anything, so there is no acceptance difference to read.
-On stage depth it is 2-1 to off. That is not enough to call it a regression
--- WITH DROPOUT ON THE TWO ARMS DRAW DIFFERENT MASKS, because the native
-path splits the SafeKey before its reference pass, so the trajectories
-diverge for a reason that has nothing to do with the kernels. It is more
-than enough to leave the flag off.
+On stage depth it is 2-1 to off.
+
+PART OF THAT WAS AN RNG BUG OF OUR OWN, since fixed: `hk.eval_shape` was
+handed the real SafeKey, forcing an extra split so the native arm drew
+different dropout masks from the JAX arm by construction. With the reference
+pass on a throwaway key, the same three trajectories re-run:
+
+| trajectory | on, before | on, after | off |
+| --- | --- | --- | --- |
+| c4dd0ffbc9d291dc | rejected at screen 0.64 | anneal 0.81, rejected at harden | passed all five |
+| 707d3e7f0f7e5c8c | rejected at mutate 0.49 | harden 0.59, rejected at mutate 0.55 | passed all five |
+| 5245753cc9f283a6 | rejected at harden 0.19 | rejected at anneal 0.28 | rejected at screen 0.40 |
+| accepted | 0 / 3 | 0 / 3 | 0 / 3 |
+
+The fix improved the native arm's absolute depth on two of three, and the
+comparison against off stayed 2-1.  Nothing accepted in ANY arm, so the
+target and settings are simply hard here and three trajectories cannot
+separate the two.  The flag stays off until someone runs enough of them.
 
 With dropout OFF, where the masks cannot differ, one paired trajectory had
 them equivalent and the native arm accepted (0.80 / 0.90 against 0.79 /
