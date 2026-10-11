@@ -112,6 +112,35 @@
 # pair stack at all.  It isolates opacity by holding the missing work
 # constant against the 10.0 s row; it is not a model anyone can run.
 #
+# A BARRIER UPSTREAM SAVES 0.7 s AND MOVES THE MODEL.  Put an
+# optimization_barrier on query_embedding entering the template embedding --
+# splitting the one long JAX region that the embedder, the relative encoding,
+# the recycle terms and construct_input all share -- and design_loss goes
+# 7.8 -> 7.1 s.  It is not adoptable:
+#
+#   full        plddt 0.451212  ptm 0.146862  |grad| 4.4077
+#   qbar        plddt 0.452332  ptm 0.146948  |grad| 2.9677   <- 0.7 s cheaper
+#   f32 qbar    plddt 0.452332  ptm 0.146948  |grad| 2.9698   <- same in f32
+#   patchonly   plddt 0.451212  ptm 0.146862  |grad| 4.4101   <- patch is clean
+#
+# The barrier is a semantic no-op: run SingleTemplateEmbedding with and
+# without one on the same parameters and the outputs are bit-identical,
+# max|d| 0.000e+00.  The wrapper that installs it is also innocent -- the same
+# wrapper with the barrier removed reproduces the baseline exactly.  And it is
+# not a bfloat16 artefact: f32 gives the same deviation to six figures.
+#
+# What is left is that changing the FUSION changes f32 accumulation order by
+# ~1e-7, and the model amplifies that through 48 Evoformer blocks and a
+# structure module stiff enough that a 1e-3 move in its input shifts an atom
+# 0.13 A.  1.1e-03 on pLDDT and a third of the gradient norm.
+#
+# The lesson generalises past this one op: A TRANSFORMATION BEING
+# SEMANTICS-PRESERVING DOES NOT MAKE IT OUTPUT-PRESERVING HERE.  Anything that
+# changes how XLA fuses the graph upstream of the trunk has to be checked
+# against the metrics, not argued from its definition.  For scale, the native
+# embedder moves pLDDT 1.4e-04 for 0.8 s and is off by default; this is eight
+# times that for less.
+#
 # WHAT IS A RESULT: THESE DELTAS ARE MARGINAL, NOT ADDITIVE, AND CAN BE
 # NEGATIVE.  Each row says what happens if you remove that one thing, which
 # is the honest question for deciding whether to remove it.  It does not say
