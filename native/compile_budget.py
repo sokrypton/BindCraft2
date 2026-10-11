@@ -73,6 +73,28 @@
 # There is no large single cause left in the template path.  Anyone looking
 # for one should know these three numbers before starting.
 #
+# SPLIT FURTHER, and with a warning about reading any of this as a sum:
+#
+#   full                                        7.8 s
+#   TemplateEmbedding.__call__ stubbed to zeros 4.2 s  -> its contents 3.6 s
+#   templates disabled                          3.9 s  -> batch features 0.3 s
+#   native stack call replaced by IDENTITY      9.9 s  -> TWO SECONDS WORSE
+#
+# That last row is not a typo and it reproduced with the substitution printed
+# from inside the trace.  Removing the native template stack call makes the
+# design compile 2.1 s SLOWER than leaving it in.  The call also carries the
+# 32-padding, so which of the two is responsible is NOT isolated here, and
+# jax.lax.optimization_barrier in the same place does not reproduce the
+# benefit (7.8 s, unchanged), nor does one on the PAE logits (7.9 s).  So
+# "the custom call acts as a fusion barrier" is a guess, not a result.
+#
+# WHAT IS A RESULT: THESE DELTAS ARE MARGINAL, NOT ADDITIVE, AND CAN BE
+# NEGATIVE.  Each row says what happens if you remove that one thing, which
+# is the honest question for deciding whether to remove it.  It does not say
+# that thing "costs" that much in a way that sums to the total, and a row
+# that goes the wrong way proves the interactions are real.  Read the table
+# as a list of marginal answers, not a pie chart.
+#
 # AND OUTSIDE THE TEMPLATE PATH, the 4.0 s that remains with templates off:
 #
 #   the confidence metrics (pTM, ipTM, PAE)   2.0 s   <- the largest item left
