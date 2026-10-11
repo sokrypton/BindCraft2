@@ -125,13 +125,13 @@ def cyclic_sequence_offsets(residue_index: Array, asym_id: Array, flags: Array, 
         cyclic_distance = jnp.where(jnp.abs(cyclic_distance) > 2, 32 * jnp.sign(cyclic_distance), cyclic_distance)
     return jnp.where(cyclic_pairs, cyclic_distance * jnp.sign(offsets), offsets).astype(jnp.int32)
 
-def alphafold_input_features(sequence: Array, sequence_profile: Array, atoms: Array, atom_mask: Array, residue_index: Array, asym_id: Array, seq_mask: Array, flags: Array, dropout: Array, cyclic_offset_mode: str='direction', entity_id: Array | None=None, target_flexibility: float=0.0, bigbang_initialization: bool=False) -> dict[str, Array]:
+def alphafold_input_features(sequence: Array, sequence_profile: Array, atoms: Array, atom_mask: Array, residue_index: Array, asym_id: Array, seq_mask: Array, flags: Array, dropout: Array, cyclic_offset_mode: str='direction', entity_id: Array | None=None, target_flexibility: float=0.0, bigbang_initialization: bool=False, template_act_const: Array | None=None) -> dict[str, Array]:
     length = sequence.shape[0]
     aatype = sequence.argmax(-1).astype(jnp.int32)
     mask = seq_mask[:, None]
     entity_id = asym_id if entity_id is None else entity_id
     msa_feat = jnp.zeros((1, length, 49)).at[:, :, 0:20].set(sequence[None]).at[:, :, 25:45].set(sequence_profile[None])
-    return {'aatype': aatype, 'residue_index': residue_index, 'offset': cyclic_sequence_offsets(residue_index, asym_id, flags, seq_mask, cyclic_offset_mode), 'asym_id': asym_id, 'entity_id': entity_id, 'sym_id': asym_id, 'seq_mask': seq_mask, 'msa_mask': jnp.ones((1, length)) * seq_mask[None], 'target_feat': sequence, 'msa_feat': msa_feat, 'extra_msa': jnp.zeros((1, length), dtype=jnp.int32), 'extra_msa_mask': jnp.zeros((1, length), dtype=jnp.float32), 'extra_has_deletion': jnp.zeros((1, length), dtype=jnp.float32), 'extra_deletion_value': jnp.zeros((1, length)), 'all_atom_positions': atoms.astype(jnp.float32), 'all_atom_mask': atom_mask.astype(jnp.float32), 'atom14_atom_exists': jnp.where(mask, jnp.asarray(residue_constants.restype_atom14_mask)[aatype], 0), 'atom37_atom_exists': jnp.where(mask, jnp.asarray(residue_constants.restype_atom37_mask)[aatype], 0), 'residx_atom14_to_atom37': jnp.where(mask, jnp.asarray(residue_constants.restype_atom14_to_atom37)[aatype], 0), 'residx_atom37_to_atom14': jnp.where(mask, jnp.asarray(residue_constants.restype_atom37_to_atom14)[aatype], 0), 'use_dropout': dropout, 'prev': {'prev_msa_first_row': jnp.zeros((length, 256)), 'prev_pair': jnp.zeros((length, length, 128)), 'prev_pos': jnp.zeros((length, 37, 3))}, **({'initial_atom_pos': atoms.astype(jnp.float32)} if bigbang_initialization else {}), **target_template_features(aatype, atoms, atom_mask, flags, residue_index, target_flexibility)}
+    return {'aatype': aatype, 'residue_index': residue_index, 'offset': cyclic_sequence_offsets(residue_index, asym_id, flags, seq_mask, cyclic_offset_mode), 'asym_id': asym_id, 'entity_id': entity_id, 'sym_id': asym_id, 'seq_mask': seq_mask, 'msa_mask': jnp.ones((1, length)) * seq_mask[None], 'target_feat': sequence, 'msa_feat': msa_feat, 'extra_msa': jnp.zeros((1, length), dtype=jnp.int32), 'extra_msa_mask': jnp.zeros((1, length), dtype=jnp.float32), 'extra_has_deletion': jnp.zeros((1, length), dtype=jnp.float32), 'extra_deletion_value': jnp.zeros((1, length)), 'all_atom_positions': atoms.astype(jnp.float32), 'all_atom_mask': atom_mask.astype(jnp.float32), 'atom14_atom_exists': jnp.where(mask, jnp.asarray(residue_constants.restype_atom14_mask)[aatype], 0), 'atom37_atom_exists': jnp.where(mask, jnp.asarray(residue_constants.restype_atom37_mask)[aatype], 0), 'residx_atom14_to_atom37': jnp.where(mask, jnp.asarray(residue_constants.restype_atom14_to_atom37)[aatype], 0), 'residx_atom37_to_atom14': jnp.where(mask, jnp.asarray(residue_constants.restype_atom37_to_atom14)[aatype], 0), 'use_dropout': dropout, 'prev': {'prev_msa_first_row': jnp.zeros((length, 256)), 'prev_pair': jnp.zeros((length, length, 128)), 'prev_pos': jnp.zeros((length, 37, 3))}, **({'initial_atom_pos': atoms.astype(jnp.float32)} if bigbang_initialization else {}), **target_template_features(aatype, atoms, atom_mask, flags, residue_index, target_flexibility), **({'template_act_const': template_act_const} if template_act_const is not None else {})}
 
 def recycled_alphafold_outputs(alphafold_runner: af_model.RunModel, model_parameters: Array, key: Array, model_inputs: dict, num_recycle: int) -> dict:
     recycle_keys = jax.random.split(key, num_recycle + 1)
@@ -370,12 +370,12 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         compiled_gradient = self.gradient_compile_cache.get(cache_key)
         if compiled_gradient is None:
             state_alphafold_runners = {state_name: self._alphafold_runner(model_family, subbatch_size) for state_name, subbatch_size in state_subbatch_sizes}
-            def predict_complex_arrays(alphafold_runner: af_model.RunModel, model_parameters: Array, key: Array, chain_names: tuple[str, ...], chain_lengths: tuple[int, ...], sequence: Array, atoms: Array, atom_mask: Array, flags: Array, residue_index: Array, dropout: Array, softmax_weight: Array, one_hot_weight: Array, temperature: Array, logit_scale: Array):
+            def predict_complex_arrays(alphafold_runner: af_model.RunModel, model_parameters: Array, key: Array, chain_names: tuple[str, ...], chain_lengths: tuple[int, ...], sequence: Array, atoms: Array, atom_mask: Array, flags: Array, residue_index: Array, dropout: Array, softmax_weight: Array, one_hot_weight: Array, temperature: Array, logit_scale: Array, template_act_const: Array | None=None):
                 asym_id = residue_chain_ids(chain_lengths)
                 entity_id = residue_entity_ids(chain_names, chain_lengths, self.multi_chain_binders)
                 seq_mask = real_residue_weights(flags)
                 sequence_features, sequence_profile = prepare_design_sequence_features(sequence, flags, softmax_weight, one_hot_weight, temperature, logit_scale, self.amino_acid_bias)
-                model_inputs = alphafold_input_features(sequence_features, sequence_profile, atoms, atom_mask, residue_index, asym_id, seq_mask, flags, dropout, self.cyclic_offset_mode, entity_id, self.target_flexibility, self.bigbang_initialization)
+                model_inputs = alphafold_input_features(sequence_features, sequence_profile, atoms, atom_mask, residue_index, asym_id, seq_mask, flags, dropout, self.cyclic_offset_mode, entity_id, self.target_flexibility, self.bigbang_initialization, template_act_const)
                 alphafold_outputs = recycled_alphafold_outputs(alphafold_runner, model_parameters, key, model_inputs, self.num_recycle)
                 predicted_atom_positions = alphafold_outputs['structure_module']['final_atom_positions'].astype(jnp.float16)
                 predicted_atom_mask = alphafold_outputs['structure_module']['final_atom_mask'].astype(bool)
@@ -392,7 +392,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                 prediction_arrays: dict[str, tuple[Array, Array, dict]] = {}
                 for state_name, state_chain_names, chain_lengths in complex_shapes:
                     template = state_templates[state_name]
-                    original_complex, predicted_complex, predicted_atom_positions, predicted_atom_mask, metrics = predict_complex_arrays(state_alphafold_runners[state_name], model_parameters, key, state_chain_names, chain_lengths, jnp.concatenate([sequences[chain_name] for chain_name in state_chain_names], axis=0), template['atoms'], template['atom_mask'], template['flags'], template['residue_index'], dropout, softmax_weight, one_hot_weight, temperature, logit_scale)
+                    original_complex, predicted_complex, predicted_atom_positions, predicted_atom_mask, metrics = predict_complex_arrays(state_alphafold_runners[state_name], model_parameters, key, state_chain_names, chain_lengths, jnp.concatenate([sequences[chain_name] for chain_name in state_chain_names], axis=0), template['atoms'], template['atom_mask'], template['flags'], template['residue_index'], dropout, softmax_weight, one_hot_weight, temperature, logit_scale, template.get('act_const'))
                     protein_states[state_name] = original_complex
                     predictions[state_name] = StructurePrediction(protein_complex=predicted_complex, metrics=dict(metrics))
                     prediction_arrays[state_name] = predicted_atom_positions, predicted_atom_mask, metrics
@@ -437,6 +437,65 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         if self.native_evoformer:
             from .af import native
             native.use_model(model)   # bind THIS model's weights before tracing
+            # THE TEMPLATE CONSTANT, harvested once per target rather than
+            # rebuilt every step.  Eight of SingleTemplateEmbedding's nine
+            # feature projections depend only on the template, so this lifts
+            # the backbone affine, the rigid inverse, the pseudo-beta, the
+            # distogram, the one-hots and eight Linears out of the graph --
+            # off the compile AND off every step.
+            #
+            # aatype must come from the SAME place the graph gets it:
+            # prepare_design_sequence_features, then argmax.  Taking the raw
+            # sequence's argmax instead looks equivalent -- template residues
+            # are not designed, so their sequence is fixed -- and is not: the
+            # softmax, bias and temperature move the argmax at some template
+            # positions, and the metrics moved with it (pLDDT 0.451212 ->
+            # 0.450127).  The end-to-end check is what caught it.
+            # OFF by default, and not because of its speed.  In model it
+            # shifts pLDDT by 1.1e-03 (0.451212 -> 0.450127) and I could not
+            # account for it.  The module math is proven bit-identical --
+            # harvest the constant, hand it back, the whole of
+            # SingleTemplateEmbedding reproduces exactly, max|d| 0.000e+00 --
+            # so the difference is in the INPUTS this computes outside the
+            # graph, not in the substitution.  aatype was the obvious suspect
+            # and is not it: deriving it through
+            # prepare_design_sequence_features exactly as the graph does left
+            # the number unchanged to six figures.  With a single chain the
+            # multichain mask cannot be it either.
+            #
+            # It may well be nothing -- a barrier that is a PROVABLE no-op
+            # moves this model 1.1e-03 too, purely by reordering fusion -- but
+            # "may well be nothing" is not a reason to enable a path whose
+            # output I cannot account for.  BC2_TEMPLATE_CONST=1 to try it.
+            if os.environ.get('BC2_TEMPLATE_CONST') == '1':
+                for state_name, state_chain_names, _ in complex_shapes:
+                    tmpl = state_templates[state_name]
+                    seq = jnp.concatenate(
+                        [sequences[c] for c in state_chain_names], axis=0)
+                    seq_feat, _ = prepare_design_sequence_features(
+                        seq, tmpl['flags'], jnp.asarray(softmax_weight),
+                        jnp.asarray(one_hot_weight), jnp.asarray(temperature),
+                        jnp.asarray(logit_scale), self.amino_acid_bias)
+                    tf = target_template_features(
+                        seq_feat.argmax(-1).astype(jnp.int32), tmpl['atoms'],
+                        tmpl['atom_mask'], tmpl['flags'],
+                        tmpl['residue_index'], self.target_flexibility)
+                    # target_template_features emits a leading TEMPLATE
+                    # axis (hk.scan maps over it); SingleTemplateEmbedding
+                    # sees one slice, so drop it here
+                    tb = {k: tf[k][0] for k in ('template_aatype',
+                                                'template_all_atom_positions',
+                                                'template_all_atom_mask')}
+                    asym = residue_chain_ids(
+                        tuple(len(sequences[c]) for c in state_chain_names))
+                    mc = asym[:, None] == asym[None, :]
+                    n = seq.shape[0]
+                    pair_ch = 128
+                    # back on the TEMPLATE axis: template_batch is scanned
+                    # over it, so every entry needs one
+                    tmpl['act_const'] = native.template_act_const(
+                        self.model_parameters[model], tb, mc,
+                        (n, n, pair_ch), jnp.bfloat16)[None]
         compiled_sequence_gradients = self._compiled_sequence_gradients(model, complex_shapes, reference_shapes, losses)
         gradient_arguments = (self.model_parameters[model], self.key, sequences, state_templates, reference_templates, weights, frozen_interfaces, jnp.asarray(self.dropout), jnp.asarray(softmax_weight), jnp.asarray(one_hot_weight), jnp.asarray(temperature), jnp.asarray(logit_scale))
         with one_worker_compiles((model, complex_shapes, reference_shapes, tuple(sorted(losses)))):

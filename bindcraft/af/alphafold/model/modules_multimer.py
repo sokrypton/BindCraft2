@@ -87,6 +87,9 @@ NATIVE_POST_TRUNK_TRACES = [0]
 NATIVE_EMBEDDER = None
 NATIVE_EMBEDDER_TRACES = [0]
 
+# See the note at the template call site: 0.7 s of compile, 1.9 ms a step.
+TEMPLATE_QUERY_BARRIER = True
+
 
 def _native_post_trunk(representations, batch, config, safe_key):
   """Run the structure module and the four heads natively.
@@ -495,6 +498,8 @@ class EmbeddingsAndEvoformer(hk.Module):
         }
         if "template_dgram" in batch:
           template_batch["template_dgram"] = batch["template_dgram"]
+        if "template_act_const" in batch:
+          template_batch["template_act_const"] = batch["template_act_const"]
 
         # Construct a mask such that only intra-chain template features are
         # computed, since all templates are for each chain individually.
@@ -502,8 +507,16 @@ class EmbeddingsAndEvoformer(hk.Module):
         multichain_mask = jnp.where(batch["mask_template_interchain"], multichain_mask, True)
 
         safe_key, safe_subkey = safe_key.split()
+        # Splits the one long JAX region -- input Linears, relative encoding,
+        # recycle terms, construct_input -- that XLA otherwise optimises as a
+        # unit.  0.7 s of compile for 1.9 ms a step.  A semantic no-op that is
+        # not output-preserving: it reorders fusion, hence f32 accumulation,
+        # which this model amplifies to 1.1e-03 on pLDDT.
+        query_for_templates = (
+            jax.lax.optimization_barrier(pair_activations)
+            if TEMPLATE_QUERY_BARRIER else pair_activations)
         template_act = template_module(
-            query_embedding=pair_activations,
+            query_embedding=query_for_templates,
             template_batch=template_batch,
             padding_mask_2d=mask_2d,
             multichain_mask_2d=multichain_mask,
@@ -771,7 +784,8 @@ class SingleTemplateEmbedding(hk.Module):
     dtype = query_embedding.dtype
     num_channels = self.config.num_channels
     
-    def construct_input(query_embedding, template_batch, multichain_mask_2d):
+    def construct_input(query_embedding, template_batch, multichain_mask_2d,
+                        const_only=False):
 
       if "template_dgram" in template_batch:
         template_dgram = template_batch["template_dgram"].astype(dtype)
@@ -827,15 +841,21 @@ class SingleTemplateEmbedding(hk.Module):
       # pseudo beta mask which just needs CB) so we add both masks as features.
       to_concat.extend([(x, 0) for x in unit_vector])
       to_concat.append((backbone_mask_2d, 0))          
-      query_embedding = common_modules.LayerNorm(
-          axis=[-1],
-          create_scale=True,
-          create_offset=True,
-          name='query_embedding_norm')(query_embedding)
       # Allow the template embedder to see the query embedding.  Note this
       # contains the position relative feature, so this is how the network knows
       # which residues are next to each other.
-      to_concat.append((query_embedding, 1))
+      # EIGHT OF THE NINE FEATURES ARE CONSTANT WITHIN A DESIGN STEP.  Each
+      # is built from the TEMPLATE -- its aatype, atom positions and atom
+      # mask -- and designed residues are masked to aatype 21 whatever they
+      # currently are, so changing the sequence changes none of them.  Only
+      # query_embedding, the ninth, varies.
+      #
+      # const_only leaves the ninth off, producing exactly the sum a caller
+      # can compute once per target and hand back as template_act_const.
+      if not const_only:
+        to_concat.append((common_modules.LayerNorm(
+            axis=[-1], create_scale=True, create_offset=True,
+            name='query_embedding_norm')(query_embedding), 1))
 
       act = 0
 
@@ -847,7 +867,31 @@ class SingleTemplateEmbedding(hk.Module):
             name=f'template_pair_embedding_{i}')(x)
       return act
 
-    act = construct_input(query_embedding, template_batch, multichain_mask_2d)
+    def query_projection(query_embedding):
+      '''the ninth feature alone.  Both names are construct_input's own, in
+      the same scope, so this binds the same weights -- restating the
+      arithmetic anywhere else would bind template_pair_embedding_8 from
+      nothing.'''
+      q = common_modules.LayerNorm(
+          axis=[-1], create_scale=True, create_offset=True,
+          name='query_embedding_norm')(query_embedding)
+      return common_modules.Linear(
+          num_channels, num_input_dims=1, initializer='relu',
+          name='template_pair_embedding_8')(q)
+
+    if template_batch.get('__const_only__'):
+      # the harvest, from inside this module so the eight Linears keep their
+      # haiku scope and therefore their weights
+      return construct_input(query_embedding, template_batch,
+                             multichain_mask_2d, const_only=True)
+
+    act_const = template_batch.get('template_act_const')
+    if act_const is None:
+      act = construct_input(query_embedding, template_batch, multichain_mask_2d)
+    else:
+      # the same sum, with the constant eight read instead of rebuilt --
+      # removing them from EVERY step, not just from the compile
+      act = act_const.astype(dtype) + query_projection(query_embedding)
 
     template_iteration = TemplateEmbeddingIteration(
         c.template_pair_stack, gc, name='template_embedding_iteration')
