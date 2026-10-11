@@ -497,7 +497,7 @@ installed, so set them before starting a run.
 | `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
 | `BC2_NATIVE_EMBED` | on | The embedder's four input Linears and the relative-position gather. `0` turns it off. |
 | `BC2_NATIVE_POST` | on | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `0` returns it to JAX. |
-| `BC2_NATIVE_TPLEMBED` | **off** (see below) | The WHOLE template embedding -- the query LayerNorm, the ninth projection, both stack blocks, `output_layer_norm`, the relu and `output_linear` -- in one call. `1` turns it on, and it then supersedes `BC2_NATIVE_TEMPLATE`, which covers only the two blocks in the middle. Needs exactly one template and the harvested constant; without either it falls back to JAX silently. |
+| `BC2_NATIVE_TPLEMBED` | on (see below) | The WHOLE template embedding -- the query LayerNorm, the ninth projection, both stack blocks, `output_layer_norm`, the relu and `output_linear` -- in one call. `0` turns it off. It supersedes `BC2_NATIVE_TEMPLATE`, which covers only the two blocks in the middle, without disabling it. Needs exactly one template and the harvested constant; without either it falls back to JAX silently. |
 
 `BC2_NATIVE_POST` is the newest of the three. At 179 tokens with a cold cache
 it takes the design graph's compile from 17.0 s to 7.7 s and the first
@@ -513,7 +513,9 @@ single run can tell you is whether it changes design *outcomes*: two
 trajectories with identical settings differ by more than the backends do, so
 if you are comparing results across versions, hold this fixed.
 
-`BC2_NATIVE_TPLEMBED` STAYS OFF, and the campaign is why. Design-loss
+`BC2_NATIVE_TPLEMBED` IS ON BY REQUEST, NOT BY THE MEASUREMENT -- the
+campaign below could not separate it from the JAX path, and is recorded so
+nobody mistakes the default for evidence. Design-loss
 compile drops 6.4 -> 4.2 s with it on and the step does not move, so the
 case for it is purely compile. Paired hPDL1 campaigns, 3 trajectories each,
 the same three trajectory hashes:
@@ -543,7 +545,9 @@ pass on a throwaway key, the same three trajectories re-run:
 The fix improved the native arm's absolute depth on two of three, and the
 comparison against off stayed 2-1.  Nothing accepted in ANY arm, so the
 target and settings are simply hard here and three trajectories cannot
-separate the two.  The flag stays off until someone runs enough of them.
+separate the two.  Nobody has run enough of them to settle it; the flag is on regardless,
+so if a campaign ever looks wrong this is the first thing to turn off
+(`BC2_NATIVE_TPLEMBED=0`).
 
 With dropout OFF, where the masks cannot differ, one paired trajectory had
 them equivalent and the native arm accepted (0.80 / 0.90 against 0.79 /
