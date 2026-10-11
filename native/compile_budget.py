@@ -37,13 +37,24 @@
 # projections are recompiled into every design graph to recompute a value that
 # cannot change.  Only template_pair_embedding_8, on query_embedding, varies.
 #
-# Hoisting them -- computing act_const once per (target, flags, length) and
-# passing the [N, N, 64] result in -- would remove most of the 3.7 s with NO
-# numerical change at all, which no amount of porting can match.  It is left
-# as a recommendation rather than done here because it restructures the design
-# loop rather than adding an opt-in fast path, and because the modes that can
-# legitimately change a template mid-campaign (induced fit, multitarget target
-# swaps, redesign) decide whether the cache key is the target or the step.
+# HOISTING THEM IS WORTH 0.4 s, NOT 3 s, AND THAT WAS MEASURED BEFORE IT WAS
+# BUILT.  Feeding the design graph a precomputed constant in place of those
+# eight features -- a zeros array answers the question, since compile time is
+# a property of the graph and not of the data -- takes design_loss from 7.8 s
+# to 7.4 s.  The substitution itself is exact: running the whole of
+# SingleTemplateEmbedding with the constant handed back reproduces the shipped
+# output bit for bit (max|d| 0.000e+00).
+#
+# So the 3.7 s the template path costs is NOT mostly its feature
+# construction.  What is left is the pair stack's presence in the graph even
+# though its blocks are native, the hk.scan around it, the aggregation and
+# output_linear.  Those are where a further attempt should look.
+#
+# The hoist was implemented, proven exact, measured at 0.4 s and then REMOVED,
+# because the part that remained -- computing the constant outside the graph
+# and threading it through af2.py's compiled path -- is real surgery on a hot
+# path, and 0.4 s does not buy it.  Reverting cost nothing; building the
+# plumbing first and measuring second would have.
 import os, sys, time, logging, shutil
 ARM = sys.argv[1]
 cache = f'/tmp/claude-1000/budget_{ARM}'
