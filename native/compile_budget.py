@@ -11,6 +11,27 @@
 #
 #   for a in full notpl norecyc; do python native/compile_budget.py $a; done
 #
+# RE-MEASURED 2026-10-11 with the template EMBEDDING native as well
+# (BC2_NATIVE_TPLEMBED=1).  The template path is now essentially gone:
+#
+#   full      design_loss XLA  4.3 s
+#   notpl                      3.8 s   -> the template path is 0.5 s, was 3.7
+#   bareloss                   4.1 s   -> two of the three loss terms: 0.2 s
+#
+# AND STAGE 3 IS NOT WORTH DOING.  The plan was to port feature construction
+# so XLA compiles only the loss.  Feature construction, jitted on its own at
+# N=179, compiles in 0.23 s forward and 0.03 s with its gradient -- it is not
+# where the compile goes, and porting all of it could not buy more than that.
+#
+# WHICH LEAVES ~3.2 s UNACCOUNTED and no hypothesis yet: it is not features,
+# not the loss terms, not templates, not the recycle terms.  What is left is
+# the glue -- the recycling wrapper, the msa/pair assembly in
+# AlphaFoldIteration, and the HLO that jax.grad still builds AROUND the
+# custom calls.  Decomposing that is the next measurement, and it should come
+# before any more porting; the last two estimates made without it were both
+# wrong (the embedder at ~3 s was 0.8 s; feature construction looked like the
+# obvious target and is 0.23 s).
+#
 # Measured 2026-10-11, N=179, cold cache, native trunk + native post-trunk:
 #
 #   full      design_loss XLA  7.7 s
@@ -219,6 +240,14 @@ p = Protein.empty(179, jax.random.PRNGKey(1))
 st = {'complex': {'binder': p}, 'binder_alone': {'binder': p}}
 ls = build_losses({'weights_plddt_loss': 1.0, 'weights_sequence_entropy': 0.1,
                    'weights_compactness': 0.1})
+if ARM == 'bareloss':
+    # THE LOSS'S OWN SHARE.  The stated goal is a design step that compiles
+    # ONLY the loss -- "i dont like compile or cache ... but allow custom
+    # losses" -- so the loss's share is the floor stage 3 is aiming at, and
+    # everything above it is what porting feature construction could remove.
+    # The three terms are replaced by one that touches a single output, which
+    # keeps the graph's shape while removing the loss arithmetic.
+    ls = build_losses({'weights_plddt_loss': 1.0})
 t = time.perf_counter()
 r = af.sequence_gradients(st, ls, model='model_1_multimer_v3')
 jax.block_until_ready(jax.tree_util.tree_leaves(r[-1])[0])
