@@ -74,6 +74,69 @@ NATIVE_EXTRA_MSA_STACK = None
 NATIVE_TEMPLATE_STACK = None
 
 
+# Set by bindcraft.af.native.install_post(); None leaves the JAX path alone.
+NATIVE_POST_TRUNK = None
+
+
+def _native_post_trunk(representations, batch, config):
+  """Run the structure module and the four heads natively.
+
+  Returns None -- and the caller falls back to JAX -- whenever the native
+  path cannot produce exactly what the JAX one would: a head this model
+  weights that the call does not cover, or a shape it was not built for.
+  Falling back is always allowed; producing something subtly different is
+  not.
+  """
+  import jax.numpy as jnp
+  from . import all_atom_multimer
+
+  single, pair = representations['single'], representations['pair']
+  aatype, seq_mask = batch['aatype'], batch['seq_mask']
+  heads_cfg = config.heads
+  # every head this model actually weights has to be one the call produces
+  wanted = {n for n, c in heads_cfg.items()
+            if getattr(c, 'weight', 0.0) and n != 'structure_module'}
+  if not wanted <= {'distogram', 'predicted_lddt', 'predicted_aligned_error',
+                    'experimentally_resolved', 'masked_msa'}:
+    return None
+
+  pair_mask = seq_mask[:, None] * seq_mask[None, :]
+  out = NATIVE_POST_TRUNK(single, pair, pair_mask, aatype)
+
+  # atom14 -> atom37 STAYS IN JAX.  It is one gather through a constant
+  # per-restype table: the same cost in XLA as in CUDA, and porting the
+  # tables would put a second copy of AF2's geometry behind a kernel.
+  atom14 = out['atom14']
+  atom37_mask = all_atom_multimer.get_atom37_mask(aatype) * seq_mask[:, None]
+  atom37 = all_atom_multimer.atom14_to_atom37(atom14, aatype)
+  atom37 = atom37 * atom37_mask[:, :, None]
+  atom14_mask = all_atom_multimer.get_atom14_mask(aatype) * seq_mask[:, None]
+
+  ret = {'structure_module': {
+      'final_atom14_positions': atom14,
+      'final_atom14_mask': atom14_mask,
+      'final_atom_positions': atom37,
+      'final_atom_mask': atom37_mask,
+  }}
+  if 'distogram' in wanted:
+    c = heads_cfg.distogram
+    ret['distogram'] = {
+        'logits': out['distogram'],
+        'bin_edges': jnp.linspace(c.first_break, c.last_break, c.num_bins - 1),
+    }
+  if 'predicted_aligned_error' in wanted:
+    c = heads_cfg.predicted_aligned_error
+    ret['predicted_aligned_error'] = {
+        'logits': out['pae'],
+        'breaks': jnp.linspace(0., c.max_error_bin, c.num_bins - 1),
+    }
+  if 'predicted_lddt' in wanted:
+    ret['predicted_lddt'] = {'logits': out['plddt']}
+  if 'experimentally_resolved' in wanted:
+    ret['experimentally_resolved'] = {'logits': out['expres']}
+  return {'ret': ret}
+
+
 class AlphaFoldIteration(hk.Module):
   """A single recycling iteration of AlphaFold architecture.
 
@@ -125,13 +188,39 @@ class AlphaFoldIteration(hk.Module):
                                head_factory(head_config, self.global_config))
 
     structure_module_output = None
+    native_post = None
     if 'entity_id' in batch and 'all_atom_positions' in batch:
-      _, fold_module = self.heads['structure_module']
-      structure_module_output = fold_module(representations, batch)
+      # THE POST-TRUNK STEP IN ONE CALL.  Everything from here to the tensors
+      # a loss reads -- the eight fold iterations, the atom builder and the
+      # four heads -- is fixed model code nobody edits, and compiling it is
+      # most of what a design step pays XLA before its first gradient.  The
+      # native path replaces the lot; the loss above it stays ordinary
+      # differentiable Python.
+      if NATIVE_POST_TRUNK is not None:
+        native_post = _native_post_trunk(representations, batch, self.config)
+      if native_post is None:
+        _, fold_module = self.heads['structure_module']
+        structure_module_output = fold_module(representations, batch)
 
 
     ret = {}
     ret['representations'] = representations
+
+    if native_post is not None:
+      # the heads below are skipped: their outputs are already here.
+      # representations['structure_module'] is deliberately NOT set.  The JAX
+      # path puts the fold module's act there for one reader, PredictedLDDTHead,
+      # and this path has already produced that head's logits.  Leaving the key
+      # absent means a future reader raises instead of quietly getting a None
+      # that would look like a zero activation.
+      ret.update(native_post['ret'])
+      for name, (head_config, module) in self.heads.items():
+        if name in ret or name == 'structure_module':
+          continue
+        ret[name] = module(representations, batch)
+      if self.config.heads.get('predicted_aligned_error.weight', 0.0):
+        ret['predicted_aligned_error']['asym_id'] = batch['asym_id']
+      return ret
 
     for name, (head_config, module) in self.heads.items():
       if name == 'structure_module' and structure_module_output is not None:
