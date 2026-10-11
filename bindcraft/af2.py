@@ -2,6 +2,7 @@ import copy
 import fcntl
 import hashlib
 import os
+import warnings
 from contextlib import contextmanager
 from typing import Callable
 import jax
@@ -206,7 +207,7 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
-    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, evoformer_backend: str='auto', dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
+    def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, backend: str='auto', evoformer_backend: str | None=None, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
         self.target_pad_length = target_pad_length
         self.multi_chain_binders = multi_chain_binders
@@ -216,17 +217,34 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         self.dropout = dropout
 
         # BC2_NATIVE forces either way for a dev run: =1 native, =0 jax.
+        # `evoformer_backend` WAS THE OLD NAME and is honoured, because it
+        # means exactly what `backend` means -- unlike the retired
+        # BC2_NATIVE_* flags, where the defaults had flipped and obeying an
+        # old setting would have given the opposite of what it asked for.
+        # The name was wrong anyway: it selects the implementation for the
+        # embedder, both stacks, the template embedding and the post-trunk
+        # step as well, not just the evoformer.
+        if evoformer_backend is not None:
+            if backend != 'auto':
+                raise ValueError(
+                    'pass backend= or evoformer_backend=, not both; '
+                    'evoformer_backend is the old name for backend')
+            warnings.warn('evoformer_backend is now called backend; it '
+                          'selects more than the evoformer',
+                          DeprecationWarning, stacklevel=2)
+            backend = evoformer_backend
+        # BC2_NATIVE forces either way for a dev run: =1 native, =0 jax.
         _env = os.environ.get('BC2_NATIVE')
         if _env is not None:
-            evoformer_backend = 'native' if _env == '1' else 'jax'
-        if evoformer_backend not in ('auto', 'native', 'jax'):
+            backend = 'native' if _env == '1' else 'jax'
+        if backend not in ('auto', 'native', 'jax'):
             raise ValueError(
-                f'evoformer_backend must be auto, native or jax, not '
-                f'{evoformer_backend!r}')
-        self.evoformer_backend = evoformer_backend
+                f'backend must be auto, native or jax, not {backend!r}')
+        self.backend = backend
+        self.evoformer_backend = backend      # the old attribute name
         # 'native' INSISTS: it is a request, so a card or build that cannot
         # serve it should say so rather than quietly run something else.
-        self.native_evoformer = evoformer_backend in ('auto', 'native')
+        self.native_evoformer = backend in ('auto', 'native')
         #for the desperation autotuner only
         self.num_recycle = num_recycle
         self.target_flexibility = target_flexibility

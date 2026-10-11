@@ -964,7 +964,7 @@ def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
     return stack
 
 
-# ONE SWITCH, NOT FIVE.  `evoformer_backend` (auto|native|jax, in the
+# ONE SWITCH, NOT FIVE.  `backend` (auto|native|jax, in the
 # settings file or `--set`) is the user-facing control: it turns the whole
 # native path on or off, and nothing below is meant to be part of a normal
 # run.  BC2_NATIVE_DISABLE is a DEBUGGING escape hatch -- a comma separated
@@ -985,7 +985,7 @@ def _disabled_pieces():
         if os.environ.get(old) is not None:
             raise ValueError(
                 f'{old} no longer exists.  To turn the whole native path '
-                f'off use evoformer_backend=jax (or BC2_NATIVE=0); to leave '
+                f'off use backend=jax (or BC2_NATIVE=0); to leave '
                 f'just this piece on JAX for debugging use '
                 f'BC2_NATIVE_DISABLE={piece}.')
     raw = os.environ.get('BC2_NATIVE_DISABLE', '')
