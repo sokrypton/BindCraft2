@@ -49,12 +49,12 @@ def split_setting_overrides(arguments: list[str]) -> tuple[list[str], list[str]]
     for argument in arguments:
         if overridden:
             assignments.append(argument)
-        # --jax is the one shorthand: the Evoformer runs on the bundled CUDA
-        # kernels by default, and this asks for the JAX trunk instead (the
-        # same model, about 2x slower).  It is `--set evoformer_backend=jax`,
-        # spelled the way someone reaches for it.
+        # --jax is the one shorthand: the model runs on the bundled CUDA
+        # kernels by default, and this asks for JAX instead (the same model,
+        # about 2x slower).  It is `--set backend=jax`, spelled the way
+        # someone reaches for it.
         elif argument == '--jax':
-            assignments.append('evoformer_backend=jax')
+            assignments.append('backend=jax')
         elif argument != '--set':
             paths.append(argument)
         overridden = argument == '--set'

@@ -477,7 +477,7 @@ A sweep needs `max_trajectories`, divides its budget between arms, and disables 
 | `subbatch_size` | `auto` | Split large calculations to reduce memory; an integer fixes the chunk size, `null` disables chunking. |
 | `attention_backend` | `auto` | Choose attention implementation; leave automatic unless diagnosing performance. |
 | `use_cueq` | false | Enable optional cuEquivariance kernels when installed. |
-| `evoformer_backend` | auto | Which Evoformer trunk to run: `auto` takes the bundled CUDA kernels where the card and build allow and the JAX trunk otherwise, `native` insists on the kernels and errors if they cannot run here, `jax` asks for the JAX trunk. The kernels are ~2x faster per step and cut the first step's compile from 55 s to 21 s at 224 tokens; they need an Ampere or newer GPU. `--jax` on the command line is `evoformer_backend=jax`. |
+| `backend` | auto | Which implementation to run -- the trunk, the extra-MSA stack, the embedder, the template stack and embedding, and the post-trunk structure module and heads. `auto` takes the bundled CUDA kernels where the card and build allow and JAX otherwise, `native` insists and errors if they cannot run here, `jax` asks for JAX. The kernels are ~2x faster per step and cut the first step's compile from 55 s to 21 s at 224 tokens; they need an Ampere or newer GPU. `--jax` on the command line is `--set backend=jax`. The old name `evoformer_backend` still works, with a DeprecationWarning. |
 | `auto_multi_gpu` | true | Use the visible GPU allocation automatically; false keeps a single process. |
 | `workers_per_gpu`, `max_workers_per_gpu` | `auto`, 8 | Set or cap concurrent design workers per card. |
 | `design_workers` | Unset | Cap total workers across the allocation. |
@@ -486,19 +486,28 @@ A sweep needs `max_trajectories`, divides its budget between arms, and disables 
 
 ### Native kernel switches
 
-`evoformer_backend` chooses the trunk. Three environment variables control the
-other native pieces; each takes over a part of the model that XLA would
-otherwise compile on every fresh process. All are read when the models are
-installed, so set them before starting a run.
+`backend` chooses the implementation and is the only control a normal run
+needs. The one environment variable below is a debugging hatch for leaving
+individual pieces on JAX. Both are read when the models are installed, so
+set them before starting a run.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `BC2_NATIVE_EXTRA` | on | The extra-MSA stack. `0` returns it to JAX. |
 | `BC2_NATIVE_DISABLE` | unset | **Debugging only.** Comma separated list of native pieces to leave on JAX while the rest stay native: `extra`, `template`, `tplembed`, `post`, `embed`. For bisecting a bad campaign, never for speed -- all-on is the fastest configuration measured. An unknown name is refused rather than ignored. |
 
-ONE SWITCH, NOT FIVE.  `evoformer_backend` in the settings file (or
-`--set evoformer_backend=jax`, or `BC2_NATIVE=0`) turns the whole native
-path on or off, and that is the only control a normal run needs.  The five
+ONE SWITCH, NOT FIVE.  `backend` in the settings file (`auto`, `native` or
+`jax`), or `--jax`, or `BC2_NATIVE=0`, turns the whole native path on or
+off, and that is the only control a normal run needs.
+
+IT USED TO BE CALLED `evoformer_backend`, which was wrong: it selects the
+implementation for the embedder, both stacks, the template embedding and
+the post-trunk step as well, not just the evoformer.  The old name still
+works in a settings file and in the constructor, with a DeprecationWarning,
+because it means exactly what `backend` means.  `backend` and
+`attention_backend` are nested rather than rival -- `backend` picks the
+implementation, `attention_backend` picks the attention kernel inside the
+JAX one.  The five
 separate variables this replaced -- `BC2_NATIVE_EXTRA`, `_TEMPLATE`,
 `_TPLEMBED`, `_POST`, `_EMBED` -- are REFUSED if set, with a message saying
 where the setting went, so a script carrying one learns rather than quietly
