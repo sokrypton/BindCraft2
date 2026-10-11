@@ -484,6 +484,28 @@ A sweep needs `max_trajectories`, divides its budget between arms, and disables 
 | `gpu_ids` | All visible | Select a subset of visible GPUs. |
 | `worker_launch_stagger` | 0 seconds | Space worker starts to reduce startup pressure. |
 
+### Native kernel switches
+
+`evoformer_backend` chooses the trunk. Three environment variables control the
+other native pieces; each takes over a part of the model that XLA would
+otherwise compile on every fresh process. All are read when the models are
+installed, so set them before starting a run.
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `BC2_NATIVE_EXTRA` | on | The extra-MSA stack. `0` returns it to JAX. |
+| `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
+| `BC2_NATIVE_POST` | **off** | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `1` turns it on. |
+
+`BC2_NATIVE_POST` is opt-in because it is new, not because it is known to be
+worse. At 179 tokens with a cold cache it takes the design graph's compile
+from 17.0 s to 7.7 s and the first gradient from 21.9 s to 12.4 s, for 1.1%
+more time per step. It carries AF2's structure-module dropout, and it is gated
+against AF2 on the real checkpoint. What has not been established is whether
+it changes design outcomes: a single trajectory cannot say, because two runs
+of the same settings differ by more than the backends do.
+
+
 Worker packing is limited by GPU memory, host memory and the campaign's attempt budget; sweep fan-out uses the budget of one arm. A trajectory-only run uses one worker per GPU. Lengths can be divided among workers, so faster length groups can appear more often in results. See [execution and environment overrides](installation.md#gpu-and-memory-controls) for scheduling, caches and GPU visibility.
 
 ## Installation
