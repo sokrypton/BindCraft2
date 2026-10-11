@@ -497,6 +497,7 @@ installed, so set them before starting a run.
 | `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
 | `BC2_NATIVE_EMBED` | **off** | The embedder's four input Linears and the relative-position gather. `1` turns it on. |
 | `BC2_NATIVE_POST` | on | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `0` returns it to JAX. |
+| `BC2_NATIVE_TPLEMBED` | **off** | The WHOLE template embedding -- the query LayerNorm, the ninth projection, both stack blocks, `output_layer_norm`, the relu and `output_linear` -- in one call. `1` turns it on, and it then supersedes `BC2_NATIVE_TEMPLATE`, which covers only the two blocks in the middle. Needs exactly one template and the harvested constant; without either it falls back to JAX silently. |
 
 `BC2_NATIVE_POST` is the newest of the three. At 179 tokens with a cold cache
 it takes the design graph's compile from 17.0 s to 7.7 s and the first
