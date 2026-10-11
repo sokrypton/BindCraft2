@@ -35,7 +35,30 @@
 # matches on 'sequence_design_loss'.  functools.wraps fixed it.  A harness
 # fault that reads as a finding -- the usual kind.)
 #
-# WHICH LEAVES ~3.2 s UNACCOUNTED and no hypothesis yet: it is not features,
+# ANSWERED: THE REST IS XLA'S KERNEL CODEGEN, NOT OUR MODEL CODE.
+# BUDGET_EVENTS=1 prints every compile, not just the matching ones:
+#
+#   176 compiles, 6.8 s total
+#     4.31 s  x1    jit(sequence_design_loss)      <- one module, not fifty
+#     0.50 s  x94   jit(stage)                     <- the native stack's own
+#
+# That one module is SMALL: 4421 lines before optimisation, 2362 instructions
+# carrying an op_name, 133 computations.  After optimisation it is 9131 lines
+# and **117 fusions** plus 25 custom calls.  The 4.3 s is LLVM -> PTX ->
+# ptxas for those 117 kernels, which is why no module ablation moves it --
+# removing a module removes a handful of fusions.
+#
+#   --xla_gpu_force_compilation_parallelism=1    6.9 s
+#   default                                     4.3 s
+#   --xla_gpu_force_compilation_parallelism=16   4.2 s
+#   --xla_gpu_autotune_level=0                   4.0 s
+#
+# XLA already parallelises it and the autotuner is only 0.3 s.  There is no
+# flag left to pull here, and porting more model code cannot reach it: what
+# is being compiled is the glue and the loss, which is the part that has to
+# stay in XLA for custom losses to work at all.
+#
+# (Was: ~3.2 s unaccounted, not features,
 # not the loss terms, not templates, not the recycle terms.  What is left is
 # the glue -- the recycling wrapper, the msa/pair assembly in
 # AlphaFoldIteration, and the HLO that jax.grad still builds AROUND the
@@ -216,11 +239,20 @@ sys.path.insert(0, '/home/ubuntu/bc2')
 import jax
 jax.config.update('jax_log_compiles', True)
 ev = []
+allev = []
 class G(logging.Handler):
     def emit(self, r):
         m = r.getMessage()
         if 'Finished XLA compilation' in m and 'sequence_design_loss' in m:
             try: ev.append(float(m.rsplit(' in ', 1)[1].split(' ')[0]))
+            except Exception: pass
+        if os.environ.get('BUDGET_EVENTS') == '1' and 'Finished XLA compilation' in m:
+            # EVERY compile, not just the matching ones.  The summed number
+            # hides whether it is one module or fifty -- and no ablation can
+            # move a total that is made of fifty.
+            try:
+                nm = m.split('of ')[1].split(' in ')[0]
+                allev.append((nm, float(m.rsplit(' in ', 1)[1].split(' ')[0])))
             except Exception: pass
 lg = logging.getLogger('jax'); lg.addHandler(G()); lg.setLevel(logging.DEBUG)
 
@@ -289,3 +321,12 @@ r = af.sequence_gradients(st, ls, model='model_1_multimer_v3')
 jax.block_until_ready(jax.tree_util.tree_leaves(r[-1])[0])
 print(f'  [{ARM:<8}] first {time.perf_counter()-t:6.1f} s   '
       f'design_loss XLA {sum(ev):6.1f} s')
+if os.environ.get('BUDGET_EVENTS') == '1':
+    import collections
+    agg = collections.Counter()
+    n = collections.Counter()
+    for nm, t in allev:
+        agg[nm] += t; n[nm] += 1
+    print(f'  {len(allev)} compiles, {sum(t for _, t in allev):.1f} s total')
+    for nm, t in agg.most_common(10):
+        print(f'    {t:6.2f} s  x{n[nm]:<4d} {nm[:72]}')
