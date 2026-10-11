@@ -23,6 +23,18 @@
 # N=179, compiles in 0.23 s forward and 0.03 s with its gradient -- it is not
 # where the compile goes, and porting all of it could not buy more than that.
 #
+# AND IT IS NOT THE GRADIENT EITHER.  The fwdonly arm jits the same loss
+# through a forward-only stand-in for jax.value_and_grad:
+#
+#   full      4.3 s
+#   fwdonly   4.0 s   -> the whole backward is 0.3 s
+#
+# So ~3.2 s sits in the FORWARD graph, with the trunk, extra-MSA, embedder,
+# template embedding and post-trunk all native.  (The first run of that arm
+# reported 0.0 s: an unwrapped closure renames the HLO module and the timer
+# matches on 'sequence_design_loss'.  functools.wraps fixed it.  A harness
+# fault that reads as a finding -- the usual kind.)
+#
 # WHICH LEAVES ~3.2 s UNACCOUNTED and no hypothesis yet: it is not features,
 # not the loss terms, not templates, not the recycle terms.  What is left is
 # the glue -- the recycling wrapper, the msa/pair assembly in
@@ -212,6 +224,26 @@ class G(logging.Handler):
             except Exception: pass
 lg = logging.getLogger('jax'); lg.addHandler(G()); lg.setLevel(logging.DEBUG)
 
+if ARM == 'fwdonly':
+    # THE BACKWARD'S OWN SHARE.  Same graph, same loss, jitted WITHOUT the
+    # gradient: af2 builds its compiled step with jax.value_and_grad, so
+    # swapping that for a forward-only stand-in leaves everything else alone.
+    # The gradient still has to be returned -- zeros of the right shape keep
+    # the caller happy without putting a backward in the graph.
+    import functools as _ft
+    import jax.numpy as _jnp
+    def _fwd_only(f, argnums=0, has_aux=False):
+        # KEEP THE NAME.  The timer below matches compile messages on
+        # 'sequence_design_loss', and an unwrapped closure renames the HLO
+        # module -- the first run of this arm reported 0.0 s for that reason
+        # alone, which reads as a finding and is not one.
+        @_ft.wraps(f)
+        def g(*a, **k):
+            return f(*a, **k), jax.tree_util.tree_map(_jnp.zeros_like,
+                                                      a[argnums])
+        return g
+    jax.value_and_grad = _fwd_only
+
 import bindcraft.af.alphafold.model.config as cfg
 _real = cfg.model_config
 def _patched(name):
@@ -238,6 +270,10 @@ af = AF2(presets='model_1_multimer_v3', data_dir='/home/ubuntu/params',
          dropout=True, evoformer_backend='native')
 p = Protein.empty(179, jax.random.PRNGKey(1))
 st = {'complex': {'binder': p}, 'binder_alone': {'binder': p}}
+# NO 'onestate' ARM.  A per-state split would say whether the compile is
+# per-state glue, but every loss here reads binder_alone and the ones that do
+# not still fail on a single state -- it needs a loss set built for it, not a
+# flag.  Left undone rather than left broken.
 ls = build_losses({'weights_plddt_loss': 1.0, 'weights_sequence_entropy': 0.1,
                    'weights_compactness': 0.1})
 if ARM == 'bareloss':
