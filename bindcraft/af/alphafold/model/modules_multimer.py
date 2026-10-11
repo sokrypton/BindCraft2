@@ -83,6 +83,10 @@ NATIVE_POST_TRUNK = None
 # path is the one that ran.
 NATIVE_POST_TRUNK_TRACES = [0]
 
+# Set by bindcraft.af.native.install_models(); None leaves the JAX path alone.
+NATIVE_EMBEDDER = None
+NATIVE_EMBEDDER_TRACES = [0]
+
 
 def _native_post_trunk(representations, batch, config, safe_key):
   """Run the structure module and the four heads natively.
@@ -423,14 +427,37 @@ class EmbeddingsAndEvoformer(hk.Module):
       
       msa_feat = batch['msa_feat'].astype(dtype)
       target_feat = jnp.pad(batch["target_feat"].astype(dtype),[[0,0],[0,1]])
-      preprocess_1d = common_modules.Linear(c.msa_channel, name='preprocess_1d')(target_feat)
-      preprocess_msa = common_modules.Linear(c.msa_channel, name='preprocess_msa')(msa_feat)
-      msa_activations = preprocess_1d[None] + preprocess_msa
-      num_msa_sequences = msa_activations.shape[0]
+      # THE FOUR INPUT LINEARS AND THE RELATIVE-POSITION GATHER, natively.
+      # This is where a design step's gradient reaches the sequence.
+      #
+      # It returns the relative encoding ALREADY ADDED into the pair, so the
+      # `max_relative_idx` block below is skipped.  The recycle terms between
+      # here and there are not folded in: they are added afterwards instead,
+      # which is the same sum because every one of them is a `+=`.
+      native_emb = NATIVE_EMBEDDER is not None
+      if native_emb:
+        NATIVE_EMBEDDER_TRACES[0] += 1
+        if NATIVE_EMBEDDER_TRACES[0] == 1:
+          print(f'native: embedder hook FIRED (N={target_feat.shape[0]})',
+                flush=True)
+        msa_activations, pair_activations = NATIVE_EMBEDDER(
+            target_feat, msa_feat, batch['residue_index'], batch['asym_id'],
+            batch['entity_id'], batch['sym_id'])
+        # the call works in f32 where this block works in bfloat16; rounding
+        # back here keeps everything downstream byte-identical in shape and
+        # dtype, and leaves the Linears computed on the more accurate side
+        msa_activations = msa_activations.astype(dtype)
+        pair_activations = pair_activations.astype(dtype)
+        num_msa_sequences = msa_activations.shape[0]
+      else:
+        preprocess_1d = common_modules.Linear(c.msa_channel, name='preprocess_1d')(target_feat)
+        preprocess_msa = common_modules.Linear(c.msa_channel, name='preprocess_msa')(msa_feat)
+        msa_activations = preprocess_1d[None] + preprocess_msa
+        num_msa_sequences = msa_activations.shape[0]
 
-      left_single = common_modules.Linear(c.pair_channel, name='left_single')(target_feat)
-      right_single = common_modules.Linear(c.pair_channel, name='right_single')(target_feat)
-      pair_activations = left_single[:, None] + right_single[None]
+        left_single = common_modules.Linear(c.pair_channel, name='left_single')(target_feat)
+        right_single = common_modules.Linear(c.pair_channel, name='right_single')(target_feat)
+        pair_activations = left_single[:, None] + right_single[None]
       mask_2d = batch['seq_mask'][:, None] * batch['seq_mask'][None, :]
       mask_2d = mask_2d.astype(dtype)
 
@@ -455,7 +482,8 @@ class EmbeddingsAndEvoformer(hk.Module):
             create_offset=True,
             name='prev_pair_norm')(batch['prev_pair']).astype(dtype)
 
-      if c.max_relative_idx:
+      # already in the pair when the native embedder produced it
+      if c.max_relative_idx and not native_emb:
         pair_activations += self._relative_encoding(batch)
 
       if c.template.enabled:

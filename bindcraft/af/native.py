@@ -322,6 +322,108 @@ def _make_post_runner(weights_dir, depth=8):
     return run
 
 
+_EMB = 'alphafold/alphafold_iteration/evoformer'
+_EMB_LEAVES = ('preprocess_1d', 'preprocess_msa', 'left_single',
+               'right_single', 'position_activations')
+
+
+def embed_weights_from_params(params, out_dir=None):
+    """The embedder's five arrays, from a live haiku param tree.
+
+    THE SCOPE IS THE TRAP: haiku scopes a module created inside a METHOD
+    under that method's name and the checkpoint keeps it, so
+    position_activations lives at `evoformer/~_relative_encoding/
+    position_activations` while its four siblings sit directly under
+    `evoformer/`.  Matching on the LEAF rather than the full path is what
+    makes both land.
+    """
+    import hashlib
+    import tempfile
+
+    flat = {}
+    for mod, d in params.items():
+        if not mod.startswith(_EMB):
+            continue
+        leaf = mod.split('/')[-1]
+        if leaf not in _EMB_LEAVES:
+            continue
+        for pname, v in d.items():
+            flat[f'param/{leaf}/{pname}'] = np.asarray(v, np.float32)
+    if len(flat) != 2 * len(_EMB_LEAVES):
+        raise KeyError(f'embedder: found {len(flat)} arrays, '
+                       f'expected {2 * len(_EMB_LEAVES)}')
+    h = hashlib.sha1()
+    for k in sorted(flat):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(flat[k]).tobytes()[:4096])
+    out = out_dir or os.path.join(tempfile.gettempdir(),
+                                  f'bc2_emb_{h.hexdigest()[:16]}')
+    if os.path.exists(os.path.join(out, 'manifest.txt')):
+        return out
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, 'manifest.txt'), 'w') as fh:
+        for name in sorted(flat):
+            arr = np.ascontiguousarray(flat[name], dtype=np.float32)
+            fn = name.replace('/', '__') + '.f32'
+            arr.tofile(os.path.join(out, fn))
+            fh.write(f'{name} {fn} {arr.ndim} '
+                     f'{" ".join(str(x) for x in arr.shape)}\n')
+    return out
+
+
+def _make_embed_runner(weights_dir):
+    """The four input Linears and the relative-position gather, in one call.
+
+    NO REPLAY AND NO SAVE SET -- the only piece of this chain that needs
+    neither.  The backward is a pure function of the cotangents, target_feat
+    and the weights, so the residual carries one tensor.
+    """
+
+    def raw(tf, mf, ri, ai, ei, si):
+        n, s = tf.shape[0], mf.shape[0]
+        f = jnp.float32
+        return jax.ffi.ffi_call(
+            'native_embed_fwd',
+            (jax.ShapeDtypeStruct((s, n, 256), f),
+             jax.ShapeDtypeStruct((n, n, 128), f)),
+            vmap_method='sequential')(
+                tf, mf, ri, ai, ei, si, weights_dir=weights_dir)
+
+    @jax.custom_vjp
+    def emb(tf, mf, ri, ai, ei, si):
+        return raw(tf, mf, ri, ai, ei, si)
+
+    def fwd(tf, mf, ri, ai, ei, si):
+        return raw(tf, mf, ri, ai, ei, si), (tf, ri, ai, ei, si)
+
+    def bwd(res, g):
+        tf, ri, ai, ei, si = res
+        dmsa, dpair = [x.astype(jnp.float32) for x in g]
+        s, n = dmsa.shape[0], dmsa.shape[1]
+        dtf, dmf = jax.ffi.ffi_call(
+            'native_embed_bwd',
+            (jax.ShapeDtypeStruct((n, 21), jnp.float32),
+             jax.ShapeDtypeStruct((s, n, 49), jnp.float32)),
+            vmap_method='sequential')(
+                dmsa, dpair, tf, weights_dir=weights_dir)
+        # the relative-position term is a GATHER from the four id features,
+        # so they carry no gradient; they are arrays, so they cannot be
+        # nondiff_argnums and a None here would be an error rather than a
+        # shortcut
+        return (dtf, dmf, jnp.zeros_like(ri), jnp.zeros_like(ai),
+                jnp.zeros_like(ei), jnp.zeros_like(si))
+
+    emb.defvjp(fwd, bwd)
+
+    def run(tf, mf, ri, ai, ei, si):
+        return emb(tf.astype(jnp.float32), mf.astype(jnp.float32),
+                   ri.astype(jnp.float32), ai.astype(jnp.float32),
+                   ei.astype(jnp.float32), si.astype(jnp.float32))
+
+    return run
+
+
+_EMB_RUNNERS = {}
 _POST_RUNNERS = {}
 
 
@@ -343,7 +445,9 @@ def _register():
                            ('template_pair_stack_fwd', 'TemplatePairStackFwd'),
                            ('template_pair_stack_bwd', 'TemplatePairStackBwd'),
                            ('native_post_trunk_fwd', 'StructureHeadsFwd'),
-                           ('native_post_trunk_bwd', 'StructureHeadsBwd')):
+                           ('native_post_trunk_bwd', 'StructureHeadsBwd'),
+                           ('native_embed_fwd', 'EmbedderFwd'),
+                           ('native_embed_bwd', 'EmbedderBwd')):
         jax.ffi.register_ffi_target(
             target, jax.ffi.pycapsule(getattr(lib, symbol)), platform='CUDA')
     _registered = True
@@ -661,6 +765,7 @@ def use_model(name: str):
     modules_multimer.NATIVE_EXTRA_MSA_STACK = _EXTRA_RUNNERS.get(name)
     modules_multimer.NATIVE_TEMPLATE_STACK = _TPL_RUNNERS.get(name)
     modules_multimer.NATIVE_POST_TRUNK = _POST_RUNNERS.get(name)
+    modules_multimer.NATIVE_EMBEDDER = _EMB_RUNNERS.get(name)
 
 
 def install_models(model_parameters: dict, depth: int = 48,
@@ -771,6 +876,25 @@ def install_models(model_parameters: dict, depth: int = 48,
                 print(f'native: post-trunk INSTALLED for {name} -> {pd}')
             except KeyError as e:
                 print(f'native: post-trunk NOT installed for {name}: {e}')
+        # and the embedder: the four input Linears and the relative-position
+        # gather.  OFF by default; BC2_NATIVE_EMBED=1 turns it on.
+        #
+        # Off because it is not yet judged.  The module gate is exact against
+        # AF2 (~1e-07 on both outputs and both gradients at N=179, four
+        # Linears and a gather being easy to get right), but TWO THINGS
+        # CHANGE in the model that the module gate cannot see: the block runs
+        # in bfloat16 there and this runs in f32, and the recycle terms that
+        # sit between the Linears and the relative encoding are added
+        # afterwards in JAX instead of in between.  Both are sound -- the sum
+        # is the same and f32 is the more accurate side -- but 'sound' is an
+        # argument, and the bar here is a measurement.
+        if os.environ.get('BC2_NATIVE_EMBED') == '1':
+            try:
+                ed2 = embed_weights_from_params(params)
+                _EMB_RUNNERS[name] = _make_embed_runner(ed2)
+                print(f'native: embedder INSTALLED for {name} -> {ed2}')
+            except KeyError as e:
+                print(f'native: embedder NOT installed for {name}: {e}')
     first = next(iter(model_parameters))
     use_model(first)
     print(f'native: installed {len(_MODEL_RUNNERS)} model(s): '
