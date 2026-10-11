@@ -88,6 +88,30 @@
 # benefit (7.8 s, unchanged), nor does one on the PAE logits (7.9 s).  So
 # "the custom call acts as a fusion barrier" is a guess, not a result.
 #
+# RESOLVED: IT IS THE CUSTOM CALL, AND THE MECHANISM IS OPACITY.
+#
+#   full (custom call + padding)              7.8 s
+#   padding kept, call -> identity           10.0 s
+#   no padding, no call                       9.9 s   -> padding is not it
+#   no call, optimization_barrier instead     7.4 s   -> opacity is it
+#
+# A custom call is opaque: XLA cannot fuse across it or see through it, so it
+# BOUNDS the region the optimiser works on.  Remove it and construct_input
+# fuses forward into the aggregation, and compile goes up 2.2 s.  Put a
+# jax.lax.optimization_barrier in its place and the compile comes back.
+#
+# So part of what the native kernels bought on compile was never about
+# removing operations -- it was about bounding regions.  Worth knowing when
+# reasoning about why a port cut compile more than its op count suggests.
+#
+# IT IS NOT A FURTHER WIN HERE, for the obvious reason: the opacity is
+# already present wherever it matters.  Adding a barrier on top of the
+# existing custom call leaves compile at 7.8 s, one on the PAE logits 7.9 s,
+# one on the whole model output 8.0 s -- all with the metrics bit-identical.
+# And the 7.4 s row is an ABLATION, not a configuration: it has no template
+# pair stack at all.  It isolates opacity by holding the missing work
+# constant against the 10.0 s row; it is not a model anyone can run.
+#
 # WHAT IS A RESULT: THESE DELTAS ARE MARGINAL, NOT ADDITIVE, AND CAN BE
 # NEGATIVE.  Each row says what happens if you remove that one thing, which
 # is the honest question for deciding whether to remove it.  It does not say
