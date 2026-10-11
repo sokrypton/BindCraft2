@@ -30,6 +30,7 @@
 
 #include "stack.cuh"
 #include "tplstack.cuh"
+#include "tplembed.cuh"
 #include "structmod.cuh"
 #include "embed.cuh"
 #include "heads.cuh"
@@ -664,6 +665,73 @@ ffi::Error EmbBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> dmsa,
   return ffi::Error::Success();
 }
 
+
+// ---------------------------------------------------------------------------
+// The whole template embedding: the query projection, the native pair stack
+// and the aggregation, in one call.  With the eight constant projections
+// hoisted out by the caller, this is everything the template path still costs
+// XLA.
+// ---------------------------------------------------------------------------
+struct TEKey {
+  int N, depth;
+  std::string dir;
+  cudaStream_t stream;
+  bool operator<(const TEKey& o) const {
+    return std::tie(N, depth, dir, stream) <
+           std::tie(o.N, o.depth, o.dir, o.stream);
+  }
+};
+std::map<TEKey, tplembed::TplEmbed*> g_te;
+
+tplembed::TplEmbed* te_get(int N, int depth, const std::string& dir,
+                           cudaStream_t stream) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  TEKey k{N, depth, dir, stream};
+  auto it = g_te.find(k);
+  if (it != g_te.end()) return it->second;
+  Oracle*& w = g_weights[dir];
+  if (!w) w = new Oracle(dir);
+  auto* m = new tplembed::TplEmbed();
+  m->alloc(N, depth, stream);
+  m->setWeights(*w);
+  g_te[k] = m;
+  return m;
+}
+
+ffi::Error TeFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> query,
+                     ffi::Buffer<ffi::F32> act_const,
+                     ffi::Buffer<ffi::F32> pair_mask,
+                     ffi::Buffer<ffi::U32> seed, int64_t depth,
+                     int64_t dropout, std::string_view weights_dir,
+                     ffi::Result<ffi::Buffer<ffi::F32>> out,
+                     ffi::Result<ffi::Buffer<ffi::BF16>> save) {
+  auto d = query.dimensions();
+  if (d.size() != 3 || d[2] != tplembed::CQ)
+    return ffi::Error::InvalidArgument("query must be [N,N,128]");
+  int N = (int)d[0];
+  auto* m = te_get(N, (int)depth, std::string(weights_dir), stream);
+  m->setDropout(dropout != 0, seed.typed_data());
+  m->forward(query.typed_data(), act_const.typed_data(),
+             pair_mask.typed_data(), out->typed_data(),
+             reinterpret_cast<__nv_bfloat16*>(save->typed_data()));
+  return ffi::Error::Success();
+}
+
+ffi::Error TeBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct,
+                     ffi::Buffer<ffi::F32> pair_mask,
+                     ffi::Buffer<ffi::BF16> save, ffi::Buffer<ffi::U32> seed,
+                     int64_t depth, int64_t dropout,
+                     std::string_view weights_dir,
+                     ffi::Result<ffi::Buffer<ffi::F32>> dquery) {
+  int N = (int)ct.dimensions()[0];
+  auto* m = te_get(N, (int)depth, std::string(weights_dir), stream);
+  m->setDropout(dropout != 0, seed.typed_data());
+  m->backward(ct.typed_data(), pair_mask.typed_data(),
+              reinterpret_cast<const __nv_bfloat16*>(save.typed_data()),
+              dquery->typed_data());
+  return ffi::Error::Success();
+}
+
 }  // namespace
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -794,3 +862,30 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>()      // d target_feat [N,21]
         .Ret<ffi::Buffer<ffi::F32>>());    // d msa_feat    [S,N,49]
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    TemplateEmbeddingFwd, TeFwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // query     [N,N,128]
+        .Arg<ffi::Buffer<ffi::F32>>()      // act_const [N,N,64]
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair_mask [N,N]
+        .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled]
+        .Attr<int64_t>("depth")
+        .Attr<int64_t>("dropout")
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>()      // out  [N,N,128]
+        .Ret<ffi::Buffer<ffi::BF16>>());   // save, for the stack's replay
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    TemplateEmbeddingBwd, TeBwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // d out
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair_mask
+        .Arg<ffi::Buffer<ffi::BF16>>()     // save
+        .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled]
+        .Attr<int64_t>("depth")
+        .Attr<int64_t>("dropout")
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>());    // d query [N,N,128]

@@ -90,6 +90,13 @@ NATIVE_EMBEDDER_TRACES = [0]
 # See the note at the template call site: 0.7 s of compile, 1.9 ms a step.
 TEMPLATE_QUERY_BARRIER = True
 
+# The WHOLE template embedding in one custom call -- query_embedding_norm,
+# template_pair_embedding_8, both stack blocks, output_layer_norm, the relu
+# and output_linear.  Supersedes NATIVE_TEMPLATE_STACK, which takes only the
+# two blocks in the middle; set one or the other, not both.
+NATIVE_TEMPLATE_EMBED = None
+NATIVE_TEMPLATE_EMBED_TRACES = [0]
+
 
 def _native_post_trunk(representations, batch, config, safe_key):
   """Run the structure module and the four heads natively.
@@ -690,7 +697,8 @@ class TemplateEmbedding(hk.Module):
     self.global_config = global_config
 
   def __call__(self, query_embedding, template_batch, padding_mask_2d,
-               multichain_mask_2d, use_dropout, safe_key=None):
+               multichain_mask_2d, use_dropout, safe_key=None,
+               _force_jax=False):
     """Generate an embedding for a set of templates.
 
     Args:
@@ -718,6 +726,42 @@ class TemplateEmbedding(hk.Module):
 
     num_templates = template_batch['template_aatype'].shape[0]
     num_res, _, query_num_channels = query_embedding.shape
+
+    # THE WHOLE MODULE AS ONE CUSTOM CALL.  It lives here rather than in
+    # SingleTemplateEmbedding because that one returns before output_linear,
+    # whose weights are in THIS scope -- and it is spelled as a branch of
+    # __call__ rather than a sibling method because haiku scopes a module
+    # created in any other method under `~_<method>/`, which renames every
+    # weight the checkpoint carries.
+    #
+    # TWO PRECONDITIONS, checked rather than assumed; getting either wrong is
+    # silent.  Exactly one template, because the scan and the /num_templates
+    # mean are identities only then.  And the constant eight already
+    # harvested, because the native call has no distogram, backbone frame or
+    # atom position to rebuild them from.
+    act_const = template_batch.get('template_act_const')
+    if (NATIVE_TEMPLATE_EMBED is not None and not _force_jax
+        and num_templates == 1 and act_const is not None):
+      from ...native import supported_length
+      if supported_length(num_res):
+        # SPLIT FIRST.  A SafeKey is single-use and the reference pass
+        # consumes this one; reaching for it again afterwards raises
+        # 'Random key has been used previously'.
+        safe_key, native_key = safe_key.split()
+        # the reference pass creates the parameters; its output is discarded
+        hk.eval_shape(
+            lambda q: self(q, template_batch, padding_mask_2d,
+                           multichain_mask_2d, use_dropout, safe_key,
+                           _force_jax=True), query_embedding)
+        NATIVE_TEMPLATE_EMBED_TRACES[0] += 1
+        ac = act_const[0] if act_const.ndim == 4 else act_const
+        return NATIVE_TEMPLATE_EMBED(
+            query_embedding, ac, padding_mask_2d,
+            int(c.template_pair_stack.num_block),
+            jnp.stack([
+                jax.random.bits(native_key.get(), (), jnp.uint32),
+                jnp.asarray(use_dropout, jnp.uint32).reshape(()),
+            ]))
 
     # Embed each template separately.
     template_embedder = SingleTemplateEmbedding(self.config, self.global_config)

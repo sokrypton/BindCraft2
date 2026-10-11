@@ -181,6 +181,78 @@ def weights_from_params(params, out_dir=None, depth=None, prefix=_MAIN):
     return out
 
 
+# The template embedding AS A WHOLE, the stack plus the four modules around
+# it.  `single_template_embedding/` holds three of them; output_linear is one
+# scope up, under template_embedding/ itself -- SingleTemplateEmbedding returns
+# before it.
+_TPE = 'alphafold/alphafold_iteration/evoformer/template_embedding'
+_TPE_FLAT = {
+    f'{_TPE}/single_template_embedding/query_embedding_norm':
+        'query_embedding_norm',
+    f'{_TPE}/single_template_embedding/template_pair_embedding_8':
+        'template_pair_embedding_8',
+    f'{_TPE}/single_template_embedding/output_layer_norm':
+        'output_layer_norm',
+    f'{_TPE}/output_linear': 'output_linear',
+}
+
+
+def tplembed_weights_from_params(params, out_dir=None):
+    """Everything the native template embedding needs, in one directory.
+
+    The stack's two blocks come out of layer_stack's leading axis exactly as
+    weights_from_params writes them; the four modules around it carry no block
+    index.  OUTPUT_LAYER_NORM IS NOT OPTIONAL: SingleTemplateEmbedding ends
+    with it, after the stack and before the relu, and leaving it out puts the
+    activation on the wrong scale for output_linear's weights -- rms 1.75
+    against a reference 0.95, which is what the gate caught.
+    """
+    import hashlib
+    import tempfile
+
+    mods = {k: v for k, v in params.items() if k.startswith(_TPL)}
+    if not mods:
+        raise KeyError(f'no {_TPL}* in these params')
+    depth = min(int(np.asarray(a).shape[0])
+                for d in mods.values() for a in d.values())
+
+    flat = {}
+    for mod in sorted(mods):
+        path = mod[len(_TPL) + 1:] if len(mod) > len(_TPL) else ''
+        for pname in sorted(mods[mod]):
+            w = np.asarray(mods[mod][pname], np.float32)
+            for b in range(depth):
+                key = f'param/block{b}/{path}/{pname}' if path else \
+                      f'param/block{b}/{pname}'
+                flat[key] = np.ascontiguousarray(w[b], dtype=np.float32)
+    for scope, leaf in _TPE_FLAT.items():
+        if scope not in params:
+            raise KeyError(f'template embedding: no {scope} in these params')
+        for pname, v in params[scope].items():
+            flat[f'param/{leaf}/{pname}'] = np.ascontiguousarray(
+                np.asarray(v, np.float32))
+
+    h = hashlib.sha1()
+    for k in sorted(flat):
+        h.update(k.encode())
+        h.update(flat[k].tobytes()[:4096])
+    out = out_dir or os.path.join(tempfile.gettempdir(),
+                                  f'bc2_tpe_{h.hexdigest()[:16]}')
+    if os.path.exists(os.path.join(out, 'manifest.txt')):
+        return out
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, 'manifest.txt'), 'w') as fh:
+        for name in sorted(flat):
+            arr = flat[name]
+            fn = name.replace('/', '__') + '.f32'
+            arr.tofile(os.path.join(out, fn))
+            fh.write(f'{name} {fn} {arr.ndim} '
+                     f'{" ".join(str(x) for x in arr.shape)}\n')
+    print(f'native: template embedding weights ({len(flat)} arrays, '
+          f'{depth} blocks) -> {out}')
+    return out
+
+
 _SM = 'alphafold/alphafold_iteration/structure_module'
 _HEADS = ('distogram_head', 'predicted_aligned_error_head',
           'predicted_lddt_head', 'experimentally_resolved_head')
@@ -510,7 +582,9 @@ def _register():
                            ('native_post_trunk_fwd', 'StructureHeadsFwd'),
                            ('native_post_trunk_bwd', 'StructureHeadsBwd'),
                            ('native_embed_fwd', 'EmbedderFwd'),
-                           ('native_embed_bwd', 'EmbedderBwd')):
+                           ('native_embed_bwd', 'EmbedderBwd'),
+                           ('native_tplembed_fwd', 'TemplateEmbeddingFwd'),
+                           ('native_tplembed_bwd', 'TemplateEmbeddingBwd')):
         jax.ffi.register_ffi_target(
             target, jax.ffi.pycapsule(getattr(lib, symbol)), platform='CUDA')
     _registered = True
@@ -519,6 +593,7 @@ def _register():
 _MODEL_RUNNERS = {}
 _EXTRA_RUNNERS = {}
 _TPL_RUNNERS = {}
+_TPE_RUNNERS = {}
 
 
 def supported_length(n: int) -> bool:
@@ -661,6 +736,82 @@ def _make_tpl_runner(weights_dir, depth=2, dropout=False):
         if pad:
             out = out[:n, :n]
         return out.astype(act.dtype)
+
+    return run
+
+
+def _make_tplembed_runner(weights_dir, depth=2, dropout=False):
+    """The WHOLE template embedding, not just its stack.
+
+    Takes the query pair activation and the precomputed constant eight, and
+    returns the embedding output_linear produces.  That is query_embedding_norm,
+    template_pair_embedding_8, the two stack blocks, output_layer_norm, the
+    relu and output_linear -- everything SingleTemplateEmbedding and
+    TemplateEmbedding do between them, in one custom call.
+
+    ONE TEMPLATE ONLY.  TemplateEmbedding scans over templates and divides by
+    their count; BindCraft emits template_mask jnp.ones((1,)), so the scan and
+    the mean are identities this does not reproduce.  Asserted by the caller,
+    not here, because here the count is no longer visible.
+
+    act_const takes no cotangent -- it is a constant by construction, which is
+    the entire reason it is hoisted out of the step.
+    """
+    drop = np.int64(1 if dropout else 0)
+    CQ, CT = 128, 64
+
+    def raw(q, ac, pm, seed):
+        n = q.shape[0]
+        return jax.ffi.ffi_call(
+            'native_tplembed_fwd',
+            (jax.ShapeDtypeStruct((n, n, CQ), jnp.float32),
+             jax.ShapeDtypeStruct((n * n * CT * 5 * depth,), jnp.bfloat16)),
+            vmap_method='sequential')(
+                q, ac, pm, seed, depth=np.int64(depth), dropout=drop,
+                weights_dir=weights_dir)
+
+    @jax.custom_vjp
+    def embed(q, ac, pm, seed):
+        return raw(q, ac, pm, seed)[0]
+
+    def fwd(q, ac, pm, seed):
+        o, save = raw(q, ac, pm, seed)
+        return o, (pm, save, seed)
+
+    def bwd(res, g):
+        pm, save, seed = res
+        n = g.shape[0]
+        dq = jax.ffi.ffi_call(
+            'native_tplembed_bwd',
+            jax.ShapeDtypeStruct((n, n, CQ), jnp.float32),
+            vmap_method='sequential')(
+                g.astype(jnp.float32), pm, save, seed, depth=np.int64(depth),
+                dropout=drop, weights_dir=weights_dir)
+        return (dq, jnp.zeros((n, n, CT), jnp.float32), jnp.zeros_like(pm),
+                np.zeros(seed.shape, dtype=jax.dtypes.float0))
+
+    embed.defvjp(fwd, bwd)
+
+    def run(query, act_const, pair_mask, n_block=depth, seed=None):
+        if int(n_block) != depth:
+            raise ValueError(f'template embedding built for depth {depth}, '
+                             f'asked for {int(n_block)}')
+        if seed is None:
+            seed = jnp.zeros((2,), jnp.uint32)
+        # the same 32-alignment the stack needs, for the same cuBLASLt reason
+        n = int(query.shape[0])
+        pad = (-n) % 32
+        q = query.astype(jnp.float32)
+        ac = act_const.astype(jnp.float32)
+        pm = pair_mask.astype(jnp.float32)
+        if pad:
+            q = jnp.pad(q, ((0, pad), (0, pad), (0, 0)))
+            ac = jnp.pad(ac, ((0, pad), (0, pad), (0, 0)))
+            pm = jnp.pad(pm, ((0, pad), (0, pad)))
+        out = embed(q, ac, pm, seed.astype(jnp.uint32).reshape((2,)))
+        if pad:
+            out = out[:n, :n]
+        return out.astype(query.dtype)
 
     return run
 
@@ -826,6 +977,17 @@ def use_model(name: str):
             'pool so each model gets its own directory.')
     modules_multimer.NATIVE_EVOFORMER = run
     modules_multimer.NATIVE_EXTRA_MSA_STACK = _EXTRA_RUNNERS.get(name)
+    # BOTH STAY INSTALLED.  The whole-embedding runner returns before
+    # SingleTemplateEmbedding ever runs, so there is no risk of the stack
+    # executing twice -- and nulling the stack runner here was a real bug:
+    # the embedding declines whenever its preconditions do not hold (more
+    # than one template, no harvested constant), and the state that declines
+    # then fell back to the XLA stack while the other used the native one.
+    # Measured AFTER this change: it did NOT account for the 14x design
+    # gradient difference that prompted it, so do not read it as the cause.
+    # It is still the right behaviour -- there is no reason to disable a
+    # correct runner -- but the 14x is something else.
+    modules_multimer.NATIVE_TEMPLATE_EMBED = _TPE_RUNNERS.get(name)
     modules_multimer.NATIVE_TEMPLATE_STACK = _TPL_RUNNERS.get(name)
     modules_multimer.NATIVE_POST_TRUNK = _POST_RUNNERS.get(name)
     modules_multimer.NATIVE_EMBEDDER = _EMB_RUNNERS.get(name)
@@ -899,6 +1061,21 @@ def install_models(model_parameters: dict, depth: int = 48,
                 _TPL_RUNNERS[name] = _make_tpl_runner(td, 2, bool(dropout))
             except KeyError:
                 pass
+        # the WHOLE template embedding rather than just its two blocks.  OFF
+        # by default; BC2_NATIVE_TPLEMBED=1 turns it on.  It supersedes the
+        # stack runner above -- when this one is installed the stack hook is
+        # left unset, because the native embedding already contains it and
+        # running both would mean the stack twice.
+        if os.environ.get('BC2_NATIVE_TPLEMBED') == '1':
+            try:
+                ted = tplembed_weights_from_params(params)
+                _TPE_RUNNERS[name] = _make_tplembed_runner(ted, 2,
+                                                           bool(dropout))
+                print(f'native: template EMBEDDING INSTALLED for {name} '
+                      f'-> {ted}')
+            except KeyError as e:
+                print(f'native: template embedding NOT installed for '
+                      f'{name}: {e}')
         # and the post-trunk step: the structure module and the four heads,
         # in one call.  OFF by default; BC2_NATIVE_POST=1 turns it on.
         #
