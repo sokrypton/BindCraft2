@@ -36,6 +36,26 @@
 # head-set check is not what declines it.  The fallback is safe: the hook
 # returns None and JAX runs the span.
 #
+# WHY THE REMAINING COMPILE WINS ARE NOT SIMPLY TURNED ON.  Asked directly,
+# and the answer turned out to be a number rather than a judgement.  Both of
+# them, together:
+#
+#   baseline                      XLA 7.8 s   step 712.6 ms
+#   + template query barrier      XLA   -     step 714.5 ms   (+1.9)
+#   + barrier + native embedder   XLA 6.9 s   step 718.1 ms   (+5.5, +0.77%)
+#
+# 0.9 s of compile for 5.5 ms a step.  Compile is paid once per (model,
+# length) -- with the persistent cache, once per machine.  The step is paid
+# every iteration: 5.5 ms x 500 steps is 2.75 s a trajectory.  Break-even is
+# under two trajectories and a campaign runs dozens, so enabling both makes
+# campaigns SLOWER.  That is the disjointness above biting the other way.
+#
+# They also do not add: 0.8 s and 0.7 s separately, 0.9 s together.
+#
+# The flags stay available because the trade REVERSES for a one-shot run or a
+# cold machine, where the compile is most of the cost -- a Colab notebook, a
+# single short job.  It is the campaign that cannot afford them.
+#
 # So it is a missed optimisation rather than a wrong answer, worth under a
 # tenth of a percent of a trajectory, and it stays missed on purpose.  The
 # cause was not chased past ruling out the obvious one, because the value did
