@@ -74,8 +74,14 @@ NATIVE_EXTRA_MSA_STACK = None
 NATIVE_TEMPLATE_STACK = None
 
 
-# Set by bindcraft.af.native.install_post(); None leaves the JAX path alone.
+# Set by bindcraft.af.native.install_models(); None leaves the JAX path alone.
 NATIVE_POST_TRUNK = None
+# INSTALLED IS NOT FIRED.  The extra-MSA stack once gated 'clean' three ways
+# while its hook was never reached -- predict() does not call it, use_model()
+# rebinds it, and a warm compile cache can skip the trace entirely.  This
+# counts traces so a comparison run can state, not assume, that the native
+# path is the one that ran.
+NATIVE_POST_TRUNK_TRACES = [0]
 
 
 def _native_post_trunk(representations, batch, config):
@@ -101,6 +107,9 @@ def _native_post_trunk(representations, batch, config):
     return None
 
   pair_mask = seq_mask[:, None] * seq_mask[None, :]
+  NATIVE_POST_TRUNK_TRACES[0] += 1
+  if NATIVE_POST_TRUNK_TRACES[0] == 1:
+    print(f'native: post-trunk hook FIRED (N={single.shape[0]})', flush=True)
   out = NATIVE_POST_TRUNK(single, pair, pair_mask, aatype)
 
   # atom14 -> atom37 STAYS IN JAX.  It is one gather through a constant
