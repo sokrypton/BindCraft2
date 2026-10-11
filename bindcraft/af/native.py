@@ -738,12 +738,36 @@ def install_models(model_parameters: dict, depth: int = 48,
         # stacks have and what decides whether a 4.9e-02 gradient difference
         # against JAX matters to a trajectory.  Until one has run, a user who
         # does nothing gets the path with that evidence.
-        if os.environ.get('BC2_NATIVE_POST') == '1':
+        # THE STRUCTURE MODULE HAS DROPOUT AND THIS PATH DOES NOT.
+        # folding_multimer.FoldIteration applies it twice per iteration
+        # (lines 428 and 449, rate c.dropout under batch['use_dropout']), and
+        # the native structure module runs deterministically.  use_dropout is
+        # a RUNTIME value -- that is the whole point of the dropout work, a
+        # stage can turn it off without recompiling -- so the hook cannot
+        # branch on it at trace time.  The decision has to be made here.
+        #
+        # Installing anyway would run a different model from the one the user
+        # asked for, silently.  A seed-matched campaign shows what that costs:
+        # i_pTM 0.80/0.80/0.79/0.69 and pLDDT 0.92/0.91/0.91/0.85 on JAX
+        # against 0.74/0.73/0.76/0.66 and 0.81/0.79/0.86/0.79 native, every
+        # stage worse in the same direction.
+        if os.environ.get('BC2_NATIVE_POST') == '1' and dropout:
+            print('native: post-trunk NOT installed -- design dropout is on '
+                  'and the native structure module has none.  Implement it '
+                  'there first; until then this path would quietly run a '
+                  'deterministic structure module.')
+        elif os.environ.get('BC2_NATIVE_POST') == '1':
+            # LOUD, not silent.  The other two stacks swallow a KeyError
+            # because a preset that lacks them is a normal thing; asking for
+            # this one explicitly and silently not getting it is not, and a
+            # comparison run against a hook that never installed would read
+            # as 'no difference' for the wrong reason.
             try:
                 pd = post_weights_from_params(params)
                 _POST_RUNNERS[name] = _make_post_runner(pd, 8)
-            except KeyError:
-                pass
+                print(f'native: post-trunk INSTALLED for {name} -> {pd}')
+            except KeyError as e:
+                print(f'native: post-trunk NOT installed for {name}: {e}')
     first = next(iter(model_parameters))
     use_model(first)
     print(f'native: installed {len(_MODEL_RUNNERS)} model(s): '
