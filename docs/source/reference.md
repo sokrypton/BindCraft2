@@ -495,6 +495,7 @@ installed, so set them before starting a run.
 | --- | --- | --- |
 | `BC2_NATIVE_EXTRA` | on | The extra-MSA stack. `0` returns it to JAX. |
 | `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
+| `BC2_NATIVE_EMBED` | **off** | The embedder's four input Linears and the relative-position gather. `1` turns it on. |
 | `BC2_NATIVE_POST` | on | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `0` returns it to JAX. |
 
 `BC2_NATIVE_POST` is the newest of the three. At 179 tokens with a cold cache
@@ -510,6 +511,15 @@ already accepts; `native/post_trunk_gate.py` reproduces the table. What no
 single run can tell you is whether it changes design *outcomes*: two
 trajectories with identical settings differ by more than the backends do, so
 if you are comparing results across versions, hold this fixed.
+
+`BC2_NATIVE_EMBED` is off because the measurement says so, not out of
+caution. It saves 0.8 s of compile — a tenth — and moves pLDDT 1.4e-04 and
+the gradient norm 18.1%, which is seven times the post-trunk step's move for
+a twelfth of the saving. The move has a cause rather than a bug: that block
+runs in bfloat16 and the call runs in f32, which is the more accurate side
+but not an unchanged one, and it is the one place where the gradient reaches
+the sequence. Turn it on if you want the compile and can hold the backend
+fixed across whatever you are comparing.
 
 
 Worker packing is limited by GPU memory, host memory and the campaign's attempt budget; sweep fan-out uses the budget of one arm. A trajectory-only run uses one worker per GPU. Lengths can be divided among workers, so faster length groups can appear more often in results. See [execution and environment overrides](installation.md#gpu-and-memory-controls) for scheduling, caches and GPU visibility.
