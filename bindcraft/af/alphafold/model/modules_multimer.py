@@ -744,14 +744,17 @@ class TemplateEmbedding(hk.Module):
         and num_templates == 1 and act_const is not None):
       from ...native import supported_length
       if supported_length(num_res):
-        # SPLIT FIRST.  A SafeKey is single-use and the reference pass
-        # consumes this one; reaching for it again afterwards raises
-        # 'Random key has been used previously'.
-        safe_key, native_key = safe_key.split()
-        # the reference pass creates the parameters; its output is discarded
+        # THE REFERENCE PASS GETS A THROWAWAY KEY, and the real stream goes
+        # to the native call.  It is a shape-only computation whose output is
+        # discarded, so it has no business consuming the RNG -- and when it
+        # did, the native arm drew different dropout masks from the JAX arm
+        # BY CONSTRUCTION, which made every dropout-on comparison between
+        # them uninterpretable.  A SafeKey is single-use, so this is also
+        # what stops 'Random key has been used previously'.
         hk.eval_shape(
             lambda q: self(q, template_batch, padding_mask_2d,
-                           multichain_mask_2d, use_dropout, safe_key,
+                           multichain_mask_2d, use_dropout,
+                           prng.SafeKey(jax.random.PRNGKey(0)),
                            _force_jax=True), query_embedding)
         NATIVE_TEMPLATE_EMBED_TRACES[0] += 1
         ac = act_const[0] if act_const.ndim == 4 else act_const
@@ -759,7 +762,7 @@ class TemplateEmbedding(hk.Module):
             query_embedding, ac, padding_mask_2d,
             int(c.template_pair_stack.num_block),
             jnp.stack([
-                jax.random.bits(native_key.get(), (), jnp.uint32),
+                jax.random.bits(safe_key.get(), (), jnp.uint32),
                 jnp.asarray(use_dropout, jnp.uint32).reshape(()),
             ]))
 
