@@ -32,7 +32,27 @@ DTYPE = {'float16': jnp.float16, 'float32': jnp.float32,
          'bool': jnp.bool_, 'uint8': jnp.uint8, 'int32': jnp.int32}
 
 
+def check_seam():
+    """The seam and the contract must not drift apart.
+
+    Pure Python, so it runs before the expensive part and fails fast.  The
+    adapter in design_step.py is the one place that knows both spellings;
+    if a field is added to boundary.py and not to it, every loss reading
+    that field gets an AttributeError at trace time instead of here.
+    """
+    from bindcraft.af.design_step import DesignStepOutputs
+    want = [f.name for f in boundary.STRUCTURE + boundary.METRICS]
+    got = list(DesignStepOutputs._fields)
+    if want != got:
+        print('SEAM DIVERGED from boundary.py')
+        print(f'  contract {want}')
+        print(f'  outputs  {got}')
+        raise SystemExit(1)
+    print(f'  seam matches the contract ({len(want)} fields)')
+
+
 def main():
+    check_seam()
     af = AF2(presets='model_1_multimer_v3', data_dir='/home/ubuntu/params',
              key=jax.random.PRNGKey(0), num_recycle=0, length_bucket_size=32,
              dropout=False, backend='native')
