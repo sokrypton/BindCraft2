@@ -527,6 +527,21 @@ __global__ void addDropNarrowBK(__nv_bfloat16* __restrict__ dst,
 // the bf16 form, which is what the block's chain actually carries: a module's
 // backward templates its cotangent and its accumulator on the SAME type, so a
 // float scratch cannot be paired with a bf16 accumulator.
+// THE STRUCTURE MODULE'S DROPOUT IS NOT THE EVOFORMER'S.  AF2 applies it to
+// the WHOLE act after the residual add (folding_multimer.FoldIteration, after
+// the IPA residual and after the transition residual), with broadcast_dim
+// None -- so the mask is elementwise over [N, C] and shares nothing, where
+// every Evoformer site scales a module DELTA before the residual and shares
+// the mask across rows or columns.  Same hash, different shape of use, so it
+// gets its own kernel rather than a fourth template parameter on dropScaleK.
+__global__ void dropFlatK(float* __restrict__ dst, const float* __restrict__ src,
+                          const uint32_t* __restrict__ seedp, uint32_t depth,
+                          uint32_t mod, float rate, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  dst[i] = src[i] * dropScale(seedp, depth, mod, (uint32_t)i, rate);
+}
+
 template <bool PER_ROW>
 __global__ void dropScaleBK(__nv_bfloat16* __restrict__ dst,
                             const __nv_bfloat16* __restrict__ src, int N, int C,

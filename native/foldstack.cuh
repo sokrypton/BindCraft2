@@ -70,6 +70,17 @@ struct FoldStack {
     }
   }
 
+  // EVERY ITERATION GETS ITS OWN drop_depth, so the eight do not draw one
+  // mask.  AF2 splits a fresh key per iteration and twice within it; here the
+  // iteration index is the hash's depth and the two sites are its module id,
+  // which gives the same independence without carrying keys.
+  void setDropout(bool on, const uint32_t* seed) {
+    for (int i = 0; i < depth; ++i) {
+      it[i].drop_seed = on ? seed : nullptr;
+      it[i].drop_depth = (uint32_t)i;
+    }
+  }
+
   const float* actIn(int i, const float* act0) const {
     return i == 0 ? act0 : it[i - 1].a4;
   }

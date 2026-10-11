@@ -94,6 +94,10 @@ struct StructureModule {
     get("initial_projection/bias", &bip, C);
   }
 
+  // dropout lives in the fold iterations; the two LayerNorms and the initial
+  // projection out here have none
+  void setDropout(bool on, const uint32_t* seed) { stack.setDropout(on, seed); }
+
   void forward(const float* single, const float* pair, const float* mask,
                const float* aatype = nullptr) {
     size_t nc = (size_t)N * C, np = (size_t)N * N * CZ;

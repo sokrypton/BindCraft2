@@ -84,7 +84,7 @@ NATIVE_POST_TRUNK = None
 NATIVE_POST_TRUNK_TRACES = [0]
 
 
-def _native_post_trunk(representations, batch, config):
+def _native_post_trunk(representations, batch, config, safe_key):
   """Run the structure module and the four heads natively.
 
   Returns None -- and the caller falls back to JAX -- whenever the native
@@ -107,10 +107,17 @@ def _native_post_trunk(representations, batch, config):
     return None
 
   pair_mask = seq_mask[:, None] * seq_mask[None, :]
+  # [seed, enabled], both RUNTIME.  use_dropout is a traced value -- a stage
+  # turns dropout off without recompiling -- so it rides in the buffer rather
+  # than becoming an attribute, exactly as the three Evoformer hooks do.
+  seed = jnp.stack([
+      jax.random.bits(safe_key.get(), (), jnp.uint32),
+      jnp.asarray(batch['use_dropout'], jnp.uint32).reshape(()),
+  ])
   NATIVE_POST_TRUNK_TRACES[0] += 1
   if NATIVE_POST_TRUNK_TRACES[0] == 1:
     print(f'native: post-trunk hook FIRED (N={single.shape[0]})', flush=True)
-  out = NATIVE_POST_TRUNK(single, pair, pair_mask, aatype)
+  out = NATIVE_POST_TRUNK(single, pair, pair_mask, aatype, seed)
 
   # atom14 -> atom37 STAYS IN JAX.  It is one gather through a constant
   # per-restype table: the same cost in XLA as in CUDA, and porting the
@@ -206,7 +213,9 @@ class AlphaFoldIteration(hk.Module):
       # native path replaces the lot; the loss above it stays ordinary
       # differentiable Python.
       if NATIVE_POST_TRUNK is not None:
-        native_post = _native_post_trunk(representations, batch, self.config)
+        safe_key, post_subkey = safe_key.split()
+        native_post = _native_post_trunk(representations, batch, self.config,
+                                         post_subkey)
       if native_post is None:
         _, fold_module = self.heads['structure_module']
         structure_module_output = fold_module(representations, batch)
