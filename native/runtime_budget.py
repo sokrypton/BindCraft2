@@ -68,6 +68,26 @@
 # two identical campaigns here disagreed by more than this -- only that they
 # are healthy end to end.
 #
+# ALL THREE ON, CAMPAIGN-VERIFIED, WITH ONE THING WORTH FLAGGING.  The run
+# completed clean -- rc=0, both hooks fired -- but its trajectory was
+# rejected at ANNEAL on pLDDT 0.61, earlier than any other campaign run on
+# this target:
+#
+#   JAX baseline (two runs)   rejected at mutate / PASSED all five
+#   native post-trunk         rejected at mutate / PASSED all five
+#   + embedder + barrier      PASSED all five
+#   + template constant       REJECTED AT ANNEAL
+#
+# One trajectory cannot tell whether that is the change or the spread.  The
+# spread here is enormous -- two IDENTICAL campaigns on this target
+# disagreed by more and flipped the final accept -- and reading n=1 as a
+# regression is the exact mistake made earlier in this work and retracted.
+# But it is the earliest failure seen, it is the configuration with the most
+# perturbation in it, and that is worth someone's attention before a real
+# campaign rather than after.
+#
+# What would settle it is several trajectories an arm, which nobody has run.
+#
 # The flags stay available because the trade REVERSES for a one-shot run or a
 # cold machine, where the compile is most of the cost -- a Colab notebook, a
 # single short job.  It is the campaign that cannot afford them.
