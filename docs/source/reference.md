@@ -497,7 +497,7 @@ installed, so set them before starting a run.
 | `BC2_NATIVE_TEMPLATE` | on | The template pair stack. `0` returns it to JAX. |
 | `BC2_NATIVE_EMBED` | on | The embedder's four input Linears and the relative-position gather. `0` turns it off. |
 | `BC2_NATIVE_POST` | on | The post-trunk step: the structure module and the distogram, PAE, pLDDT and experimentally-resolved heads, in one call. `0` returns it to JAX. |
-| `BC2_NATIVE_TPLEMBED` | **off** | The WHOLE template embedding -- the query LayerNorm, the ninth projection, both stack blocks, `output_layer_norm`, the relu and `output_linear` -- in one call. `1` turns it on, and it then supersedes `BC2_NATIVE_TEMPLATE`, which covers only the two blocks in the middle. Needs exactly one template and the harvested constant; without either it falls back to JAX silently. |
+| `BC2_NATIVE_TPLEMBED` | **off** (see below) | The WHOLE template embedding -- the query LayerNorm, the ninth projection, both stack blocks, `output_layer_norm`, the relu and `output_linear` -- in one call. `1` turns it on, and it then supersedes `BC2_NATIVE_TEMPLATE`, which covers only the two blocks in the middle. Needs exactly one template and the harvested constant; without either it falls back to JAX silently. |
 
 `BC2_NATIVE_POST` is the newest of the three. At 179 tokens with a cold cache
 it takes the design graph's compile from 17.0 s to 7.7 s and the first
@@ -512,6 +512,30 @@ already accepts; `native/post_trunk_gate.py` reproduces the table. What no
 single run can tell you is whether it changes design *outcomes*: two
 trajectories with identical settings differ by more than the backends do, so
 if you are comparing results across versions, hold this fixed.
+
+`BC2_NATIVE_TPLEMBED` STAYS OFF, and the campaign is why. Design-loss
+compile drops 6.4 -> 4.2 s with it on and the step does not move, so the
+case for it is purely compile. Paired hPDL1 campaigns, 3 trajectories each,
+the same three trajectory hashes:
+
+| trajectory | on | off |
+| --- | --- | --- |
+| c4dd0ffbc9d291dc | rejected at screen 0.64 / 0.60 | passed all five stages |
+| 707d3e7f0f7e5c8c | rejected at mutate 0.49 / 0.76 | passed all five stages |
+| 5245753cc9f283a6 | rejected at harden 0.19 / 0.63 | rejected at screen 0.40 / 0.58 |
+| accepted | 0 / 3 | 0 / 3 |
+
+Neither arm accepted anything, so there is no acceptance difference to read.
+On stage depth it is 2-1 to off. That is not enough to call it a regression
+-- WITH DROPOUT ON THE TWO ARMS DRAW DIFFERENT MASKS, because the native
+path splits the SafeKey before its reference pass, so the trajectories
+diverge for a reason that has nothing to do with the kernels. It is more
+than enough to leave the flag off.
+
+With dropout OFF, where the masks cannot differ, one paired trajectory had
+them equivalent and the native arm accepted (0.80 / 0.90 against 0.79 /
+0.93). So the suspicion is specifically about the DROPOUT path, and that is
+where to look before this is turned on.
 
 `BC2_NATIVE_EMBED` is off because the measurement says so, not out of
 caution. It saves 0.8 s of compile — a tenth — and moves pLDDT 1.4e-04 and
