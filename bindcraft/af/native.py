@@ -395,8 +395,15 @@ def _make_post_runner(weights_dir, depth=8):
 
 
 _EMB = 'alphafold/alphafold_iteration/evoformer'
+# single_activations is NOT the embedder's -- AF2 applies it to the
+# EVOFORMER's msa[0], after the trunk -- but it sits under the same scope and
+# the native embedder is what holds it (embed.cuh::singleFromTrunk).  The
+# per-piece path never needed it, because JAX did that projection; the
+# one-call design step does, and without it the pointer is null.
 _EMB_LEAVES = ('preprocess_1d', 'preprocess_msa', 'left_single',
-               'right_single', 'position_activations')
+               'right_single', 'position_activations', 'single_activations',
+               'template_single_embedding', 'template_projection',
+               'prev_pos_linear', 'prev_msa_first_row_norm', 'prev_pair_norm')
 
 
 def embed_weights_from_params(params, out_dir=None):
