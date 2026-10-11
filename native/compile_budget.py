@@ -50,6 +50,29 @@
 # though its blocks are native, the hk.scan around it, the aggregation and
 # output_linear.  Those are where a further attempt should look.
 #
+# WHERE THE TEMPLATE PATH'S 3.8 s ACTUALLY IS, after three probes:
+#
+#   templates off                           4.0 s
+#   templates on, pair stack NATIVE         7.8 s   <- shipped
+#   templates on, pair stack on JAX        20.6 s
+#
+# So the native pair stack is already worth 12.8 s and the big template win
+# was taken when it landed.  Of the 3.8 s that remains with it on:
+#
+#   the eight constant feature projections   0.4 s  (hoistable, see below)
+#   the one-iteration hk.scan                0.0 s  (unrolling it changes
+#                                                    nothing; measured, and
+#                                                    the unroll was reverted)
+#   the rest                                ~3.4 s  diffuse: the custom_vjp
+#                                                    and FFI boundary, the
+#                                                    bf16 save buffer, the
+#                                                    32-padding, the
+#                                                    aggregation and
+#                                                    output_linear
+#
+# There is no large single cause left in the template path.  Anyone looking
+# for one should know these three numbers before starting.
+#
 # The hoist was implemented, proven exact, measured at 0.4 s and then REMOVED,
 # because the part that remained -- computing the constant outside the graph
 # and threading it through af2.py's compiled path -- is real surgery on a hot
