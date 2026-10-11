@@ -465,7 +465,8 @@ SmHeads* sm_get(int N, int depth, const std::string& dir,
 
 ffi::Error SmFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
                      ffi::Buffer<ffi::F32> pair, ffi::Buffer<ffi::F32> mask,
-                     ffi::Buffer<ffi::F32> aatype, int64_t depth,
+                     ffi::Buffer<ffi::F32> aatype,
+                     ffi::Buffer<ffi::U32> seed, int64_t depth,
                      std::string_view weights_dir,
                      ffi::Result<ffi::Buffer<ffi::F32>> atom,
                      ffi::Result<ffi::Buffer<ffi::F32>> dgram,
@@ -477,6 +478,7 @@ ffi::Error SmFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
     return ffi::Error::InvalidArgument("single must be [N,384]");
   int N = (int)d[0];
   auto* m = sm_get(N, (int)depth, std::string(weights_dir), stream);
+  m->sm.setDropout(true, seed.typed_data());
   m->sm.forward(single.typed_data(), pair.typed_data(), mask.typed_data(),
                 aatype.typed_data());
   // pLDDT reads the fold module's act; experimentally_resolved reads the
@@ -504,12 +506,18 @@ ffi::Error SmBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
                      ffi::Buffer<ffi::F32> aatype,
                      ffi::Buffer<ffi::F32> datom, ffi::Buffer<ffi::F32> ddgram,
                      ffi::Buffer<ffi::F32> dpae, ffi::Buffer<ffi::F32> dplddt,
-                     ffi::Buffer<ffi::F32> dexpres, int64_t depth,
+                     ffi::Buffer<ffi::F32> dexpres,
+                     ffi::Buffer<ffi::U32> seed, int64_t depth,
                      std::string_view weights_dir,
                      ffi::Result<ffi::Buffer<ffi::F32>> dsingle,
                      ffi::Result<ffi::Buffer<ffi::F32>> dpair) {
   int N = (int)single.dimensions()[0];
   auto* m = sm_get(N, (int)depth, std::string(weights_dir), stream);
+  // THE SAME SEED, so the replay draws the SAME MASKS.  dropScale is a pure
+  // hash of (seed, depth, module, index) -- that is what lets a replayed
+  // forward reproduce a stochastic one, and what would silently break if the
+  // seed were drawn per call instead of handed in.
+  m->sm.setDropout(true, seed.typed_data());
   // the replay -- see the note above
   m->sm.forward(single.typed_data(), pair.typed_data(), mask.typed_data(),
                 aatype.typed_data());
@@ -649,6 +657,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::F32>>()      // pair   [N,N,128]
         .Arg<ffi::Buffer<ffi::F32>>()      // mask   [N]
         .Arg<ffi::Buffer<ffi::F32>>()      // aatype [N]
+        .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled], runtime
         .Attr<int64_t>("depth")
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>()      // atom14 [N,14,3]
@@ -670,6 +679,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::F32>>()      // d pae
         .Arg<ffi::Buffer<ffi::F32>>()      // d plddt
         .Arg<ffi::Buffer<ffi::F32>>()      // d expres
+        .Arg<ffi::Buffer<ffi::U32>>()      // [seed, enabled], same as the fwd
         .Attr<int64_t>("depth")
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>()      // dsingle [N,384]

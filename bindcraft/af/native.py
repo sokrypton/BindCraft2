@@ -268,7 +268,7 @@ def _make_post_runner(weights_dir, depth=8):
     """
     dep = np.int64(depth)
 
-    def raw(single, pair, pair_mask, aatype):
+    def raw(single, pair, pair_mask, aatype, seed):
         n = single.shape[0]
         f = jnp.float32
         return jax.ffi.ffi_call(
@@ -279,19 +279,23 @@ def _make_post_runner(weights_dir, depth=8):
              jax.ShapeDtypeStruct((n, 50), f),
              jax.ShapeDtypeStruct((n, 37), f)),
             vmap_method='sequential')(
-                single, pair, pair_mask, aatype,
+                single, pair, pair_mask, aatype, seed,
                 depth=dep, weights_dir=weights_dir)
 
     @jax.custom_vjp
-    def post(single, pair, pair_mask, aatype):
-        return raw(single, pair, pair_mask, aatype)
+    def post(single, pair, pair_mask, aatype, seed):
+        return raw(single, pair, pair_mask, aatype, seed)
 
-    def fwd(single, pair, pair_mask, aatype):
-        return (raw(single, pair, pair_mask, aatype),
-                (single, pair, pair_mask, aatype))
+    def fwd(single, pair, pair_mask, aatype, seed):
+        # THE SEED GOES IN THE RESIDUAL.  The backward replays the forward,
+        # and a replay that redrew its dropout masks would hand back the
+        # gradient of a model that was never run -- with nothing wrong in any
+        # output to show for it.
+        return (raw(single, pair, pair_mask, aatype, seed),
+                (single, pair, pair_mask, aatype, seed))
 
     def bwd(res, g):
-        single, pair, pair_mask, aatype = res
+        single, pair, pair_mask, aatype, seed = res
         n = single.shape[0]
         dsingle, dpair = jax.ffi.ffi_call(
             'native_post_trunk_bwd',
@@ -299,16 +303,20 @@ def _make_post_runner(weights_dir, depth=8):
              jax.ShapeDtypeStruct((n, n, 128), jnp.float32)),
             vmap_method='sequential')(
                 single, pair, pair_mask, aatype,
-                *[x.astype(jnp.float32) for x in g],
+                *[x.astype(jnp.float32) for x in g], seed,
                 depth=dep, weights_dir=weights_dir)
         return (dsingle, dpair, jnp.zeros_like(pair_mask),
-                jnp.zeros_like(aatype))
+                jnp.zeros_like(aatype),
+                np.zeros(seed.shape, dtype=jax.dtypes.float0))
 
     post.defvjp(fwd, bwd)
 
-    def run(single, pair, pair_mask, aatype):
+    def run(single, pair, pair_mask, aatype, seed=None):
+        if seed is None:
+            seed = jnp.zeros((2,), jnp.uint32)
         out = post(single.astype(jnp.float32), pair.astype(jnp.float32),
-                   pair_mask.astype(jnp.float32), aatype.astype(jnp.float32))
+                   pair_mask.astype(jnp.float32), aatype.astype(jnp.float32),
+                   seed.astype(jnp.uint32).reshape((2,)))
         return dict(zip(('atom14', 'distogram', 'pae', 'plddt', 'expres'), out))
 
     return run
@@ -726,37 +734,14 @@ def install_models(model_parameters: dict, depth: int = 48,
         # and the post-trunk step: the structure module and the four heads,
         # in one call.  OFF by default; BC2_NATIVE_POST=1 turns it on.
         #
-        # It is off for the reason the template stack was once off and should
-        # not have been -- the evidence is not yet of the right KIND.  There
-        # is a module-level gate against AF2 on the real checkpoint at the
-        # campaign's own length (N=211: the forward at the structure module's
-        # own floor, dgram and pae exactly 0, expres 1.3e-07), and two
-        # controls showing the composition is right -- one-hot cotangents put
-        # each head's gradient on the correct tensor and nowhere else, and a
-        # finite-difference step sweep converges onto the analytic value.
-        # What is missing is a real campaign, which is what the other two
-        # stacks have and what decides whether a 4.9e-02 gradient difference
-        # against JAX matters to a trajectory.  Until one has run, a user who
-        # does nothing gets the path with that evidence.
-        # THE STRUCTURE MODULE HAS DROPOUT AND THIS PATH DOES NOT.
-        # folding_multimer.FoldIteration applies it twice per iteration
-        # (lines 428 and 449, rate c.dropout under batch['use_dropout']), and
-        # the native structure module runs deterministically.  use_dropout is
-        # a RUNTIME value -- that is the whole point of the dropout work, a
-        # stage can turn it off without recompiling -- so the hook cannot
-        # branch on it at trace time.  The decision has to be made here.
-        #
-        # Installing anyway would run a different model from the one the user
-        # asked for, silently.  A seed-matched campaign shows what that costs:
-        # i_pTM 0.80/0.80/0.79/0.69 and pLDDT 0.92/0.91/0.91/0.85 on JAX
-        # against 0.74/0.73/0.76/0.66 and 0.81/0.79/0.86/0.79 native, every
-        # stage worse in the same direction.
-        if os.environ.get('BC2_NATIVE_POST') == '1' and dropout:
-            print('native: post-trunk NOT installed -- design dropout is on '
-                  'and the native structure module has none.  Implement it '
-                  'there first; until then this path would quietly run a '
-                  'deterministic structure module.')
-        elif os.environ.get('BC2_NATIVE_POST') == '1':
+        # The native structure module now carries AF2's two dropout sites
+        # (folding_multimer.FoldIteration lines 428 and 449, rate 0.1
+        # elementwise on the act after each residual), so this installs
+        # whether or not design dropout is on.  It was guarded until it did:
+        # without them the path was not a faster structure module but a
+        # different one, and use_dropout is a runtime value so the hook
+        # cannot decline at trace time.
+        if os.environ.get('BC2_NATIVE_POST') == '1':
             # LOUD, not silent.  The other two stacks swallow a KeyError
             # because a preset that lacks them is a normal thing; asking for
             # this one explicitly and silently not getting it is not, and a

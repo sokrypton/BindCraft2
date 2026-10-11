@@ -142,6 +142,22 @@ struct FoldIteration {
   // are on, this iteration's OUTPUT FRAME gains a second consumer: the next
   // iteration and this iteration's atoms both read it, so its cotangent is a
   // sum -- which is the only structural change they make to the backward.
+  // DROPOUT.  AF2 applies it inside the fold iteration at two points, and
+  // NOT the way the Evoformer does: folding_multimer.FoldIteration drops the
+  // WHOLE act after each residual add (rate 0.1, broadcast_dim None), where
+  // every Evoformer site scales a module delta before the residual and shares
+  // the mask across a row or a column.  So this uses dropFlatK, elementwise
+  // over [N, C], and the mask index is the flat one.
+  //
+  // The seed is a DEVICE pointer, two words: [seed, enabled].  Both are
+  // runtime values, so a stage that turns dropout off costs no recompile --
+  // which is the whole reason the Evoformer's dropout is built this way, and
+  // the reason the structure module could not simply bake the rate in.
+  const uint32_t* drop_seed = nullptr;
+  uint32_t drop_depth = 0;        // the iteration index: 8 iterations, 8 masks
+  enum { DM_SM_ATTN = 21, DM_SM_TRANS = 22 };
+  static constexpr float SM_DROP = 0.1f;
+
   bool do_atoms = false;
   sidechain::Sidechain sc;
   atom14::Atom14 at;
@@ -239,6 +255,11 @@ struct FoldIteration {
     int g = (int)((n + 255) / 256), gw = (N + 7) / 8;
     attn.forward(act, pair, mask, rot, trans);
     addK<<<g, 256, 0, st>>>(a1, act, attn.out, n);
+    // IN PLACE, so a1 holds what the LayerNorm actually saw -- the backward
+    // reads a1 as the LayerNorm's saved input and must get the dropped value
+    if (drop_seed)
+      dropFlatK<<<g, 256, 0, st>>>(a1, a1, drop_seed, drop_depth, DM_SM_ATTN,
+                                   SM_DROP, n);
     lnFwdK<><<<gw, 256, 0, st>>>(a1, ln1s, ln1o, a2, mu1, rs1, N);
     gemm(N, C, C, a2, w1, h1);
     addRowBiasK<<<g, 256, 0, st>>>(h1, b1, C, n);
@@ -249,6 +270,9 @@ struct FoldIteration {
     gemm(N, C, C, h2, w3, tr);
     addRowBiasK<<<g, 256, 0, st>>>(tr, b3, C, n);
     addK<<<g, 256, 0, st>>>(a3, tr, a2, n);
+    if (drop_seed)
+      dropFlatK<<<g, 256, 0, st>>>(a3, a3, drop_seed, drop_depth, DM_SM_TRANS,
+                                   SM_DROP, n);
     lnFwdK<><<<gw, 256, 0, st>>>(a3, ln2s, ln2o, a4, mu2, rs2, N);
     rig.forward(a4, rot, trans, rout, tout);
     rout_ = rout;
@@ -333,6 +357,12 @@ struct FoldIteration {
     // sidechain
     if (do_atoms && datom) accK<<<g, 256, 0, st>>>(d1, dscAct, n);
     lnBwdK<><<<gw, 256, 0, st>>>(d1, a3, ln2s, mu2, rs2, d2, N);   // da3
+    // dropout is a multiply by a 0-or-1/keep mask, so its backward is the
+    // SAME mask.  dropScale is a pure hash of (seed, depth, module, index),
+    // which is why the backward can regenerate it rather than store it.
+    if (drop_seed)
+      dropFlatK<<<g, 256, 0, st>>>(d2, d2, drop_seed, drop_depth, DM_SM_TRANS,
+                                   SM_DROP, n);
     // the transition, in reverse; the residual means da2 starts as da3
     gemmNT(N, C, C, d2, w3, dh);
     reluBwdK<<<g, 256, 0, st>>>(dh, h2, n);
@@ -341,6 +371,9 @@ struct FoldIteration {
     gemmNT(N, C, C, d3, w1, dh);
     accK<<<g, 256, 0, st>>>(dh, d2, n);                          // da2
     lnBwdK<><<<gw, 256, 0, st>>>(dh, a1, ln1s, mu1, rs1, d2, N);   // da1
+    if (drop_seed)
+      dropFlatK<<<g, 256, 0, st>>>(d2, d2, drop_seed, drop_depth, DM_SM_ATTN,
+                                   SM_DROP, n);
     // IPA, whose frame gradients land ON TOP of the composition's: the same
     // rigid was handed to both, so drot/dtrans accumulate rather than being
     // overwritten.
