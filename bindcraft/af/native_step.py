@@ -35,8 +35,8 @@ DBINS = 64
 
 
 @functools.lru_cache(maxsize=1)
-def _tables():
-    """AF2's own constant tables, as device arrays.
+def _table_arrays():
+    """AF2's own constant tables, as NUMPY arrays.
 
     They travel as INPUTS rather than being baked into the kernel: a second
     copy of residue_constants behind a CUDA rebuild is a second thing to
@@ -53,11 +53,24 @@ def _tables():
     chi_msk = np.zeros((22, 4), np.float32)
     chi_msk[:20] = np.asarray(RC.chi_angles_mask, np.float32)
     chi_msk[21] = chi_msk[20]
-    return (jnp.asarray(RC.restype_atom14_mask, F32),
-            jnp.asarray(RC.restype_atom37_mask, F32),
-            jnp.asarray(RC.restype_atom14_to_atom37, I32),
-            jnp.asarray(RC.restype_atom37_to_atom14, I32),
-            jnp.asarray(chi_idx), jnp.asarray(chi_msk))
+    return (np.asarray(RC.restype_atom14_mask, np.float32),
+            np.asarray(RC.restype_atom37_mask, np.float32),
+            np.asarray(RC.restype_atom14_to_atom37, np.int32),
+            np.asarray(RC.restype_atom37_to_atom14, np.int32),
+            chi_idx, chi_msk)
+
+
+def _tables():
+    """...and as device arrays, built fresh on every call.
+
+    CACHING THE jnp ARRAYS LEAKS A TRACER.  The first call happens inside
+    `_step`, which is being traced for custom_vjp, so an lru_cache of the
+    converted arrays hands the SECOND trace a value that belongs to the
+    first -- `UnexpectedTracerError`, raised from ffi_call and pointing at
+    the cache rather than at the conversion.  The numpy side is cached;
+    the conversion is not.
+    """
+    return tuple(jnp.asarray(a) for a in _table_arrays())
 
 
 def _out_shapes(nmax):
