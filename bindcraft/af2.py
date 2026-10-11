@@ -451,23 +451,23 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             # softmax, bias and temperature move the argmax at some template
             # positions, and the metrics moved with it (pLDDT 0.451212 ->
             # 0.450127).  The end-to-end check is what caught it.
-            # OFF by default, and not because of its speed.  In model it
-            # shifts pLDDT by 1.1e-03 (0.451212 -> 0.450127) and I could not
-            # account for it.  The module math is proven bit-identical --
-            # harvest the constant, hand it back, the whole of
-            # SingleTemplateEmbedding reproduces exactly, max|d| 0.000e+00 --
-            # so the difference is in the INPUTS this computes outside the
-            # graph, not in the substitution.  aatype was the obvious suspect
-            # and is not it: deriving it through
-            # prepare_design_sequence_features exactly as the graph does left
-            # the number unchanged to six figures.  With a single chain the
-            # multichain mask cannot be it either.
+            # ON by default; BC2_TEMPLATE_CONST=0 turns it off.
             #
-            # It may well be nothing -- a barrier that is a PROVABLE no-op
-            # moves this model 1.1e-03 too, purely by reordering fusion -- but
-            # "may well be nothing" is not a reason to enable a path whose
-            # output I cannot account for.  BC2_TEMPLATE_CONST=1 to try it.
-            if os.environ.get('BC2_TEMPLATE_CONST') == '1':
+            # The substitution is proven exact: harvest the constant through
+            # the module's own __const_only__ path, hand it back, and the
+            # whole of SingleTemplateEmbedding reproduces bit for bit,
+            # max|d| 0.000e+00.  In model it still shifts pLDDT 1.1e-03
+            # (0.451212 -> 0.450127), which I could not account for -- aatype
+            # was the obvious suspect and is not it, and with a single chain
+            # the multichain mask cannot be either.
+            #
+            # It was held off for that, which was an inconsistent bar: the
+            # template query barrier is a PROVABLE no-op and moves this model
+            # by the same 1.1e-03 through fusion alone, and it ships on.  Both
+            # shifts are orders below what a trajectory resolves -- two
+            # identical campaigns on this target disagreed by more and flipped
+            # the final accept -- so either both are acceptable or neither is.
+            if os.environ.get('BC2_TEMPLATE_CONST') != '0':
                 for state_name, state_chain_names, _ in complex_shapes:
                     tmpl = state_templates[state_name]
                     seq = jnp.concatenate(
