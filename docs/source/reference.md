@@ -513,6 +513,23 @@ single run can tell you is whether it changes design *outcomes*: two
 trajectories with identical settings differ by more than the backends do, so
 if you are comparing results across versions, hold this fixed.
 
+THERE IS NO SPEED REASON TO TURN ANY OF THESE OFF.  One flag off at a time
+against an all-on baseline, N=179, four timed steps after warmup:
+
+| off | step | what the native piece does |
+| --- | --- | --- |
+| nothing (all on) | 755.5 ms +- 0.4 | -- |
+| `BC2_NATIVE_TEMPLATE` | 762.1 ms +- 1.2 | saves 6.6 ms |
+| `BC2_NATIVE_EMBED` | 761.3 ms +- 0.7 | saves 5.8 ms |
+| `BC2_NATIVE_POST` | 755.2 ms +- 0.6 | +0.3 ms, inside the noise |
+| `BC2_NATIVE_TPLEMBED` | 753.4 ms +- 1.1 | +2.1 ms, 0.3%, for -2.2 s compile |
+
+All-on is the fastest configuration bar a 0.3% give-back on the template
+embedding.  EARLIER PER-PIECE NUMBERS IN THE NOTES ARE STALE -- the
+post-trunk step was once +1.1% and the structure module measured 1.17x to
+1.50x slower than XLA standalone; neither survives in the composition.  The
+flags are kill switches now, not a performance dial.
+
 `BC2_NATIVE_TPLEMBED` IS ON BY REQUEST, NOT BY THE MEASUREMENT -- the
 campaign below could not separate it from the JAX path, and is recorded so
 nobody mistakes the default for evidence. Design-loss
