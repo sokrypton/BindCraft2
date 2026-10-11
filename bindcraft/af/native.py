@@ -1066,12 +1066,21 @@ def install_models(model_parameters: dict, depth: int = 48,
                 _TPL_RUNNERS[name] = _make_tpl_runner(td, 2, bool(dropout))
             except KeyError:
                 pass
-        # the WHOLE template embedding rather than just its two blocks.  OFF
-        # by default; BC2_NATIVE_TPLEMBED=1 turns it on.  It supersedes the
-        # stack runner above -- when this one is installed the stack hook is
-        # left unset, because the native embedding already contains it and
-        # running both would mean the stack twice.
-        if os.environ.get('BC2_NATIVE_TPLEMBED') == '1':
+        # the WHOLE template embedding rather than just its two blocks.  ON
+        # by default; BC2_NATIVE_TPLEMBED=0 turns it off.  It supersedes the
+        # stack runner above WITHOUT disabling it: this one returns before
+        # SingleTemplateEmbedding runs, so the stack cannot execute twice,
+        # and leaving the stack runner installed keeps any state that
+        # declines the embedding -- more than one template, no harvested
+        # constant -- on the native stack rather than dropping it to XLA.
+        #
+        # TURNED ON BY REQUEST, NOT BY THE MEASUREMENT.  Compile goes
+        # 6.4 -> 4.2 s and the step does not move.  Paired hPDL1 campaigns
+        # could not separate it from the JAX path: nothing was accepted in
+        # ANY arm, including pure JAX, so three trajectories had no
+        # resolution; on stage depth it was 2-1 to off.  See the reference
+        # table for the numbers.
+        if os.environ.get('BC2_NATIVE_TPLEMBED') != '0':
             try:
                 ted = tplembed_weights_from_params(params)
                 _TPE_RUNNERS[name] = _make_tplembed_runner(ted, 2,
@@ -1082,8 +1091,6 @@ def install_models(model_parameters: dict, depth: int = 48,
                 print(f'native: template embedding NOT installed for '
                       f'{name}: {e}')
         # and the post-trunk step: the structure module and the four heads,
-        # in one call.  OFF by default; BC2_NATIVE_POST=1 turns it on.
-        #
         # and the post-trunk step: the structure module and the four heads in
         # one call.  ON by default; BC2_NATIVE_POST=0 turns it off.
         #
