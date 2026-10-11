@@ -181,6 +181,142 @@ def weights_from_params(params, out_dir=None, depth=None, prefix=_MAIN):
     return out
 
 
+_SM = 'alphafold/alphafold_iteration/structure_module'
+_HEADS = ('distogram_head', 'predicted_aligned_error_head',
+          'predicted_lddt_head', 'experimentally_resolved_head')
+_IT = 'alphafold/alphafold_iteration'
+# AF2's IPA builds its three scalar projections with use_bias=True so that the
+# graph is the same for monomer and multimer, but no checkpoint carries those
+# biases -- they were trained at zero.  Supplied here rather than special-cased
+# in CUDA.
+_IPA_ZERO_BIAS = ('fold_iteration/invariant_point_attention/q_scalar_projection',
+                  'fold_iteration/invariant_point_attention/k_scalar_projection',
+                  'fold_iteration/invariant_point_attention/v_scalar_projection')
+
+
+def post_weights_from_params(params, out_dir=None):
+    """The post-trunk weights -- structure module and the four heads.
+
+    Unlike the Evoformer's these carry NO block index: AF2's structure module
+    is recurrent and its eight iterations share one set of fold_iteration
+    weights.  The residue-constant tables travel with the dump, from the same
+    residue_constants the model itself uses, so there is no second copy of
+    AF2's geometry on the CUDA side.
+    """
+    import hashlib
+    import tempfile
+
+    flat = {}
+    for mod, d in params.items():
+        if mod == _SM or mod.startswith(_SM + '/'):
+            path = mod[len(_SM) + 1:]
+        elif mod.startswith(_IT + '/') and mod[len(_IT) + 1:].split('/')[0] in _HEADS:
+            path = mod[len(_IT) + 1:]
+        else:
+            continue
+        for pname, v in d.items():
+            key = f'param/{path}/{pname}' if path else f'param/{pname}'
+            flat[key] = np.asarray(v, np.float32)
+    if not flat:
+        raise KeyError('no structure_module or head parameters in these params')
+
+    for m in _IPA_ZERO_BIAS:
+        wk, bk = f'param/{m}/weights', f'param/{m}/bias'
+        if wk in flat and bk not in flat:
+            # [C, H, QK] -- the bias spans every dim but the input one
+            flat[bk] = np.zeros(int(np.prod(flat[wk].shape[1:])), np.float32)
+
+    from .alphafold.common import residue_constants as rc
+    flat['const/default_frame'] = np.asarray(
+        rc.restype_rigid_group_default_frame, np.float32)
+    flat['const/atom14_to_group'] = np.asarray(
+        rc.restype_atom14_to_rigid_group, np.float32)
+    flat['const/atom14_lit_pos'] = np.asarray(
+        rc.restype_atom14_rigid_group_positions, np.float32)
+    flat['const/atom14_mask'] = np.asarray(rc.restype_atom14_mask, np.float32)
+
+    h = hashlib.sha1()
+    for k in sorted(flat):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(flat[k]).tobytes()[:4096])
+    out = out_dir or os.path.join(tempfile.gettempdir(),
+                                  f'bc2_post_{h.hexdigest()[:16]}')
+    if os.path.exists(os.path.join(out, 'manifest.txt')):
+        return out
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, 'manifest.txt'), 'w') as fh:
+        for name in sorted(flat):
+            arr = np.ascontiguousarray(flat[name], dtype=np.float32)
+            fn = name.replace('/', '__') + '.f32'
+            arr.tofile(os.path.join(out, fn))
+            fh.write(f'{name} {fn} {arr.ndim} '
+                     f'{" ".join(str(x) for x in arr.shape)}\n')
+    return out
+
+
+def _make_post_runner(weights_dir, depth=8):
+    """Structure module + all four heads as one custom call.
+
+    NO PADDING, unlike the three Evoformer-family runners.  Those fail inside
+    cuBLASLt at an unaligned length; this path goes through the IPA and the
+    atom builder instead, and gates clean at N=211 -- a campaign's own length
+    -- so padding it would cost an allocation to buy nothing.
+
+    THE BACKWARD REPLAYS.  Nothing crosses from the forward but the inputs,
+    which is what makes both calls re-entrant under JAX's async dispatch; see
+    the note in ffi.cu.
+    """
+    dep = np.int64(depth)
+
+    def raw(single, pair, pair_mask, aatype):
+        n = single.shape[0]
+        f = jnp.float32
+        return jax.ffi.ffi_call(
+            'native_post_trunk_fwd',
+            (jax.ShapeDtypeStruct((n, 14, 3), f),
+             jax.ShapeDtypeStruct((n, n, 64), f),
+             jax.ShapeDtypeStruct((n, n, 64), f),
+             jax.ShapeDtypeStruct((n, 50), f),
+             jax.ShapeDtypeStruct((n, 37), f)),
+            vmap_method='sequential')(
+                single, pair, pair_mask, aatype,
+                depth=dep, weights_dir=weights_dir)
+
+    @jax.custom_vjp
+    def post(single, pair, pair_mask, aatype):
+        return raw(single, pair, pair_mask, aatype)
+
+    def fwd(single, pair, pair_mask, aatype):
+        return (raw(single, pair, pair_mask, aatype),
+                (single, pair, pair_mask, aatype))
+
+    def bwd(res, g):
+        single, pair, pair_mask, aatype = res
+        n = single.shape[0]
+        dsingle, dpair = jax.ffi.ffi_call(
+            'native_post_trunk_bwd',
+            (jax.ShapeDtypeStruct((n, 384), jnp.float32),
+             jax.ShapeDtypeStruct((n, n, 128), jnp.float32)),
+            vmap_method='sequential')(
+                single, pair, pair_mask, aatype,
+                *[x.astype(jnp.float32) for x in g],
+                depth=dep, weights_dir=weights_dir)
+        return (dsingle, dpair, jnp.zeros_like(pair_mask),
+                jnp.zeros_like(aatype))
+
+    post.defvjp(fwd, bwd)
+
+    def run(single, pair, pair_mask, aatype):
+        out = post(single.astype(jnp.float32), pair.astype(jnp.float32),
+                   pair_mask.astype(jnp.float32), aatype.astype(jnp.float32))
+        return dict(zip(('atom14', 'distogram', 'pae', 'plddt', 'expres'), out))
+
+    return run
+
+
+_POST_RUNNERS = {}
+
+
 def available() -> bool:
     return why_unavailable() == ''
 
@@ -197,7 +333,9 @@ def _register():
     for target, symbol in (('native_evoformer_fwd', 'NativeEvoformerFwd'),
                            ('native_evoformer_bwd', 'NativeEvoformerBwd'),
                            ('template_pair_stack_fwd', 'TemplatePairStackFwd'),
-                           ('template_pair_stack_bwd', 'TemplatePairStackBwd')):
+                           ('template_pair_stack_bwd', 'TemplatePairStackBwd'),
+                           ('native_post_trunk_fwd', 'StructureHeadsFwd'),
+                           ('native_post_trunk_bwd', 'StructureHeadsBwd')):
         jax.ffi.register_ffi_target(
             target, jax.ffi.pycapsule(getattr(lib, symbol)), platform='CUDA')
     _registered = True
@@ -514,6 +652,7 @@ def use_model(name: str):
     modules_multimer.NATIVE_EVOFORMER = run
     modules_multimer.NATIVE_EXTRA_MSA_STACK = _EXTRA_RUNNERS.get(name)
     modules_multimer.NATIVE_TEMPLATE_STACK = _TPL_RUNNERS.get(name)
+    modules_multimer.NATIVE_POST_TRUNK = _POST_RUNNERS.get(name)
 
 
 def install_models(model_parameters: dict, depth: int = 48,
@@ -582,6 +721,27 @@ def install_models(model_parameters: dict, depth: int = 48,
             try:
                 td = weights_from_params(params, depth=None, prefix=_TPL)
                 _TPL_RUNNERS[name] = _make_tpl_runner(td, 2, bool(dropout))
+            except KeyError:
+                pass
+        # and the post-trunk step: the structure module and the four heads,
+        # in one call.  OFF by default; BC2_NATIVE_POST=1 turns it on.
+        #
+        # It is off for the reason the template stack was once off and should
+        # not have been -- the evidence is not yet of the right KIND.  There
+        # is a module-level gate against AF2 on the real checkpoint at the
+        # campaign's own length (N=211: the forward at the structure module's
+        # own floor, dgram and pae exactly 0, expres 1.3e-07), and two
+        # controls showing the composition is right -- one-hot cotangents put
+        # each head's gradient on the correct tensor and nowhere else, and a
+        # finite-difference step sweep converges onto the analytic value.
+        # What is missing is a real campaign, which is what the other two
+        # stacks have and what decides whether a 4.9e-02 gradient difference
+        # against JAX matters to a trajectory.  Until one has run, a user who
+        # does nothing gets the path with that evidence.
+        if os.environ.get('BC2_NATIVE_POST') == '1':
+            try:
+                pd = post_weights_from_params(params)
+                _POST_RUNNERS[name] = _make_post_runner(pd, 8)
             except KeyError:
                 pass
     first = next(iter(model_parameters))

@@ -30,6 +30,8 @@
 
 #include "stack.cuh"
 #include "tplstack.cuh"
+#include "structmod.cuh"
+#include "heads.cuh"
 #if NE_CUPTI
 #include "cupti_prof.cuh"
 #endif
@@ -400,6 +402,176 @@ ffi::Error TplBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct,
   return ffi::Error::Success();
 }
 
+
+// ---------------------------------------------------------------------------
+// The post-trunk step: structure module + all four heads, in one call.
+//
+// This is the boundary that lets a design step keep its losses in Python
+// while XLA compiles none of the model.  Everything between the trunk's
+// (single, pair) and the tensors a loss actually reads -- atom14 positions
+// and the four heads' logits -- happens here.
+//
+// THE BACKWARD REPLAYS THE FORWARD.  StructureModule keeps its forward state
+// in member buffers (foldstack deliberately holds one iteration's save-set
+// and remats the other seven), so a second forward on the same object
+// overwrites what the first one's backward still needs.  BindCraft runs
+// several prediction states through one model, and nothing stops XLA from
+// issuing fwd(A), fwd(B), bwd(B), bwd(A) -- which would silently hand A's
+// backward B's activations.  Replaying costs one structure-module forward
+// and removes the ordering assumption entirely.
+// ---------------------------------------------------------------------------
+__global__ void addPlainK(float* __restrict__ dst, const float* __restrict__ src,
+                          size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] += src[i];
+}
+
+// KEYED ON THE STREAM.  foldstack owns a tree of cuBLAS handles and has no
+// setStream, so rather than thread a setter through it the object is built on
+// the stream it will run on.  XLA hands these calls one stream, so this is one
+// object in practice; a second stream would simply get its own.
+struct SKey {
+  int N, depth;
+  std::string dir;
+  cudaStream_t stream;
+  bool operator<(const SKey& o) const {
+    return std::tie(N, depth, dir, stream) <
+           std::tie(o.N, o.depth, o.dir, o.stream);
+  }
+};
+struct SmHeads {
+  structmod::StructureModule sm;
+  heads::Heads hd;
+};
+std::map<SKey, SmHeads*> g_sm;
+
+SmHeads* sm_get(int N, int depth, const std::string& dir,
+                cudaStream_t stream) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  SKey k{N, depth, dir, stream};
+  auto it = g_sm.find(k);
+  if (it != g_sm.end()) return it->second;
+  Oracle*& w = g_weights[dir];
+  if (!w) w = new Oracle(dir);
+  auto* m = new SmHeads();
+  m->sm.do_atoms = true;          // bc2 reads final_atom_positions
+  m->sm.alloc(N, depth, stream);
+  m->sm.setWeights(*w);
+  m->hd.alloc(N, stream);
+  m->hd.setWeights(*w);
+  g_sm[k] = m;
+  return m;
+}
+
+ffi::Error SmFwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
+                     ffi::Buffer<ffi::F32> pair, ffi::Buffer<ffi::F32> mask,
+                     ffi::Buffer<ffi::F32> aatype, int64_t depth,
+                     std::string_view weights_dir,
+                     ffi::Result<ffi::Buffer<ffi::F32>> atom,
+                     ffi::Result<ffi::Buffer<ffi::F32>> dgram,
+                     ffi::Result<ffi::Buffer<ffi::F32>> pae,
+                     ffi::Result<ffi::Buffer<ffi::F32>> plddt,
+                     ffi::Result<ffi::Buffer<ffi::F32>> expres) {
+  auto d = single.dimensions();
+  if (d.size() != 2 || d[1] != structmod::C)
+    return ffi::Error::InvalidArgument("single must be [N,384]");
+  int N = (int)d[0];
+  auto* m = sm_get(N, (int)depth, std::string(weights_dir), stream);
+  m->sm.forward(single.typed_data(), pair.typed_data(), mask.typed_data(),
+                aatype.typed_data());
+  // pLDDT reads the fold module's act; experimentally_resolved reads the
+  // trunk single it was handed
+  m->hd.forward(pair.typed_data(), m->sm.outAct());
+  m->hd.expResFwd(single.typed_data());
+  size_t na = (size_t)N * atom14::NA * 3, np = (size_t)N * N;
+  CU(cudaMemcpyAsync(atom->typed_data(), m->sm.outAtom(), na * 4,
+                     cudaMemcpyDeviceToDevice, stream));
+  CU(cudaMemcpyAsync(dgram->typed_data(), m->hd.dgram,
+                     np * heads::NDGRAM * 4, cudaMemcpyDeviceToDevice, stream));
+  CU(cudaMemcpyAsync(pae->typed_data(), m->hd.pae, np * heads::NPAE * 4,
+                     cudaMemcpyDeviceToDevice, stream));
+  CU(cudaMemcpyAsync(plddt->typed_data(), m->hd.plddt,
+                     (size_t)N * heads::PL_BINS * 4, cudaMemcpyDeviceToDevice,
+                     stream));
+  CU(cudaMemcpyAsync(expres->typed_data(), m->hd.expres,
+                     (size_t)N * heads::NER * 4, cudaMemcpyDeviceToDevice,
+                     stream));
+  return ffi::Error::Success();
+}
+
+ffi::Error SmBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
+                     ffi::Buffer<ffi::F32> pair, ffi::Buffer<ffi::F32> mask,
+                     ffi::Buffer<ffi::F32> aatype,
+                     ffi::Buffer<ffi::F32> datom, ffi::Buffer<ffi::F32> ddgram,
+                     ffi::Buffer<ffi::F32> dpae, ffi::Buffer<ffi::F32> dplddt,
+                     ffi::Buffer<ffi::F32> dexpres, int64_t depth,
+                     std::string_view weights_dir,
+                     ffi::Result<ffi::Buffer<ffi::F32>> dsingle,
+                     ffi::Result<ffi::Buffer<ffi::F32>> dpair) {
+  int N = (int)single.dimensions()[0];
+  auto* m = sm_get(N, (int)depth, std::string(weights_dir), stream);
+  // the replay -- see the note above
+  m->sm.forward(single.typed_data(), pair.typed_data(), mask.typed_data(),
+                aatype.typed_data());
+  m->hd.forward(pair.typed_data(), m->sm.outAct());
+
+  // the heads first: they produce the structure module's act cotangent and
+  // write dpair, which the structure module then accumulates onto
+  static float* dact = nullptr;
+  static size_t dact_n = 0;
+  size_t nc = (size_t)N * structmod::C;
+  if (dact_n < nc) {
+    if (dact) CU(cudaFree(dact));
+    CU(cudaMalloc(&dact, nc * 4)); dact_n = nc;
+  }
+  m->hd.backward(ddgram.typed_data(), dpae.typed_data(), dplddt.typed_data(),
+                 m->sm.outAct(), dpair->typed_data(), dact);
+  // the trunk single's own head cotangent starts dsingle (beta=0); the
+  // structure module's backward overwrites it, so this has to go after --
+  // instead it lands in a scratch and is added below.
+  static float* dse = nullptr;
+  static size_t dse_n = 0;
+  if (dse_n < nc) {
+    if (dse) CU(cudaFree(dse));
+    CU(cudaMalloc(&dse, nc * 4)); dse_n = nc;
+  }
+  m->hd.expResBwd(dexpres.typed_data(), dse, /*beta*/0.f);
+
+  // the rotation/translation cotangents are zero: bc2 reads positions, not
+  // frames, so nothing downstream differentiates the output frame directly
+  static float *drot = nullptr, *dtrans = nullptr;
+  static int frame_n = 0;
+  if (frame_n < N) {
+    if (drot) { CU(cudaFree(drot)); CU(cudaFree(dtrans)); }
+    CU(cudaMalloc(&drot, (size_t)N * 9 * 4));
+    CU(cudaMalloc(&dtrans, (size_t)N * 3 * 4));
+    frame_n = N;
+  }
+  CU(cudaMemsetAsync(drot, 0, (size_t)N * 9 * 4, stream));
+  CU(cudaMemsetAsync(dtrans, 0, (size_t)N * 3 * 4, stream));
+
+  // structmod::backward WRITES dpair rather than accumulating, so the heads'
+  // share -- already sitting in the output buffer -- is staged aside and
+  // added back afterwards.  Same for dsingle and the expres head's share.
+  static float* dpz = nullptr;
+  static size_t dpz_n = 0;
+  size_t npz = (size_t)N * N * structmod::CZ;
+  if (dpz_n < npz) {
+    if (dpz) CU(cudaFree(dpz));
+    CU(cudaMalloc(&dpz, npz * 4)); dpz_n = npz;
+  }
+  CU(cudaMemcpyAsync(dpz, dpair->typed_data(), npz * 4,
+                     cudaMemcpyDeviceToDevice, stream));
+  m->sm.backward(dact, drot, dtrans, single.typed_data(),
+                 dsingle->typed_data(), dpair->typed_data(),
+                 datom.typed_data(), aatype.typed_data());
+  addPlainK<<<(int)((npz + 255) / 256), 256, 0, stream>>>(
+      dpair->typed_data(), dpz, npz);
+  addPlainK<<<(int)((nc + 255) / 256), 256, 0, stream>>>(
+      dsingle->typed_data(), dse, nc);
+  return ffi::Error::Success();
+}
+
 }  // namespace
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -468,3 +640,37 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("dropout")
         .Attr<std::string_view>("weights_dir")
         .Ret<ffi::Buffer<ffi::F32>>());    // dpair [N,N,64]
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    StructureHeadsFwd, SmFwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // single [N,384]
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair   [N,N,128]
+        .Arg<ffi::Buffer<ffi::F32>>()      // mask   [N]
+        .Arg<ffi::Buffer<ffi::F32>>()      // aatype [N]
+        .Attr<int64_t>("depth")
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>()      // atom14 [N,14,3]
+        .Ret<ffi::Buffer<ffi::F32>>()      // dgram  [N,N,64]
+        .Ret<ffi::Buffer<ffi::F32>>()      // pae    [N,N,64]
+        .Ret<ffi::Buffer<ffi::F32>>()      // plddt  [N,50]
+        .Ret<ffi::Buffer<ffi::F32>>());    // expres [N,37]
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    StructureHeadsBwd, SmBwdImpl,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // single
+        .Arg<ffi::Buffer<ffi::F32>>()      // pair
+        .Arg<ffi::Buffer<ffi::F32>>()      // mask
+        .Arg<ffi::Buffer<ffi::F32>>()      // aatype
+        .Arg<ffi::Buffer<ffi::F32>>()      // d atom14
+        .Arg<ffi::Buffer<ffi::F32>>()      // d dgram
+        .Arg<ffi::Buffer<ffi::F32>>()      // d pae
+        .Arg<ffi::Buffer<ffi::F32>>()      // d plddt
+        .Arg<ffi::Buffer<ffi::F32>>()      // d expres
+        .Attr<int64_t>("depth")
+        .Attr<std::string_view>("weights_dir")
+        .Ret<ffi::Buffer<ffi::F32>>()      // dsingle [N,384]
+        .Ret<ffi::Buffer<ffi::F32>>());    // dpair   [N,N,128]

@@ -210,7 +210,13 @@ def design(settings_path: str, assignments: list[str]=(), metadata_path: str | N
     from bindcraft.campaign import launch_campaign
     from bindcraft.design_workers import running_as_design_worker
     if compile_cache and not running_as_design_worker():
-        print(f'compiled graphs cached in {compile_cache}', flush=True)
+        # REPORT WHAT JAX IS ACTUALLY USING.  compile_cache is the directory
+        # this function just tried to set, but jax read the variable at import
+        # and ignores a later assignment -- so printing it claimed a location
+        # that stays empty while the real cache filled up somewhere else.
+        import jax as _jax
+        _actual = _jax.config.jax_compilation_cache_dir or compile_cache
+        print(f'compiled graphs cached in {_actual}', flush=True)
     from bindcraft.preflight import CampaignPreflightError
     try:
         status = launch_campaign(settings_path, assignments, metadata_path=metadata_path)
