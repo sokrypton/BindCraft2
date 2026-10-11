@@ -52,6 +52,22 @@
 #
 # They also do not add: 0.8 s and 0.7 s separately, 0.9 s together.
 #
+# THE NEW DEFAULTS ARE CAMPAIGN-VERIFIED.  Flipping them on without a
+# campaign would have broken the rule every other default flip in this work
+# followed, so: hPDL1, N=179, embedder and barrier both on, both hooks
+# confirmed FIRED in the trace --
+#
+#   screen  i_pTM 0.53  pLDDT 0.84
+#   refine        0.79        0.91
+#   anneal        0.77        0.93
+#   harden        0.75        0.92
+#   mutate        0.78        0.91
+#
+# All five design stages passed, where the first JAX baseline on this target
+# was rejected at mutate.  That is not evidence the new defaults are BETTER --
+# two identical campaigns here disagreed by more than this -- only that they
+# are healthy end to end.
+#
 # The flags stay available because the trade REVERSES for a one-shot run or a
 # cold machine, where the compile is most of the cost -- a Colab notebook, a
 # single short job.  It is the campaign that cannot afford them.
