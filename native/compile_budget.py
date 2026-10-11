@@ -73,6 +73,27 @@
 # There is no large single cause left in the template path.  Anyone looking
 # for one should know these three numbers before starting.
 #
+# AND OUTSIDE THE TEMPLATE PATH, the 4.0 s that remains with templates off:
+#
+#   the confidence metrics (pTM, ipTM, PAE)   2.0 s   <- the largest item left
+#   the embedder's four Linears + relpos      0.8 s   (BC2_NATIVE_EMBED)
+#   the Kabsch alignment onto the template     0.2 s
+#   the recycle terms                          0.2 s
+#   the rest                                  ~0.8 s
+#
+# The metrics being 2.0 s looks at first like duplicated work: pTM and ipTM
+# differ ONLY in their pair mask, so the softmax over [N, N, 64] and the TM
+# term summed over bins are computed twice, and the PAE takes that same
+# softmax a third time -- all per state, with two states a step.  Fusing them
+# into one softmax and one TM term is EXACTLY equal (pTM, ipTM and
+# ipTM_per_residue bit-identical on a real two-chain mask, where ipTM is
+# nonzero rather than trivially masked to zero) and saves NOTHING: 8.0 s
+# against 8.1 s.  XLA's CSE already had it.
+#
+# So the 2.0 s is the arithmetic itself, not a redundancy, and it cannot be
+# removed without computing something different.  Written, proven equal,
+# measured, reverted.
+#
 # The hoist was implemented, proven exact, measured at 0.4 s and then REMOVED,
 # because the part that remained -- computing the constant outside the graph
 # and threading it through af2.py's compiled path -- is real surgery on a hot
