@@ -23,6 +23,23 @@
 # RUNTIME has to go at the trunk, which is already native and already the
 # subject of the kernel work.  Optimising one axis here does not move the
 # other, and a change justified on one should not be sold on the other.
+#
+# VALIDATION IS 1.74% OF A TRAJECTORY and is not worth optimising.  A
+# model_1_ptm predict at N=179 is 315 ms; a 500-step trajectory spends 355 s
+# designing and 6.3 s validating its ten candidates across two models.
+#
+# That matters because there IS a gap in those 6.3 s: predict() fires the
+# native post-trunk hook for model_1_multimer_v3 (traces=1) and NOT for
+# model_1_ptm (traces=0), although both are installed, both run through
+# modules_multimer -- model.py builds that graph unconditionally, monomer
+# preset or not -- and their weighted head sets are identical, so the
+# head-set check is not what declines it.  The fallback is safe: the hook
+# returns None and JAX runs the span.
+#
+# So it is a missed optimisation rather than a wrong answer, worth under a
+# tenth of a percent of a trajectory, and it stays missed on purpose.  The
+# cause was not chased past ruling out the obvious one, because the value did
+# not justify the hunt -- which is the thing to know before repeating it.
 import os, sys, time, shutil
 ARM = sys.argv[1]
 cache = f'/tmp/claude-1000/rt_{ARM}'
