@@ -33,6 +33,26 @@ os.environ.setdefault('JAX_COMPILATION_CACHE_DIR', _default_cache)
 os.environ.setdefault('JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES', 'none')
 if 'triton_gemm' not in os.environ.get('XLA_FLAGS', ''):
     append_xla_flags('--xla_gpu_enable_triton_gemm=false')
+# TWO IDENTICAL RUNS HAVE TO AGREE.  XLA benchmarks several kernels for each
+# fusion while it compiles and keeps the fastest; which one wins depends on
+# what else the card was doing at the time, so a SECOND PROCESS picks
+# differently and every number downstream moves.  Measured on
+# model_1_multimer_v3, two chains of 64, same states, same key, dropout off:
+# predicted coordinates 1.4 A apart, pLDDT differing in the third decimal,
+# and a design GRADIENT at cos 0.963 -- 48 blocks of backward amplify it.
+# That is the "1 in 6 design steps lands elsewhere" effect, and it is not
+# one in six.
+#
+# Turning the autotuner off makes two processes bit-identical on every
+# field, and it is not a trade: a design step measured 1099 ms against
+# 1090 at 192 residues (+0.8%), 127.1 ms against 126.8 at 64, and COMPILE
+# is 2.2 s faster.  On this model and these cards it finds nothing better
+# than the default kernel and charges compile time to look.
+#
+# BC2_AUTOTUNE=1 puts it back.
+if os.environ.get('BC2_AUTOTUNE', '') != '1' and \
+        'autotune_level' not in os.environ.get('XLA_FLAGS', ''):
+    append_xla_flags('--xla_gpu_autotune_level=0')
 if os.environ.get('BC2_XLA_EXTRA', '').strip():
     append_xla_flags(os.environ['BC2_XLA_EXTRA'].strip())
 
