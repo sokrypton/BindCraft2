@@ -17,6 +17,7 @@ build still runs stock.
 """
 
 import os
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -86,7 +87,7 @@ def _refuse_if_stale(lib: str) -> None:
         f'    -gencode arch=compute_86,code=sm_86 \\\n'
         f'    -gencode arch=compute_90,code=sm_90 \\\n'
         f'    --compiler-options -fPIC -shared -I. \\\n'
-        f"    -I$(python -c 'import jax.ffi;print(jax.ffi.include_dir())') \\\n"
+        f"    -I$({sys.executable} -c 'import jax.ffi;print(jax.ffi.include_dir())') \\\n"
         f'    ffi.cu -lcublas -lcublasLt -o {os.path.basename(lib)}\n'
         f'BC2_NATIVE_LIB_STALE_OK=1 runs it anyway.')
 
