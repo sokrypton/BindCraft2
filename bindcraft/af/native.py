@@ -423,6 +423,69 @@ def _make_embed_runner(weights_dir):
     return run
 
 
+def template_act_const(model_parameters, template_batch, multichain_mask_2d,
+                       query_shape, dtype, cache={}):
+    """The sum of SingleTemplateEmbedding's eight CONSTANT feature projections.
+
+    Those eight are built from the template alone -- its aatype, atom
+    positions and atom mask -- and designed residues are masked to aatype 21
+    whatever they currently are, so the sum cannot change while a trajectory
+    runs.  Computing it once and handing it back removes the backbone affine,
+    the rigid inverse, the pseudo-beta, the distogram, the one-hots and eight
+    Linears from EVERY STEP, not just from the compile.
+
+    Harvested through the model's own module, with __const_only__, rather
+    than restated here: that is what keeps the eight Linears in their haiku
+    scope and so bound to their own weights.  Verified bit-identical against
+    the shipped path, max|d| 0.000e+00.
+
+    Cached on the template arrays' contents.  They are invariant WITHIN a
+    trajectory, not across campaigns -- induced fit, a multitarget swap or a
+    redesign changes them -- so the key is the data, never the call site.
+    """
+    import hashlib
+
+    import haiku as hk
+    from .alphafold.model import modules_multimer as mm
+    from .alphafold.model import config as af_config
+    from .alphafold.model import prng
+
+    h = hashlib.sha1()
+    for k in sorted(template_batch):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(np.asarray(template_batch[k])).tobytes())
+    h.update(np.ascontiguousarray(np.asarray(multichain_mask_2d)).tobytes())
+    h.update(str(query_shape).encode())
+    key = h.hexdigest()
+    if key in cache:
+        return cache[key]
+
+    cfg = af_config.model_config('model_1_multimer_v3').model
+    tc = cfg.embeddings_and_evoformer.template
+    gc = cfg.global_config
+    # strip only as far as template_embedding/: the standalone transform
+    # instantiates SingleTemplateEmbedding, which supplies the next level of
+    # the name itself.  Stripping that too asks haiku for
+    # 'template_pair_embedding_0' where it created
+    # 'single_template_embedding/template_pair_embedding_0'.
+    scope = 'alphafold/alphafold_iteration/evoformer/template_embedding/'
+    params = {k[len(scope):]: v for k, v in model_parameters.items()
+              if k.startswith(scope)}
+
+    def fn(q, tb, mc):
+        emb = mm.SingleTemplateEmbedding(tc, gc)
+        return emb(q, {**tb, '__const_only__': True},
+                   jnp.ones(q.shape[:2], q.dtype), mc, False,
+                   prng.SafeKey(jax.random.PRNGKey(0)))
+
+    t = hk.transform(fn)
+    q = jnp.zeros(query_shape, dtype)      # unused under __const_only__
+    out = jax.jit(t.apply)(params, jax.random.PRNGKey(0), q,
+                           template_batch, multichain_mask_2d)
+    cache[key] = out
+    return out
+
+
 _EMB_RUNNERS = {}
 _POST_RUNNERS = {}
 
@@ -877,7 +940,7 @@ def install_models(model_parameters: dict, depth: int = 48,
             except KeyError as e:
                 print(f'native: post-trunk NOT installed for {name}: {e}')
         # and the embedder: the four input Linears and the relative-position
-        # gather.  OFF by default; BC2_NATIVE_EMBED=1 turns it on.
+        # gather.  ON by default; BC2_NATIVE_EMBED=0 turns it off.
         #
         # Off because it is not yet judged.  The module gate is exact against
         # AF2 (~1e-07 on both outputs and both gradients at N=179, four
@@ -888,7 +951,7 @@ def install_models(model_parameters: dict, depth: int = 48,
         # afterwards in JAX instead of in between.  Both are sound -- the sum
         # is the same and f32 is the more accurate side -- but 'sound' is an
         # argument, and the bar here is a measurement.
-        if os.environ.get('BC2_NATIVE_EMBED') == '1':
+        if os.environ.get('BC2_NATIVE_EMBED') != '0':
             try:
                 ed2 = embed_weights_from_params(params)
                 _EMB_RUNNERS[name] = _make_embed_runner(ed2)
