@@ -52,7 +52,7 @@ struct TplEmbed {
   float *act = nullptr, *emb = nullptr, *pre = nullptr;
   float *dact = nullptr, *dqn = nullptr;
   __nv_bfloat16 *actb = nullptr, *dactb = nullptr;
-  const float* queryIn = nullptr;           // borrowed for the backward's LN
+  float* outScratch = nullptr;              // the replay's discarded output
 
   size_t pairElems() const { return (size_t)N * N * CT; }
   size_t queryElems() const { return (size_t)N * N * CQ; }
@@ -71,6 +71,7 @@ struct TplEmbed {
     CU(cudaMalloc(&rs, (size_t)N * N * 4));
     CU(cudaMalloc(&mu2, (size_t)N * N * 4));
     CU(cudaMalloc(&rs2, (size_t)N * N * 4));
+    CU(cudaMalloc(&outScratch, queryElems() * 4));
   }
 
   void setStream(cudaStream_t s) { st = s; CUB(cublasSetStream(cub, s));
@@ -122,7 +123,6 @@ struct TplEmbed {
     const size_t nq = queryElems(), np = pairElems();
     const int gq = (int)((nq + 255) / 256), gp = (int)((np + 255) / 256);
     const int rows = (int)((size_t)N * N);
-    queryIn = query;
     foldit::lnFwdK<CQ><<<(rows + 7) / 8, 256, 0, st>>>(query, lnS, lnO, qn, mu,
                                                        rs, rows);
     gemm(rows, CT, CQ, qn, w8, act);
@@ -144,11 +144,21 @@ struct TplEmbed {
 
   // cotangent on the embedding -> the query.  act_const is a constant, so no
   // gradient flows back to it, which is the whole point of hoisting it.
-  void backward(const float* dout, const float* pair_mask,
-                const __nv_bfloat16* save, float* dquery) {
+  // THE BACKWARD REPLAYS THE FORWARD FIRST, and that is not an optimisation
+  // to be removed.  Everything below reads emb, pre, mu2, rs2, mu, rs -- all
+  // of it member state.  A gate runs one forward and then its backward, so
+  // the state is still the right one and it measures green.  A DESIGN STEP
+  // DOES NOT: it runs forwards for every state and every recycle before any
+  // backward, so by the time a backward runs, another forward has overwritten
+  // all of it.  Replaying from (query, act_const) makes the op stateless and
+  // is what the pair stack already does with its own save set.
+  void backward(const float* dout, const float* query, const float* act_const,
+                const float* pair_mask, const __nv_bfloat16* save,
+                float* dquery) {
     const size_t nq = queryElems(), np = pairElems();
     const int gp = (int)((np + 255) / 256);
     const int rows = (int)((size_t)N * N);
+    forward(query, act_const, pair_mask, outScratch, const_cast<__nv_bfloat16*>(save));
     gemmNT(rows, CT, CQ, dout, wo, dact);
     foldit::reluBwdK<<<gp, 256, 0, st>>>(dact, emb, np);
     foldit::lnBwdK<CT><<<(rows + 7) / 8, 256, 0, st>>>(dact, pre, oS, mu2, rs2,
@@ -157,7 +167,7 @@ struct TplEmbed {
     stack.backward(dactb, pair_mask, save);
     bf16OutK<<<gp, 256, 0, st>>>(dact, stack.dpair(), np);
     gemmNT(rows, CQ, CT, dact, w8, dqn);
-    foldit::lnBwdK<CQ><<<(rows + 7) / 8, 256, 0, st>>>(dqn, queryIn, lnS, mu,
+    foldit::lnBwdK<CQ><<<(rows + 7) / 8, 256, 0, st>>>(dqn, query, lnS, mu,
                                                        rs, dquery, rows);
     (void)nq;
   }
