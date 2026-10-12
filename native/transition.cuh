@@ -353,16 +353,40 @@ struct Trans {
   // `factor` is the transition's intermediate multiple.  The Evoformer's is
   // 4; the TEMPLATE pair stack's is 2 (num_intermediate_factor in the
   // config), which is why it cannot be assumed.
+  // TR_ROWS: how many pair elements a chunk.  The transition is ELEMENTWISE
+  // over M, so a chunk is a contiguous run and splitting it is exact.  xn and
+  // dy/dr/dxn live inside one phase and become chunk-sized with no replay;
+  // `h` crosses into the backward (maskDxK reads it unless KEEP_RELU supplied
+  // the sign bits) and `out` is the module's output, so both stay whole.
+  static size_t trChunk(size_t m) {
+    const char* e = getenv("TR_ROWS");
+    const size_t r = e ? (size_t)atoll(e) : 0;
+    return (r > 0 && r < m) ? r : m;
+  }
+
+  size_t trRows = 0;   // pair elements a chunk; M when unchunked
+  __nv_bfloat16* hAt(size_t t0) { return h + t0 * I; }   // h is whole
+
   void alloc(int M_, int C_, cudaStream_t s = nullptr, int factor = 4) {
     M = M_; C = C_; I = factor * C; st = s;
     lt.init();
     size_t mc = (size_t)M * C, mi = (size_t)M * I;
-    CU(cudaMalloc(&xn, mc * 2));
+    trRows = trChunk((size_t)M);
+    const size_t cc = trRows * C, ci = trRows * I;
+    CU(cudaMalloc(&xn, cc * 2));
+    // h STAYS WHOLE.  Making it chunk-sized and having the backward read the
+    // relu sign from hbit instead (maskDxK<128,true>, the KEEP_RELU path)
+    // looks right and corrupts memory: keepSlots() declares h at mi*2 and the
+    // stack's tier machinery swaps that pointer, so a chunk-sized h is a
+    // buffer two parties disagree about the length of.  The symptom was an
+    // illegal access surfacing in trimul_body and opm -- somewhere else
+    // entirely, asynchronously.  Freeing it needs the keep-slot contract
+    // changed too, which is a bigger change than it is worth here.
     CU(cudaMalloc(&h, mi * 2));
     CU(cudaMalloc(&out, mc * 2));
-    CU(cudaMalloc(&dy, mc * 2));
-    CU(cudaMalloc(&dr, mi * 2));
-    CU(cudaMalloc(&dxn, mc * 2));
+    CU(cudaMalloc(&dy, cc * 2));
+    CU(cudaMalloc(&dr, ci * 2));
+    CU(cudaMalloc(&dxn, cc * 2));
     if (is_pair) CU(cudaMalloc(&hbit, mi / 8));
     CU(cudaMalloc(&mu, (size_t)M * 4));
     CU(cudaMalloc(&rstd, (size_t)M * 4));
@@ -414,19 +438,27 @@ struct Trans {
   // packing the mask in both costs +14 ms against 15 saved, which is the
   // measurement that kept this idea unbuilt until the gating existed.
   void forward(const __nv_bfloat16* x, bool tail = true, bool want_mask = false) {
-    size_t mi = (size_t)M * I;
-    TRANS_LN(lnFwdK, C, M, st, x, ln_scale, ln_offset, xn, mu, rstd, M);
-    // bias and relu ride in the first GEMM's epilogue
-    PROF_STEP("tr.f gemm1+relu",
-      lt.matmul(M, I, C, xn, w1t, h, CUDA_R_16BF, CUBLASLT_EPILOGUE_RELU_BIAS, b1,
-              nullptr, st));
-    if (want_mask && hbit)
-      PROF_STEP("tr.f packMask",
-        packReluMaskK<<<(mi + 255) / 256, 256, 0, st>>>(h, hbit, mi));
-    if (!tail) return;
-    PROF_STEP("tr.f gemm2",
-      lt.matmul(M, C, I, h, w2t, out, CUDA_R_16BF, CUBLASLT_EPILOGUE_BIAS, b2,
-              nullptr, st));
+    // ELEMENTWISE OVER M, so the whole body runs a chunk at a time.  xn is
+    // chunk-sized and used at base; h/out/mu/rstd/hbit outlive the chunk and
+    // are offset.  TR_ROWS unset means one chunk of M -- what it did before.
+    for (size_t t0 = 0; t0 < (size_t)M; t0 += trRows) {
+      const size_t tm = ((size_t)M - t0 < trRows) ? (size_t)M - t0 : trRows;
+      const size_t ti = tm * I;
+      TRANS_LN(lnFwdK, C, (int)tm, st, x + t0 * C, ln_scale, ln_offset, xn,
+               mu + t0, rstd + t0, tm);
+      // bias and relu ride in the first GEMM's epilogue
+      PROF_STEP("tr.f gemm1+relu",
+        lt.matmul((int)tm, I, C, xn, w1t, hAt(t0), CUDA_R_16BF,
+                  CUBLASLT_EPILOGUE_RELU_BIAS, b1, nullptr, st));
+      if (want_mask && hbit)
+        PROF_STEP("tr.f packMask",
+          packReluMaskK<<<(ti + 255) / 256, 256, 0, st>>>(hAt(t0),
+              hbit + t0 * I / 8, ti));
+      if (!tail) continue;
+      PROF_STEP("tr.f gemm2",
+        lt.matmul((int)tm, C, I, hAt(t0), w2t, out + t0 * C, CUDA_R_16BF,
+                  CUBLASLT_EPILOGUE_BIAS, b2, nullptr, st));
+    }
   }
 
   // `dout` is the cotangent on the DELTA; `dx` gets the input's, likewise
@@ -439,16 +471,23 @@ struct Trans {
   void backward(const DT* dout, const __nv_bfloat16* x, DT* dx,
                 bool acc = false, bool use_bits = false) {
     size_t mc = (size_t)M * C, mi = (size_t)M * I;
+    // SAME CHUNKS AS THE FORWARD.  dy/dr/dxn are chunk-sized and used at
+    // base; h, hbit, mu, rstd and the caller's dout/x/dx are whole and
+    // offset.  dr is 206 MB at N=448 and is one of the two allocations that
+    // ran out at 637 residues.
+    for (size_t t0 = 0; t0 < (size_t)M; t0 += trRows) {
+      const size_t tm = ((size_t)M - t0 < trRows) ? (size_t)M - t0 : trRows;
+      const size_t tc = tm * C, ti = tm * I;
     // a bf16 cotangent IS the GEMM's operand; an f32 one has to be narrowed
     const __nv_bfloat16* dyin;
     if constexpr (std::is_same<DT, __nv_bfloat16>::value) {
-      dyin = dout;
+      dyin = dout + t0 * C;
     } else {
-      f32ToBf16K<<<(mc + 255) / 256, 256, 0, st>>>(dout, dy, mc);
+      f32ToBf16K<<<(tc + 255) / 256, 256, 0, st>>>(dout + t0 * C, dy, tc);
       dyin = dy;
     }
     PROF_STEP("tr.b gemm dr",
-      lt.matmul(M, I, C, dyin, w2, dr, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
+      lt.matmul((int)tm, I, C, dyin, w2, dr, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
               nullptr, nullptr, st));
     // TR_SPLIT runs the mask and the contraction as two passes, which is the
     // A/B this was decided on.  The fused kernel only exists for C = 128 (the
@@ -467,18 +506,20 @@ struct Trans {
       }
       PROF_STEP("tr.b maskDx",
         if (use_bits)
-          maskDxK<128, true><<<(M + BMD - 1) / BMD, 32 * WD, maskDxSmem(), st>>>(
-              dr, h, hbit, w1t, dxn, M, I);
+          maskDxK<128, true><<<(tm + BMD - 1) / BMD, 32 * WD, maskDxSmem(), st>>>(
+              dr, hAt(t0), hbit + t0 * I / 8, w1t, dxn, tm, I);
         else
-          maskDxK<128, false><<<(M + BMD - 1) / BMD, 32 * WD, maskDxSmem(), st>>>(
-              dr, h, hbit, w1t, dxn, M, I);
+          maskDxK<128, false><<<(tm + BMD - 1) / BMD, 32 * WD, maskDxSmem(), st>>>(
+              dr, h + t0 * I, hbit + t0 * I / 8, w1t, dxn, tm, I);
         CU(cudaGetLastError()));
     } else {
-      maskByReluK<<<(mi + 255) / 256, 256, 0, st>>>(dr, h, mi);
-      lt.matmul(M, C, I, dr, w1, dxn, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
+      maskByReluK<<<(ti + 255) / 256, 256, 0, st>>>(dr, hAt(t0), ti);
+      lt.matmul((int)tm, C, I, dr, w1, dxn, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
                 nullptr, nullptr, st);
     }
-    TRANS_LN_ACC(lnBwdK, C, acc, DT, M, st, dxn, x, ln_scale, mu, rstd, dx, M);
+    TRANS_LN_ACC(lnBwdK, C, acc, DT, (int)tm, st, dxn, x + t0 * C, ln_scale,
+                 mu + t0, rstd + t0, dx + t0 * C, tm);
+    }
   }
 };
 
