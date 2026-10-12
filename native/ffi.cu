@@ -565,23 +565,17 @@ ffi::Error SmBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> single,
   CU(cudaMemsetAsync(drot, 0, (size_t)N * 9 * 4, stream));
   CU(cudaMemsetAsync(dtrans, 0, (size_t)N * 3 * 4, stream));
 
-  // structmod::backward WRITES dpair rather than accumulating, so the heads'
-  // share -- already sitting in the output buffer -- is staged aside and
-  // added back afterwards.  Same for dsingle and the expres head's share.
-  static float* dpz = nullptr;
-  static size_t dpz_n = 0;
-  size_t npz = (size_t)N * N * structmod::CZ;
-  if (dpz_n < npz) {
-    if (dpz) CU(cudaFree(dpz));
-    CU(cudaMalloc(&dpz, npz * 4)); dpz_n = npz;
-  }
-  CU(cudaMemcpyAsync(dpz, dpair->typed_data(), npz * 4,
-                     cudaMemcpyDeviceToDevice, stream));
+  // THE HEADS' SHARE OF dpair STAYS WHERE IT IS.  structmod::backward used to
+  // OVERWRITE dpair, so this staged the whole thing aside in f32 and added it
+  // back -- a 139 MB buffer at N=522 plus a 139 MB copy and a 139 MB
+  // read-modify-write, for an answer that is just a sum.  `acc_pair` makes
+  // its final LayerNorm backward accumulate instead, which is the same two
+  // lines the trimul and transition backwards already use for exactly this.
+  // dsingle keeps its staging: it is N*C, not N*N*C, and not worth a second
+  // flag.
   m->sm.backward(dact, drot, dtrans, single.typed_data(),
                  dsingle->typed_data(), dpair->typed_data(),
-                 datom.typed_data(), aatype.typed_data());
-  addPlainK<<<(int)((npz + 255) / 256), 256, 0, stream>>>(
-      dpair->typed_data(), dpz, npz);
+                 datom.typed_data(), aatype.typed_data(), /*acc_pair*/true);
   addPlainK<<<(int)((nc + 255) / 256), 256, 0, stream>>>(
       dsingle->typed_data(), dse, nc);
   return ffi::Error::Success();
