@@ -676,7 +676,12 @@ struct TriAttn {
     size_t mc = (size_t)M * C, mt = (size_t)M * TOT;
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
     B(&x, mc); B(&ag, mc); B(&out, mc);
-    B(&dcomb, mt); B(&dag, mc); B(&dx, mc);
+    B(&dcomb, mt); B(&dx, mc);
+    // dag is chunk-sized: the output GEMM writes it and dGateK reads it, both
+    // inside one row chunk.  dKf/dVf/dcomb cannot follow -- scatterDxK and
+    // nbbScatterK consume them only once dnbb is complete, and dnbb sums over
+    // EVERY row -- so they stay full.
+    B(&dag, (size_t)taChunkRows(N_) * N_ * C);
     // TA_ROWS: the module's scratch is sized by a ROW CHUNK, not by N.
     // Triangle attention is independent per row, so rows [r0, r0+rows) can be
     // run on their own; `xh` and `outH` are written and read inside the
@@ -691,7 +696,8 @@ struct TriAttn {
     CU(cudaMalloc(&outH, mcChunk * sizeof(half)));
     CU(cudaMalloc(&avH, mc * sizeof(half)));
     CU(cudaMalloc(&lseF, (size_t)N * H * N * sizeof(float)));
-    CU(cudaMalloc(&davH, mc * sizeof(half)));
+    // davH likewise: dGateK writes it, the flash backward reads it, one chunk.
+    CU(cudaMalloc(&davH, (size_t)taChunkRows(N_) * N_ * C * sizeof(half)));
     // dQf IS DEAD AND WAS STILL ALLOCATED.  flashBwdK writes dQ through the
     // LAST of its three destinations -- `if (dQb) ... else if (dcomb) ... else
     // dQ[...]` -- and every call here passes dcomb as dQb, so the `dQ`
@@ -984,11 +990,8 @@ struct TriAttn {
     }
     size_t mc = (size_t)M * C;
     LF_STREAM = st;
-    PROF_STEP("ta.b gemm dag",
-      lt.matmul(M, C, C, dxin, wo, dag, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT, nullptr,
-              nullptr, st));
-    PROF_STEP("ta.b gate",
-      dGateK<<<M, C, 0, st>>>(dag, avH, qkvgH, davH, dcomb, lseD, N, M));
+    // (the output GEMM runs inside the row-chunk loop below)
+    // (dGateK runs inside the row-chunk loop below)
     // cudaMemsetAsync, and NOT the vectorised kernel beside it.  These three
     // are 6.54 GB of zeroing over a fwd+bwd and PROBE_NOZERO prices them at
     // 26.3 ms.  A float4 zeroing kernel (TA_ZEROK=1, zeroFast in common.cuh)
@@ -1046,6 +1049,16 @@ struct TriAttn {
       // of this kernel's memory traffic (268 MB of 470) because BM=64 splits
       // each (b,h) into four query tiles that all accumulate into the same
       // keys.
+      // THE TWO PROBES BELOW STILL LAUNCH THE WHOLE ROW GRID, and davH is
+      // chunk-sized now, so they would read past it.  They produce a wrong
+      // gradient by design and exist only to price the atomics; refuse the
+      // combination rather than let it read out of bounds.
+      if (taRows < N && (envOn("NO_DKV") || envOn("NO_DNBB"))) {
+        fprintf(stderr, "triattn: NO_DKV/NO_DNBB price the atomics on the "
+                        "whole row grid and cannot run with TA_ROWS; unset "
+                        "one of them.\n");
+        abort();
+      }
       if (envOn("NO_DKV")) {
         PROF_STEP("ta.b flashBwd",
           TA_FB::flashBwdK<false, false, false, true><<<g, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
@@ -1057,10 +1070,33 @@ struct TriAttn {
             qkvgH, 4 * C, biasH, davH, lseF, lseD, mask, nullptr, dQf, dKf, dVf, N, H,
             nullptr, nullptr, nullptr, 0, dcomb, TOT));
       } else
-      PROF_STEP("ta.b flashBwd",
-        TA_FB::flashBwdK<true, true, false, true><<<g, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
-          qkvgH, 4 * C, biasH, davH, lseF, lseD, mask, nullptr, dQf, dKf, dVf, N, H,
-          dnbbF, dnbbI, nullptr, 0, dcomb, TOT));
+      // ONE ROW CHUNK AT A TIME.  dag and davH are chunk-sized, so the GEMM
+      // that fills dag, the gate that turns it into davH, and the flash that
+      // reads davH all run together on the same rows.  The kernel takes the
+      // row from blockIdx.z and indexes qkvg/mask/lse/dK/dV/dcomb by it, so
+      // the pointers are offset and gridDim.z is the chunk; `bias` is
+      // [H][N][N] and shared across rows, and dnbb ACCUMULATES over rows, so
+      // both are left whole.  dnbb's int64 fixed point (9c986ad) is what makes
+      // that accumulation independent of the order the chunks arrive in.
+      for (int cr0 = 0; cr0 < N; cr0 += taRows) {
+        const int crows = (N - cr0 < taRows) ? (N - cr0) : taRows;
+        const size_t Mc = (size_t)crows * N;
+        PROF_STEP("ta.b gemm dag",
+          lt.matmul((int)Mc, C, C, dxin + (size_t)cr0 * N * C, wo, dag, CUDA_R_16BF,
+                    CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
+        PROF_STEP("ta.b gate",
+          dGateK<<<Mc, C, 0, st>>>(dag, avH + (size_t)cr0 * N * C,
+            qkvgH + (size_t)cr0 * N * QKVG, davH, dcomb + (size_t)cr0 * N * TOT,
+            lseD + (size_t)cr0 * H * N, N, Mc));
+        dim3 gc((N + TA_FB::BM - 1) / TA_FB::BM, H, crows);
+        PROF_STEP("ta.b flashBwd",
+          TA_FB::flashBwdK<true, true, false, true><<<gc, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
+            qkvgH + (size_t)cr0 * N * QKVG, 4 * C, biasH, davH,
+            lseF + (size_t)cr0 * H * N, lseD + (size_t)cr0 * H * N,
+            mask + (size_t)cr0 * N, nullptr, dQf, dKf + (size_t)cr0 * N * C,
+            dVf + (size_t)cr0 * N * C, N, H,
+            dnbbF, dnbbI, nullptr, 0, dcomb + (size_t)cr0 * N * TOT, TOT));
+      }
     // fixed point -> float, once, in a kernel nothing else races with
     if (dnbbI)
       TA_FB::nbbFromFixedK<<<(int)(((size_t)H * M + 255) / 256), 256, 0, st>>>(
