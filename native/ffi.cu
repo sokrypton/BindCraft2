@@ -719,13 +719,22 @@ ffi::Error EmbBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> dmsa,
 // hoisted out by the caller, this is everything the template path still costs
 // XLA.
 // ---------------------------------------------------------------------------
+// OFF THE STREAM KEY, for the same reason as SKey above and with far less
+// work: the whole template tree already had setStream (TplEmbed -> TplStack
+// -> TplBlock), so only the key and the rebind below were missing.
+//
+// THIS IS THE TEMPLATE STACK THAT ACTUALLY RUNS.  `tpl_get` builds a
+// standalone one, and in the normal path it never executes -- the template
+// EMBEDDING "supersedes the stack runner WITHOUT disabling it: this one
+// returns before SingleTemplateEmbedding runs", in native.py's own words.
+// So native_tplstack_prealloc was preallocating an object nobody calls,
+// which is exactly how it behaved: it cost memory and bought nothing.  The
+// embedder owns the stack that runs, and it is the one worth preallocating.
 struct TEKey {
   int N, depth;
   std::string dir;
-  cudaStream_t stream;
   bool operator<(const TEKey& o) const {
-    return std::tie(N, depth, dir, stream) <
-           std::tie(o.N, o.depth, o.dir, o.stream);
+    return std::tie(N, depth, dir) < std::tie(o.N, o.depth, o.dir);
   }
 };
 std::map<TEKey, tplembed::TplEmbed*> g_te;
@@ -733,9 +742,9 @@ std::map<TEKey, tplembed::TplEmbed*> g_te;
 tplembed::TplEmbed* te_get(int N, int depth, const std::string& dir,
                            cudaStream_t stream) {
   std::lock_guard<std::mutex> lk(g_mu);
-  TEKey k{N, depth, dir, stream};
+  TEKey k{N, depth, dir};
   auto it = g_te.find(k);
-  if (it != g_te.end()) return it->second;
+  if (it != g_te.end()) { it->second->setStream(stream); return it->second; }
   Oracle*& w = g_weights[dir];
   if (!w) w = new Oracle(dir);
   auto* m = new tplembed::TplEmbed();
@@ -902,8 +911,24 @@ extern "C" int native_sm_prealloc(int N, int depth, const char* weights_dir) {
   return 0;
 }
 
-// `emb_get` and `te_get` are still keyed on the stream and are still not
-// preallocated: they are small, and neither has ever been a failure site.
+// THE TEMPLATE EMBEDDER, which owns the template stack that actually runs
+// and is where 617 dies once everything else has been made smaller.
+extern "C" int native_tplembed_prealloc(int N, int depth,
+                                        const char* weights_dir) {
+  size_t fb0 = 0, tb = 0;
+  if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
+  te_get(N, depth, std::string(weights_dir), /*stream*/nullptr);
+  size_t fb1 = 0;
+  cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr,
+          "native: prealloc tplembed N=%d depth=%d took %.2f GB "
+          "(%.2f of %.2f GB free after)\n",
+          N, depth, (fb0 - fb1) / 1e9, fb1 / 1e9, tb / 1e9);
+  return 0;
+}
+
+// `emb_get` is still keyed on the stream and is still not preallocated: it
+// is small, and it has never been a failure site.
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     NativeEvoformerFwd, FwdImpl,

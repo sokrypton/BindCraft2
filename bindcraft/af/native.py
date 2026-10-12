@@ -950,6 +950,7 @@ def _make_tplembed_runner(weights_dir, depth=2, dropout=False):
     CQ, CT = 128, 64
 
     def raw(q, ac, pm, seed):
+        _prealloc_tplembed(q.shape[0], depth, weights_dir)   # TRACE TIME
         n = q.shape[0]
         return jax.ffi.ffi_call(
             'native_tplembed_fwd',
@@ -1223,6 +1224,25 @@ def _prealloc_sm(n, depth, weights_dir):
     """
     _prealloc_simple('native_sm_prealloc', 'NB_PREALLOC_SM',
                      (int(n), int(depth), weights_dir), 'structure module')
+
+
+def _prealloc_tplembed(n, depth, weights_dir):
+    """Build the template EMBEDDER at trace time.
+
+    THIS IS THE TEMPLATE STACK THAT ACTUALLY RUNS.  `_prealloc_tplstack`
+    above goes through `tpl_get`, a standalone stack that the normal path
+    never executes -- the embedding runner returns before
+    SingleTemplateEmbedding runs, so the stack runner below it cannot fire.
+    Preallocating that one was allocating an object nobody calls, which is
+    why it cost memory and bought nothing; the hypothesis it was meant to
+    test was never actually tested.  The embedder owns the stack that runs.
+
+    `te_get` had to come off the CUDA-stream key for this, like `sm_get`
+    before it, and that was cheap: TplEmbed -> TplStack -> TplBlock already
+    had setStream the whole way down.
+    """
+    _prealloc_simple('native_tplembed_prealloc', 'NB_PREALLOC_TPE',
+                     (int(n), int(depth), weights_dir), 'template embedder')
 
 
 def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
