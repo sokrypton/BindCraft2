@@ -182,6 +182,20 @@ struct Stack {
     size_t freeb = 0, totalb = 0;
     CU(cudaMemGetInfo(&freeb, &totalb));
     size_t margin = np * 4 * depth / 2 + totalb / 8;
+    // A SHALLOW STACK RUNS FIRST AND MUST LEAVE ROOM FOR THE REST OF THE STEP.
+    // The 4-block extra-MSA stack allocates before the 48-deep trunk, the
+    // structure module and the heads, and none of those are in `freeb` yet --
+    // so its own margin (np*4*4/2, 303 MB at N=544) let it grant itself a
+    // depth-set the rest of the step then could not have.  Measured at 537
+    // residues: the shallow stack took 3.66 GB of tiers and the structure
+    // module died in foldit/ipa with 1.7 GB free; with the grant suppressed
+    // the same length RUNS, at 2036 ms against the 5919 the JAX fallback
+    // costs.  Reserve the trunk's save-set, which is what follows it.
+    //
+    // The REGRANT is why this is not simply giving the memory up: it runs on
+    // the first save forward, once everything else has allocated and XLA has
+    // stopped growing, and hands the tiers back what is genuinely spare.
+    if (depth <= 8) margin += np * 2 * 48;
     size_t budget = freeb > margin ? freeb - margin : 0;
     // KEEP_BUDGET_MB FORCES the budget, so the partial-grant path can be
     // GATED rather than hoped for.  Everything below only fires under memory
