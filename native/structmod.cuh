@@ -75,6 +75,17 @@ struct StructureModule {
     CU(cudaMalloc(&dtrans0, (size_t)N * 3 * 4));
   }
 
+  // REBIND THE STREAM.  Every buffer in here comes from plain cudaMalloc,
+  // which is not stream-ordered, and the stream is used for nothing but
+  // kernel launches and cublasSetStream.  So a module allocated on one
+  // stream runs correctly on another once this has been called -- which is
+  // what lets the module be BUILT AT TRACE TIME, before XLA's stream exists.
+  // See the prealloc note in ffi.cu.
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+    stack.setStream(s);
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     // the iterations live under fold_iteration/ when the dump carries the
     // whole module; see the same probe in foldstack.cu

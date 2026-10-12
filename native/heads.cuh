@@ -117,6 +117,10 @@ struct Heads {
                     Nn, &beta, D, K));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const char* nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];

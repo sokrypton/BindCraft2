@@ -208,6 +208,12 @@ struct FoldIteration {
     for (auto q : {&mu1, &rs1, &mu2, &rs2}) CU(cudaMalloc(q, (size_t)N * 4));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+    attn.setStream(s); rig.setStream(s);
+    if (do_atoms) { sc.setStream(s); at.setStream(s); }
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     attn.setWeights(o, P);
     rig.setWeights(o, P);

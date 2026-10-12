@@ -470,17 +470,26 @@ __global__ void addPlainK(float* __restrict__ dst, const float* __restrict__ src
   if (i < n) dst[i] += src[i];
 }
 
-// KEYED ON THE STREAM.  foldstack owns a tree of cuBLAS handles and has no
-// setStream, so rather than thread a setter through it the object is built on
-// the stream it will run on.  XLA hands these calls one stream, so this is one
-// object in practice; a second stream would simply get its own.
+// NOT KEYED ON THE STREAM any more.  It used to be: foldstack owns a tree of
+// cuBLAS handles and had no setStream, so the object was built on the stream
+// it would run on.  That made the structure module impossible to preallocate,
+// because at TRACE time there is no XLA stream to build it on and a null-
+// stream copy is one the real call never finds.  structmod::setStream now
+// walks the tree and rebinds every handle, so the key is the shape alone and
+// the stream is applied on the way out of sm_get.
+//
+// WHAT THIS GIVES UP: two streams running the SAME shape at the same time
+// used to get an object each and now share one, scratch buffers included.
+// XLA hands these calls one stream and always has, so nothing exercises it
+// today -- but it is a real hazard and not a theoretical one, so if a
+// second stream ever appears, the key needs the stream back and the
+// prealloc needs a different answer (a shape-keyed pool handed out per
+// stream, most likely).
 struct SKey {
   int N, depth;
   std::string dir;
-  cudaStream_t stream;
   bool operator<(const SKey& o) const {
-    return std::tie(N, depth, dir, stream) <
-           std::tie(o.N, o.depth, o.dir, o.stream);
+    return std::tie(N, depth, dir) < std::tie(o.N, o.depth, o.dir);
   }
 };
 struct SmHeads {
@@ -492,9 +501,11 @@ std::map<SKey, SmHeads*> g_sm;
 SmHeads* sm_get(int N, int depth, const std::string& dir,
                 cudaStream_t stream) {
   std::lock_guard<std::mutex> lk(g_mu);
-  SKey k{N, depth, dir, stream};
+  SKey k{N, depth, dir};
   auto it = g_sm.find(k);
-  if (it != g_sm.end()) return it->second;
+  if (it != g_sm.end()) { it->second->sm.setStream(stream);
+                          it->second->hd.setStream(stream);
+                          return it->second; }
   Oracle*& w = g_weights[dir];
   if (!w) w = new Oracle(dir);
   auto* m = new SmHeads();
@@ -822,11 +833,11 @@ extern "C" int native_stack_prealloc(int N, int S, int depth,
   return 0;
 }
 
-// THE TEMPLATE PAIR STACK WAS TRIED HERE AND IS NOT PREALLOCATED.
+// THE OTHER TWO ALLOCATORS, AND WHY THEY COME AS A PAIR.
 //
 // Once the evoformer stacks stopped racing, 617 and 647 started dying in
-// tplblock/tplstack instead, so the obvious next move was to build the
-// template stack at trace time too.  MEASURED, AND IT IS A REGRESSION: it
+// tplblock/tplstack, so the obvious next move was to build the template
+// stack at trace time too.  ON ITS OWN THAT IS A REGRESSION, measured: it
 // takes 2.97 GB at N=608 and 3.58 at N=672 before XLA has allocated, and
 //
 //   617  moved from tplstack to trimul_body -- still out of memory
@@ -835,17 +846,64 @@ extern "C" int native_stack_prealloc(int N, int S, int depth,
 //   577  structmod.cuh:68 -- WAS PASSING
 //   587  ipa.cuh:534      -- WAS PASSING
 //
-// It bought nothing above 587 and cost the two lengths just below it.  The
-// difference from the evoformer stacks is that the template stack is not
-// on the critical path for the big allocation: taking its 3 GB early only
-// moves the squeeze onto the structure module, which allocates last and
-// has no keep tiers to give back.
+// Read the failure sites: taking the template stack early does not lose the
+// memory, it MOVES THE SQUEEZE ONTO THE STRUCTURE MODULE, which allocates
+// last and has no keep tiers to give back.  So the half-measure is worse
+// than nothing and the whole measure is the pair -- which is why the
+// structure module had to come off the stream key first (see SKey above).
 //
-// There is a second reason not to extend this family further: `sm_get`,
-// `emb_get` and `te_get` key their caches on the CUDA STREAM, and at trace
-// time there is no XLA stream to pass.  Preallocating those with a null
-// stream builds a second copy the real call never finds, which is worse
-// than being late.
+// SO THE PAIR WAS MEASURED, AND THE PAIR IS REFUTED TOO: with both on, 577,
+// 587, 600, 608 AND 617 all fail -- worse than either alone, and worse than
+// neither.  The template stack takes its 2.97 GB at the padded bucket before
+// XLA has allocated, the structure module another 1.57-1.71, and ~8 GB is
+// not enough for the rest of the step.
+//
+// The structure module alone is NEUTRAL: 577, 587 and 608 run at the same
+// speed with the IDENTICAL gradient, and 617/632 still die -- the failure
+// only moves, from tplblock to the template stack's own triattn.
+//
+// WHY THERE IS NOTHING LEFT HERE.  At the 640 bucket the step wants 6.99 GB
+// of evoformer stacks (the two share one pair scratch -- see "adopted the
+// other stack's pair scratch" under BLK_MEM), 3.25 for the template stack
+// and 1.71 for the structure module, and XLA wants the remaining twelve.
+// That is a capacity wall on a 23.68 GB card, not a race, and no ordering
+// wins it.  608 is the ceiling until something gets genuinely smaller.
+//
+// Both entry points stay, OFF unless NB_PREALLOC_TPL / NB_PREALLOC_SM asks
+// for them, so the next person re-tests on a bigger card with an env var
+// rather than by rebuilding this reasoning.
+extern "C" int native_tplstack_prealloc(int N, int depth,
+                                        const char* weights_dir) {
+  size_t fb0 = 0, tb = 0;
+  if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
+  tpl_get(N, depth, std::string(weights_dir));
+  size_t fb1 = 0;
+  cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr,
+          "native: prealloc tplstack N=%d depth=%d took %.2f GB "
+          "(%.2f of %.2f GB free after)\n",
+          N, depth, (fb0 - fb1) / 1e9, fb1 / 1e9, tb / 1e9);
+  return 0;
+}
+
+// The null stream here is NOT the stream it will run on: sm_get rebinds the
+// whole handle tree on the way out, every call.  Nothing in the structure
+// module is stream-ordered -- see the note on structmod::setStream.
+extern "C" int native_sm_prealloc(int N, int depth, const char* weights_dir) {
+  size_t fb0 = 0, tb = 0;
+  if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
+  sm_get(N, depth, std::string(weights_dir), /*stream*/nullptr);
+  size_t fb1 = 0;
+  cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr,
+          "native: prealloc structmod N=%d depth=%d took %.2f GB "
+          "(%.2f of %.2f GB free after)\n",
+          N, depth, (fb0 - fb1) / 1e9, fb1 / 1e9, tb / 1e9);
+  return 0;
+}
+
+// `emb_get` and `te_get` are still keyed on the stream and are still not
+// preallocated: they are small, and neither has ever been a failure site.
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     NativeEvoformerFwd, FwdImpl,

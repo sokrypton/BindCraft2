@@ -383,6 +383,7 @@ def _make_post_runner(weights_dir, depth=8):
 
     def raw(single, pair, pair_mask, aatype, seed):
         n = single.shape[0]
+        _prealloc_sm(n, depth, weights_dir)   # TRACE TIME, see _prealloc_sm
         f = jnp.float32
         return jax.ffi.ffi_call(
             'native_post_trunk_fwd',
@@ -867,6 +868,7 @@ def _make_tpl_runner(weights_dir, depth=2, dropout=False):
 
     def raw(act, mask, seed):
         n = act.shape[0]
+        _prealloc_tplstack(n, depth, weights_dir)   # TRACE TIME
         out = jax.ffi.ffi_call(
             'template_pair_stack_fwd',
             (jax.ShapeDtypeStruct(act.shape, jnp.float32),
@@ -1154,6 +1156,73 @@ def _prealloc_stack(n, s_, depth, weights_dir, pair_only, dropout):
                    ctypes.c_int, ctypes.c_int, ctypes.c_int]
     fn(int(n), int(s_), int(depth), str(weights_dir).encode(),
        1 if pair_only else 0, 1, 1 if dropout else 0)
+
+
+
+def _prealloc_simple(sym, env, args, what):
+    """The same trace-time build as _prealloc_stack, for a module whose only
+    key is its shape.  Separately gated, because the claim being tested is
+    the COMBINATION: see the note above _prealloc_tplstack.
+    """
+    if os.environ.get('NB_NO_PREALLOC') or not os.environ.get(env):
+        return      # OPT-IN: both of these are measured and bought nothing
+    key = (sym,) + tuple(args)
+    if key in _PREALLOCED:
+        return
+    _PREALLOCED.add(key)
+    _register()
+    fn = getattr(_LIBH, sym, None)
+    if fn is None:
+        print('native: this libnative_evoformer.so has no %s; the %s will be '
+              'built in call order' % (sym, what), file=sys.stderr)
+        return
+    import ctypes
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int if isinstance(a, int) else ctypes.c_char_p
+                   for a in args]
+    fn(*[a if isinstance(a, int) else str(a).encode() for a in args])
+
+
+def _prealloc_tplstack(n, depth, weights_dir):
+    """Build the template pair stack at trace time -- ONLY WITH THE
+    STRUCTURE MODULE.
+
+    On its own this is a measured regression.  Once the evoformer stacks
+    stopped racing, 617 and 647 began dying in tplblock/tplstack, so taking
+    the template stack early looked obviously right; it takes 2.97 GB at
+    N=608 and it cost 577 and 587, which had been passing, while buying
+    nothing above 587.  Read where it moved the failures to -- structmod,
+    ipa -- and the reason is that it does not lose the memory, it moves the
+    squeeze onto the structure module, which allocates LAST and has no keep
+    tiers to hand back.  So it goes with `_prealloc_sm` or not at all, and
+    MEASURED TOGETHER AND REFUTED TOO: with both on, 577, 587, 600, 608 and
+    617 ALL fail -- worse than either alone.  The template stack preallocates
+    at the padded bucket, 2.97 GB at 608 and 3.25 at 640, and that is simply
+    more than the step can spare.  Off unless NB_PREALLOC_TPL is set.
+    """
+    _prealloc_simple('native_tplstack_prealloc', 'NB_PREALLOC_TPL',
+                     (int(n), int(depth), weights_dir), 'template pair stack')
+
+
+def _prealloc_sm(n, depth, weights_dir):
+    """Build the structure module and the heads at trace time.
+
+    This is the one that needed a C++ change: `sm_get` used to key its cache
+    on the CUDA STREAM, because foldstack owns a tree of cuBLAS handles and
+    had no setter -- and at trace time there is no XLA stream to pass, so a
+    null-stream copy is one the real call never finds.  `structmod::setStream`
+    now walks the tree and rebinds, and the key is the shape alone.
+
+    AND IT BUYS NOTHING, measured: 577, 587 and 608 run with it on, at the
+    same step time and the IDENTICAL gradient (8.61787, 8.83908, 9.13005),
+    and 617/632 still fail -- the failure merely moves from tplblock to the
+    template stack's triattn.  It is off unless NB_PREALLOC_SM is set.  What
+    it leaves behind is the setStream plumbing, which is what any future
+    prealloc of this module needs and which the stream key had made
+    impossible.
+    """
+    _prealloc_simple('native_sm_prealloc', 'NB_PREALLOC_SM',
+                     (int(n), int(depth), weights_dir), 'structure module')
 
 
 def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
