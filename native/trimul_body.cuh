@@ -132,7 +132,7 @@ __global__ void lnBwdK(const __nv_bfloat16* __restrict__ dx,
 // kernel ran at 123 GB/s.  Splitting it costs one extra pass over a 16.8 MB
 // tensor and makes every access coalesced.
 __global__ void centerStatsK(const __nv_bfloat16* __restrict__ t, float* __restrict__ cmu,
-                             float* __restrict__ crstd, int M) {
+                             float* __restrict__ crstd, int M, int Mt) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= (size_t)M) return;
   // TWO PASSES: mean((x-mu)^2), which is what AF2 computes
@@ -154,12 +154,12 @@ __global__ void centerStatsK(const __nv_bfloat16* __restrict__ t, float* __restr
   // still in L2 for the second pass.  Its sequential d/(c+1) buys nothing.
   float s = 0.f;
 #pragma unroll 8
-  for (int c = 0; c < I; ++c) s += __bfloat162float(t[(size_t)c * M + ij]);
+  for (int c = 0; c < I; ++c) s += __bfloat162float(t[(size_t)c * Mt + ij]);
   float m = s / I;
   float s2 = 0.f;
 #pragma unroll 8
   for (int c = 0; c < I; ++c) {
-    float d = __bfloat162float(t[(size_t)c * M + ij]) - m;
+    float d = __bfloat162float(t[(size_t)c * Mt + ij]) - m;
     s2 += d * d;
   }
   cmu[ij] = m;
@@ -169,13 +169,13 @@ __global__ void centerStatsK(const __nv_bfloat16* __restrict__ t, float* __restr
 __global__ void centerWriteK(const __nv_bfloat16* __restrict__ t,
                              const float* __restrict__ scale, const float* __restrict__ offset,
                              const float* __restrict__ cmu, const float* __restrict__ crstd,
-                             __nv_bfloat16* __restrict__ cn, int M) {
+                             __nv_bfloat16* __restrict__ cn, int M, int Mt) {
   __shared__ float tile[TILE][TILE + 1];
   int ij0 = blockIdx.x * TILE, c0 = blockIdx.y * TILE;
   for (int j = 0; j < TILE; j += 8) {
     int c = c0 + threadIdx.y + j, ij = ij0 + threadIdx.x;
     tile[threadIdx.y + j][threadIdx.x] =
-        ij < M ? __bfloat162float(t[(size_t)c * M + ij]) : 0.f;
+        ij < M ? __bfloat162float(t[(size_t)c * Mt + ij]) : 0.f;
   }
   __syncthreads();
   for (int j = 0; j < TILE; j += 8) {
@@ -293,7 +293,8 @@ __global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
                              const __nv_bfloat16* __restrict__ t,
                              const float* __restrict__ scale, const float* __restrict__ cmu,
                              const float* __restrict__ crstd,
-                             __nv_bfloat16* __restrict__ dt, int M) {
+                             __nv_bfloat16* __restrict__ dt, int M, int Mt,
+                             int Mdc) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= (size_t)M) return;
   float m = cmu[ij], r = crstd[ij];
@@ -301,8 +302,8 @@ __global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
   const size_t drow = ROWMAJ ? ij * I : ij;      // and stride 1 against M
 #pragma unroll 8
   for (int c = 0; c < I; ++c) {
-    size_t o = (size_t)c * M + ij;
-    size_t d = ROWMAJ ? drow + c : o;
+    size_t o = (size_t)c * Mt + ij;
+    size_t d = ROWMAJ ? drow + c : (size_t)c * Mdc + ij;
     float xhat = (__bfloat162float(t[o]) - m) * r;
     float dxhat = __bfloat162float(dcnT[d]) * scale[c];
     sum_d += dxhat; sum_dx += dxhat * xhat;
@@ -328,8 +329,8 @@ __global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
 #endif
 #pragma unroll 8
   for (int c = 0; c < I; ++c) {
-    size_t o = (size_t)c * M + ij;
-    size_t d = ROWMAJ ? drow + c : o;
+    size_t o = (size_t)c * Mt + ij;
+    size_t d = ROWMAJ ? drow + c : (size_t)c * Mdc + ij;
     if (PROBE_ONEPASS) { o &= 4095; d &= 4095; }
     float xhat = (__bfloat162float(t[o]) - m) * r;
     float dxhat = __bfloat162float(dcnT[d]) * scale[c];
@@ -423,7 +424,7 @@ __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
     const __nv_bfloat16* __restrict__ bcat, const float* __restrict__ mask,
     __nv_bfloat16* __restrict__ a, __nv_bfloat16* __restrict__ bb,
     gate_t* __restrict__ gl, gate_t* __restrict__ gr,
-    gt2_t* __restrict__ t2, int M) {
+    gt2_t* __restrict__ t2, int M, int Mt) {
   extern __shared__ char smem[];
   __nv_bfloat16* xs = (__nv_bfloat16*)smem;                  // [BMF][LDXF]
   // Two 16x16 tiles a warp, not the whole strip: a product and its gate have
@@ -525,8 +526,8 @@ __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
         float g = sigmoidf(st[256 + e] + __bfloat162float(bcat[gg * I + c0 + c]));
         float pv = st[e] + __bfloat162float(bcat[gp * I + c0 + c]);
         size_t ij = r0 + row;
-        out[(size_t)(c0 + c) * M + ij] = __float2bfloat16(mk[row] * pv * g);
-        if (KEEPG) gout[(size_t)(c0 + c) * M + ij] = gateStore(g);
+        out[(size_t)(c0 + c) * Mt + ij] = __float2bfloat16(mk[row] * pv * g);
+        if (KEEPG) gout[(size_t)(c0 + c) * Mt + ij] = gateStore(g);
       }
       __syncwarp();
     }
@@ -594,7 +595,7 @@ __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
           gq[u] = sigmoidf(st[256 + e0 + u * 16] + bg);
           pq[u] = st[e0 + u * 16] + bp;
         }
-        size_t o = (size_t)(c0 + c) * M + r0 + row;
+        size_t o = (size_t)(c0 + c) * Mt + r0 + row;
         __nv_bfloat162 w0 = __floats2bfloat162_rn(mk[row] * pq[0] * gq[0],
                                                   mk[row + 1] * pq[1] * gq[1]);
         __nv_bfloat162 w1 = __floats2bfloat162_rn(mk[row + 2] * pq[2] * gq[2],
@@ -825,7 +826,8 @@ __global__ void TM_LB(32 * WG) combineDxK(
     const __nv_bfloat16* __restrict__ a, const __nv_bfloat16* __restrict__ bb,
     const gate_t* __restrict__ gl, const gate_t* __restrict__ gr,
     const __nv_bfloat16* __restrict__ dt2pre, const float* __restrict__ mask,
-    const __nv_bfloat16* __restrict__ wcatT, __nv_bfloat16* __restrict__ dx, int M) {
+    const __nv_bfloat16* __restrict__ wcatT, __nv_bfloat16* __restrict__ dx, int M,
+    int Mt) {
   extern __shared__ char smem[];
   // TM_CDX4 gives the two builds their own tiles, so both issue their six
   // plane reads BEFORE any contraction instead of alternating build/contract
@@ -892,7 +894,7 @@ __global__ void TM_LB(32 * WG) combineDxK(
     // consecutive ij is one 4-byte load instead of two 2-byte ones
     for (int i = tid; i < BMG * I / 4; i += 32 * WG) {
       int c = i / (BMG / 4), row = (i % (BMG / 4)) * 4;
-      size_t o = (size_t)c * M + r0 + row;
+      size_t o = (size_t)c * Mt + r0 + row;
       __nv_bfloat162 dv2[2], pv2[2];
       float gq[4];
 #pragma unroll
@@ -1061,6 +1063,51 @@ struct TriMul {
   // reduction to save reads that were already free.  TM_CENTERF=1 to re-run.
   bool three_pass = !envOn("TM_CENTERF");
 
+  // TM_ROWS: how many pair positions a chunk.  EVERYTHING EXCEPT THE
+  // CONTRACTION IS ROW-WISE over M -- the two LayerNorms, the fused
+  // projection, the centre norm, both output GEMMs and the combine all touch
+  // one position at a time -- so a chunk of positions is exact and needs no
+  // recompute.  The contraction is not: `t_c = A_c B_c^T` reads every row of
+  // a channel's plane, so `a`, `bb`, `t`, `dt`, `da` and `db` STAY WHOLE and
+  // the module runs as two chunk loops with the batched GEMM between them.
+  // That is the whole reason this is safe where chunking the contraction
+  // itself would need a cross-chunk accumulator.
+  //
+  // What it frees: the six buffers that live inside ONE loop -- `x` and `cn`
+  // on the forward, `dO`, `dcnT` (and `dcn`) and `dx` on the backward -- 530
+  // MB across the block's two instances at N=544.  `dt2pre` is produced in
+  // the backward's first loop and read in its second, so it stays whole:
+  // lifetime, not size, is what decides.
+  //
+  // THE UNIT IS A POSITION, NOT A ROW OF N -- M is N*N, so a sane chunk is a
+  // FRACTION of M (M/4, M/8), not a small number.  TM_ROWS=128 at N=256 is
+  // 512 chunks and runs 22x slower; the value is tens of thousands.
+  //
+  // AND IT IS ROUNDED TO 1024, which is TWO separate requirements and both
+  // are hard faults rather than slowdowns:
+  //
+  //   * projGateK stores four consecutive positions of one channel as an
+  //     8-byte pair and combineDxK reads them back the same way, so a chunk
+  //     base that is not 4-aligned makes every one of those misaligned.
+  //     TM_ROWS=97 dies with "misaligned address" inside whichever GEMM runs
+  //     next.
+  //   * combineDxK's vector loads are guarded only on the WRITE -- a partial
+  //     final block reads BMG rows and keeps the ones it wants.  Unchunked
+  //     that is safe because M = N*N with N a multiple of 32 is a multiple of
+  //     1024 and every block is full.  A chunk whose length is not also a
+  //     multiple of 1024 breaks that and reads past `a` by up to 63
+  //     positions: TM_ROWS=12345 is an illegal access, not a wrong answer.
+  //
+  // Rounding to 1024 gives both, and leaves the tail chunk a multiple of 1024
+  // as well.
+  static size_t tmChunk(size_t m) {
+    const char* e = getenv("TM_ROWS");
+    size_t r = e ? (size_t)atoll(e) : 0;
+    r &= ~(size_t)1023;
+    return (r > 0 && r < m) ? r : m;
+  }
+  size_t tmRows = 0;   // positions a chunk; M when unchunked
+
   void alloc(int N_, bool out_) {
     N = N_; M = N * N; outgoing = out_;
     lt.init();
@@ -1069,6 +1116,13 @@ struct TriMul {
     CUB(cublasSetStream(cub, st));
     size_t mc = (size_t)M * C, mi = (size_t)M * I;
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
+    // THE TWO NON-DEFAULT PATHS DO NOT CHUNK.  `TM_SPLIT` materialises the
+    // 640-channel `dpre`, and `TM_CENTERF`'s fused centre norm indexes `t`
+    // with the grid's own M; both are A/B fallbacks, and teaching them the
+    // two-stride convention buys nothing.  Asking for both is not an error,
+    // it just runs one chunk.
+    tmRows = (split_cdx || !three_pass) ? (size_t)M : tmChunk((size_t)M);
+    const size_t rc = tmRows * C, ri = tmRows * I;
     // MEASURED, NOT ASSUMED: computing `pre` in row blocks small enough to keep
     // the GEMM's output in L2 (so the gate kernel reads it back from cache
     // rather than HBM) is MONOTONICALLY WORSE -- 4.39 / 3.37 / 3.16 / 3.02 /
@@ -1079,7 +1133,8 @@ struct TriMul {
     // `pre` is GONE: projGateK never writes the 640-channel intermediate, and
     // the backward reads the two gates instead.  84 MB a module at N=256
     // against 34 for gl+gr.
-    B(&x, mc); B(&a, mi); B(&bb, mi); B(&t, mi); B(&cn, mi);
+    // `x` and `cn` live inside one chunk loop apiece -- see TM_ROWS
+    B(&x, rc); B(&a, mi); B(&bb, mi); B(&t, mi); B(&cn, ri);
     CU(cudaMalloc(&gl, mi * sizeof(gate_t)));
     CU(cudaMalloc(&gr, mi * sizeof(gate_t)));
     B(&o, mc);
@@ -1094,10 +1149,12 @@ struct TriMul {
     if (split_cdx) B(&dpre, mp); else dpre = nullptr;
     B(&da, mi); B(&db, mi); B(&dt, mi);
     // dcn (row-major) is the transpose path's staging and nothing else
-    if (transpose_dcn) B(&dcn, mi); else dcn = nullptr;
+    if (transpose_dcn) B(&dcn, ri); else dcn = nullptr;
     // dcnT is the channel-major copy of dcn; only the transpose path needs it
-    B(&dcnT, mi);   // the channel-major cotangent, either way
-    B(&dO, mc); B(&dt2pre, mc); B(&dx, mc);
+    B(&dcnT, ri);   // the channel-major cotangent, either way
+    // dO and dx are chunk-local; dt2pre crosses from the first loop to the
+    // second and cannot shrink
+    B(&dO, rc); B(&dt2pre, mc); B(&dx, rc);
     CU(cudaMalloc(&mu, M * 4)); CU(cudaMalloc(&rstd, M * 4));
     CU(cudaMalloc(&cmu, M * 4)); CU(cudaMalloc(&crstd, M * 4));
 
@@ -1258,10 +1315,7 @@ struct TriMul {
     // haveT says the same of `t`, which is a SEPARATE tier -- the contraction
     // is skipped on its own, so a budget that can afford the projection set
     // but not the contraction's output still gets most of the saving.
-    if (!haveActs)
-    PROF_STEP("tm.f lnFwd",
-      lnFwdK<<<(M + 7) / 8, 256, 0, st>>>(pair, ln_scale, ln_offset, x, mu, rstd, M));
-    dim3 bt(TILE, 8), gt((M + TILE - 1) / TILE, I / TILE);
+    dim3 bt(TILE, 8);
     {
       static bool once = false;
       if (!once) {
@@ -1274,15 +1328,28 @@ struct TriMul {
         once = true;
       }
     }
+    // LOOP ONE: the input LayerNorm and the fused projection, a chunk of
+    // positions at a time.  `x` is chunk-sized and indexed from its base; the
+    // channel-major outputs a/bb/gl/gr are offset by the chunk and keep the
+    // GLOBAL stride M, which is what the extra `Mt` argument carries.  mask,
+    // t2, mu and rstd are row-wise and simply offset.
     if (!haveActs)
-    PROF_STEP("tm.f projGate",
-      if (keepGates)
-        projGateK<true><<<(M + BMF - 1) / BMF, 32 * WF, projGateSmem(), st>>>(
-            x, TM_FRAGPERM ? wcatG : wcat, bcat, mask, a, bb, gl, gr, t2, M);
-      else
-        projGateK<false><<<(M + BMF - 1) / BMF, 32 * WF, projGateSmem(), st>>>(
-            x, TM_FRAGPERM ? wcatG : wcat, bcat, mask, a, bb, nullptr, nullptr, t2, M);
-      CU(cudaGetLastError()));
+    for (size_t p0 = 0; p0 < (size_t)M; p0 += tmRows) {
+      const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
+      PROF_STEP("tm.f lnFwd",
+        lnFwdK<<<(pm + 7) / 8, 256, 0, st>>>(pair + p0 * C, ln_scale, ln_offset, x,
+                                             mu + p0, rstd + p0, pm));
+      PROF_STEP("tm.f projGate",
+        if (keepGates)
+          projGateK<true><<<(pm + BMF - 1) / BMF, 32 * WF, projGateSmem(), st>>>(
+              x, TM_FRAGPERM ? wcatG : wcat, bcat, mask + p0, a + p0, bb + p0,
+              gl + p0, gr + p0, t2 + p0 * C, pm, M);
+        else
+          projGateK<false><<<(pm + BMF - 1) / BMF, 32 * WF, projGateSmem(), st>>>(
+              x, TM_FRAGPERM ? wcatG : wcat, bcat, mask + p0, a + p0, bb + p0,
+              nullptr, nullptr, t2 + p0 * C, pm, M);
+        CU(cudaGetLastError()));
+    }
     // outgoing  T_c = A_c B_c^T ;  incoming  T_c = B_c^T A_c
     if (!haveT)
     PROF_STEP("tm.f bmm",
@@ -1310,17 +1377,30 @@ struct TriMul {
     // recomputes the statistics out of a tile it has to load regardless,
     // which also makes KEEP_STATS -- the best tier on the board at 136 ms/GB
     // -- worth nothing there.
-    PROF_STEP("tm.f centerLn",
-      if (three_pass) {
-        if (!haveStats)
-          centerStatsK<<<(M + 255) / 256, 256, 0, st>>>(t, cmu, crstd, M);
-        centerWriteK<<<gt, bt, 0, st>>>(t, cn_scale, cn_offset, cmu, crstd, cn, M);
-      } else {
+    // LOOP TWO: the centre LayerNorm and the output projection.  Same shape
+    // as loop one -- `cn` is chunk-sized, `t` is offset and keeps stride M.
+    if (three_pass) {
+      for (size_t p0 = 0; p0 < (size_t)M; p0 += tmRows) {
+        const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
+        dim3 gt((pm + TILE - 1) / TILE, I / TILE);
+        PROF_STEP("tm.f centerLn",
+          if (!haveStats)
+            centerStatsK<<<(pm + 255) / 256, 256, 0, st>>>(t + p0, cmu + p0,
+                                                           crstd + p0, pm, M);
+          centerWriteK<<<gt, bt, 0, st>>>(t + p0, cn_scale, cn_offset, cmu + p0,
+                                          crstd + p0, cn, pm, M));
+        PROF_STEP("tm.f gemm out",
+          lt.matmul(pm, C, I, cn, woT, o + p0 * C, CUDA_R_16BF,
+                    CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st));
+      }
+    } else {
+      PROF_STEP("tm.f centerLn",
         centerFusedK<<<(M + BLKC - 1) / BLKC, 256, 0, st>>>(t, cn_scale, cn_offset,
-                                                            cmu, crstd, cn, M);
-      });
-    PROF_STEP("tm.f gemm out",
-      lt.matmul(M, C, I, cn, woT, o, CUDA_R_16BF, CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st));
+                                                            cmu, crstd, cn, M));
+      PROF_STEP("tm.f gemm out",
+        lt.matmul(M, C, I, cn, woT, o, CUDA_R_16BF, CUBLASLT_EPILOGUE_BIAS, bo,
+                  nullptr, st));
+    }
     if (!fusedOut) {
       if (!out) CU(cudaMalloc(&out, mc * 2));
       PROF_STEP("tm.f outGate", outGateK<<<(mc + 255) / 256, 256, 0, st>>>(o, t2, out, mc));
@@ -1334,18 +1414,27 @@ struct TriMul {
   template <class DT>
   void backward(const DT* dout, const __nv_bfloat16* pair, const float* mask,
                 DT* dpair, bool acc = false) {
+    dim3 bt(TILE, 8);
+    // LOOP ONE, mirroring the forward's: the output gate's backward, the
+    // output projection's, and the centre LayerNorm's.  `dO`, `dcnT`/`dcn`
+    // and (on the f32 path) `dx` are chunk-sized and used at their base;
+    // `dt2pre` is read by loop TWO and stays whole; `t` and `dt` are
+    // channel-major at the global stride M.
+    for (size_t p0 = 0; p0 < (size_t)M; p0 += tmRows) {
+      const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
+      const size_t pc = (size_t)pm * C;
+      dim3 gt((pm + TILE - 1) / TILE, I / TILE);
     const __nv_bfloat16* dxin;
     if constexpr (std::is_same<DT, __nv_bfloat16>::value) {
-      dxin = dout;                       // already the GEMM's width
+      dxin = dout + p0 * C;              // already the GEMM's width
     } else {
       PROF_STEP("tm.b f32ToBf16",
-        f32ToBf16K<<<((size_t)M * C + 255) / 256, 256, 0, st>>>(dout, dx, (size_t)M * C));
+        f32ToBf16K<<<(pc + 255) / 256, 256, 0, st>>>(dout + p0 * C, dx, pc));
       dxin = dx;
     }
-    size_t mc = (size_t)M * C;
-    dim3 bt(TILE, 8), gt((M + TILE - 1) / TILE, I / TILE);
     PROF_STEP("tm.b dOutGate",
-      dOutGateK<<<(mc + 255) / 256, 256, 0, st>>>(dxin, o, t2, dO, dt2pre, mc));
+      dOutGateK<<<(pc + 255) / 256, 256, 0, st>>>(dxin, o + p0 * C, t2 + p0 * C,
+                                                  dO, dt2pre + p0 * C, pc));
     // CHANNEL-MAJOR STRAIGHT OUT OF THE GEMM.  centerLnBwdK reads its
     // cotangent as [I][M], to match `t`, and that used to be arranged by
     // writing dcn [M][I] and transposing it through HBM -- 33.6 MB each way,
@@ -1359,16 +1448,21 @@ struct TriMul {
     // cost. Kept because equal-and-simpler beats equal: one kernel and one
     // 16.8 MB buffer fewer. TM_TRANSPOSE=1 restores the round trip.
     PROF_STEP("tm.b gemm dcn",
-      lt.matmul(M, I, C, dO, wo, transpose_dcn ? (void*)dcn : (void*)dcnT,
+      lt.matmul(pm, I, C, dO, wo, transpose_dcn ? (void*)dcn : (void*)dcnT,
               CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st,
               /*tout*/!transpose_dcn));
     PROF_STEP("tm.b centerLnBwd",
       // TM_TRANSPOSE restores the channel-major round trip, which is the A/B
       // this was decided on: the transpose is 33.6 MB of the step's 117.6.
       if (transpose_dcn)
-        transposeRowToChanK<<<gt, bt, 0, st>>>(dcn, dcnT, M, I);
-      centerLnBwdK<false><<<(M + 255) / 256, 256, 0, st>>>(dcnT, t, cn_scale, cmu,
-                                                           crstd, dt, M));
+        transposeRowToChanK<<<gt, bt, 0, st>>>(dcn, dcnT, pm, I);
+      // `dcnT` is the chunk's own buffer, so its channel stride is pm, while
+      // `t` and `dt` keep M.  Two strides, which is why centerLnBwdK takes
+      // both: handing it one is a silently wrong read of 128 planes.
+      centerLnBwdK<false><<<(pm + 255) / 256, 256, 0, st>>>(dcnT, t + p0, cn_scale,
+                                                            cmu + p0, crstd + p0,
+                                                            dt + p0, pm, M, pm));
+    }
     PROF_STEP("tm.b bmm",
       if (outgoing) {
         // T = A B^T  ->  dA = dT B,  dB = dT^T A
@@ -1382,8 +1476,9 @@ struct TriMul {
     // TM_SPLIT runs the old two-kernel path instead, which is the A/B this was
     // decided on and the fallback if a card ever disagrees.
     if (split_cdx) {
+      dim3 gtM((M + TILE - 1) / TILE, I / TILE);
       PROF_STEP("tm.b combineTrans",
-        combineTransK<<<gt, bt, 0, st>>>(da, db, a, bb, gl, gr, dt2pre, mask, dpre,
+        combineTransK<<<gtM, bt, 0, st>>>(da, db, a, bb, gl, gr, dt2pre, mask, dpre,
                                          M, 0, M));
       PROF_STEP("tm.b gemm dx",
         lt.matmul(M, C, PRE, dpre, wcat, dx, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
@@ -1402,12 +1497,25 @@ struct TriMul {
                                 (int)combineDxSmem()));
         once = true;
       }
-      PROF_STEP("tm.b combineDx",
-        combineDxK<<<(M + BMG - 1) / BMG, 32 * WG, combineDxSmem(), st>>>(
-            da, db, a, bb, gl, gr, dt2pre, mask, TM_FRAGPERM ? wcatD : wcatT,
-            dx, M);
-        CU(cudaGetLastError()));
+      // LOOP TWO: the combine and the input LayerNorm's backward.  `dx` is
+      // chunk-sized again -- loop one is finished with it.
+      for (size_t p0 = 0; p0 < (size_t)M; p0 += tmRows) {
+        const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
+        PROF_STEP("tm.b combineDx",
+          combineDxK<<<(pm + BMG - 1) / BMG, 32 * WG, combineDxSmem(), st>>>(
+              da + p0, db + p0, a + p0, bb + p0, gl + p0, gr + p0,
+              dt2pre + p0 * C, mask + p0, TM_FRAGPERM ? wcatD : wcatT,
+              dx, pm, M);
+          CU(cudaGetLastError()));
+        PROF_STEP("tm.b lnBwd",
+          if (acc) lnBwdK<true, DT><<<(pm + 7) / 8, 256, 0, st>>>(
+              dx, pair + p0 * C, ln_scale, mu + p0, rstd + p0, dpair + p0 * C, pm);
+          else     lnBwdK<false, DT><<<(pm + 7) / 8, 256, 0, st>>>(
+              dx, pair + p0 * C, ln_scale, mu + p0, rstd + p0, dpair + p0 * C, pm));
+      }
+      return;
     }
+    // the TM_SPLIT path above falls through to here with whole buffers
     PROF_STEP("tm.b lnBwd",
       if (acc) lnBwdK<true, DT><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpair, M);
       else     lnBwdK<false, DT><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpair, M));
