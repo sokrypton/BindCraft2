@@ -150,6 +150,7 @@ def why_unavailable() -> str:
 
 
 _registered = False
+_LIBH = None   # the loaded CDLL, for the plain C entry points beside the FFI
 
 # haiku's param tree uses '/' inside module names and the native manifest keys
 # on the SAME paths the checkpoint does, so the two differ only in how the
@@ -635,7 +636,8 @@ def _register():
     if _k:
         print(f'native: stride remat FORCED to NB_STRIDE={_k} at every length '
               f'-- {_save_slots(48, 0)} of 48 save slots', file=sys.stderr)
-    lib = ctypes.CDLL(_LIB)
+    global _LIBH
+    lib = _LIBH = ctypes.CDLL(_LIB)
     # THE EXPORTED SYMBOL IS THE C++ HANDLER'S NAME, not a snake_case
     # convention: XLA_FFI_DEFINE_HANDLER_SYMBOL(NativeEvoformerFwd, ...)
     # exports exactly `NativeEvoformerFwd`.  Checked with nm, not guessed.
@@ -732,15 +734,17 @@ def supported_length(n: int) -> bool:
 # native/length_ladder.py is how to replace a guess with a number, and
 # BC2_NATIVE_MAX_N overrides it outright in either direction.
 _A10_BYTES = 17763631104       # jax bytes_limit on the 23.7 GB A10
-# 544 since stride remat: the save-set is 15 of 48 slots above
-# _A10_STRIDE_N, and 537 and 545 residues run where 512 was the wall.  Not
-# higher, although 587 and 617 also run: 552, 567 and 577 do NOT, twice over,
-# and the reason is not ours to fix from here -- at those lengths XLA grows
-# its pool AFTER the extra-MSA stack has allocated rather than before, so the
-# trunk arrives at 1.47 GB free instead of 7.26.  An XLA cap does not change
-# it (0.55 and 0.40 fail identically).  A ceiling is a number every length
-# below it must clear, so it is 544.
-_A10_MAX_N = 544
+# 608 since the trace-time prealloc.  The history of this constant is the
+# history of what was actually binding:
+#   512  before stride remat
+#   544  stride remat shrank the save-set, but 552 still failed
+#   608  the stacks stopped racing XLA for the first allocation
+# 552, 567, 577, 587, 600 and 608 all run, in order, with no gaps; 617, 632
+# and 647 die in tplblock/tplstack, the template pair stack, which is the
+# next mandatory allocation still made lazily.  See
+# dev/native_block/ALLOC_ORDER.md for why it cannot simply be preallocated
+# too (it was tried, and it cost 577 and 587).
+_A10_MAX_N = 608
 # Padded N above which the save-set goes stride-remat.  It is the OLD
 # ceiling on purpose: below it memory is not the binding constraint and the
 # stride is 21% of a step for nothing.
@@ -1105,6 +1109,53 @@ def _save_slots(depth: int, n: int) -> int:
     return depth if k <= 1 else (depth + k - 1) // k + k - 1
 
 
+_PREALLOCED: set = set()
+
+
+def _prealloc_stack(n, s_, depth, weights_dir, pair_only, dropout):
+    """Build this stack's buffers NOW, while the card is still empty.
+
+    THE ORDER OF ALLOCATION IS THE CEILING, not the amount.  A design step
+    runs two predictions -- binder_alone and the complex -- and whichever
+    traces into execution first allocates first.  Measured on the A10 with
+    BLK_MEM: at 552 residues the small stacks go first, XLA then grows to
+    17.83 GB in use, the complex stack takes its 4.30 GB out of the 5.86
+    remaining and the structure module dies with 1.47 GB.  At 587 -- LONGER
+    -- the complex stack goes first, takes 4.79 GB with 13.64 GB free, and
+    the whole step fits.  Nothing about 552 is bigger; the order decided it.
+
+    This runs at TRACE time, when XLA has allocated nothing, so the stacks
+    are built before there is anything to lose a race to.  It allocates the
+    exact buffers the step will then run on -- `native_stack_prealloc` goes
+    through the same `get()` cache the FFI call uses -- so unlike the
+    trace-time ballast this replaces, there is nothing held and nothing to
+    release at the right moment.
+
+    A failure here is not fatal: the stack is built on first call as it
+    always was, in the order that used to decide things.
+    """
+    if os.environ.get('NB_NO_PREALLOC'):
+        return
+    key = (int(n), int(s_), int(depth), weights_dir, bool(pair_only),
+           bool(dropout))
+    if key in _PREALLOCED:
+        return
+    _PREALLOCED.add(key)
+    _register()
+    fn = getattr(_LIBH, 'native_stack_prealloc', None)
+    if fn is None:            # an old library: say so, do not pretend
+        print('native: this libnative_evoformer.so has no '
+              'native_stack_prealloc; stacks will be built in call order',
+              file=sys.stderr)
+        return
+    import ctypes
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p,
+                   ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    fn(int(n), int(s_), int(depth), str(weights_dir).encode(),
+       1 if pair_only else 0, 1, 1 if dropout else 0)
+
+
 def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
     """Build the custom_vjp for ONE (depth, weights) pair.
 
@@ -1128,6 +1179,9 @@ def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
     pair_only = np.int64(1 if pair_only else 0)
 
     def raw(pair, msa, pair_mask, msa_mask, seed):
+        # TRACE TIME, not call time -- see _prealloc_stack.
+        _prealloc_stack(pair.shape[0], msa.shape[0], depth, weights_dir,
+                        bool(pair_only), bool(dropout))
         out = jax.ffi.ffi_call(
             'native_evoformer_fwd',
             (jax.ShapeDtypeStruct(pair.shape, jnp.float32),
