@@ -655,6 +655,18 @@ struct TriAttn {
             (void**)&wqkvgTh, (void**)&wnbbTh, (void**)&bqkvgH};
   }
 
+  int taRows = 0;   // rows a chunk; N when unchunked
+
+  // TA_ROWS=<n> sets it; 0/unset means one chunk of N, i.e. exactly what this
+  // module did before.  Measured on the standalone gate at N=128: a chunk of
+  // N/2 and N/4 are bit-identical to the unchunked run and cost 0% and 1.9%;
+  // N/8 costs 12.7%.
+  static int taChunkRows(int n) {
+    const char* e = getenv("TA_ROWS");
+    const int r = e ? atoi(e) : 0;
+    return (r > 0 && r < n) ? r : n;
+  }
+
   void alloc(int N_, bool ending_) {
     N = N_; M = N * N; ending = ending_;
     lt.init();
@@ -665,11 +677,18 @@ struct TriAttn {
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
     B(&x, mc); B(&ag, mc); B(&out, mc);
     B(&dcomb, mt); B(&dag, mc); B(&dx, mc);
-    CU(cudaMalloc(&xh, mc * sizeof(half)));
+    // TA_ROWS: the module's scratch is sized by a ROW CHUNK, not by N.
+    // Triangle attention is independent per row, so rows [r0, r0+rows) can be
+    // run on their own; `xh` and `outH` are written and read inside the
+    // FORWARD and never outlive it, so chunking them needs no replay.
+    // (qkvgH, avH, lseF are read again by the backward and stay full.)
+    taRows = taChunkRows(N);
+    const size_t mcChunk = (size_t)taRows * N * C;
+    CU(cudaMalloc(&xh, mcChunk * sizeof(half)));
     CU(cudaMalloc(&nbbMH, (size_t)M * H * sizeof(half)));
     CU(cudaMalloc(&qkvgH, mc * 4 * sizeof(half)));   // [M][4W]
     CU(cudaMalloc(&biasH, (size_t)H * M * sizeof(half)));
-    CU(cudaMalloc(&outH, mc * sizeof(half)));
+    CU(cudaMalloc(&outH, mcChunk * sizeof(half)));
     CU(cudaMalloc(&avH, mc * sizeof(half)));
     CU(cudaMalloc(&lseF, (size_t)N * H * N * sizeof(float)));
     CU(cudaMalloc(&davH, mc * sizeof(half)));
@@ -807,6 +826,38 @@ struct TriAttn {
   // cheap to keep (13.6 MB a call at N=224).  The stack owns a per-depth slot
   // for each and swaps them in use(), exactly as it does the weights.
   static inline const bool TA_SWAP = envOn("TA_SWAPPROBE");
+  // TA_ROWS: run the flash over row CHUNKS instead of all N rows at once.
+  // Triangle attention is independent per row -- the kernel already takes
+  // (r0, rows) -- so this is EXACT, not an approximation, and it is the
+  // prototype for the thing that would lift the native length ceiling: the
+  // module's scratch is N*N*C, and a chunk needs only rows*N*C of it.  Here
+  // the buffers stay full size, so this measures ONLY what splitting the
+  // launches costs in speed.
+  void flashRows(const half* qkvg, const half* bias, const float* mask,
+                 half* outHp, half* avHp, float* lseFp) {
+    static const int chunk = getenv("TA_ROWS") ? atoi(getenv("TA_ROWS")) : 0;
+    const int step = (chunk > 0 && chunk < N) ? chunk : N;
+    // THE CALLER OFFSETS THE DATA POINTERS.  Inside the kernel the row is
+    // `rl = blockIdx.y % rowsHere` and outAt()/base index with rl, NOT with
+    // the absolute `r = r0 + rl` -- r0 reaches only the mask and the bias.
+    // Passing the base pointers makes every chunk write from row 0 and the
+    // last one win, which the gate caught as cos 0.717 at TA_ROWS=64.
+    for (int r0 = 0; r0 < N; r0 += step) {
+      const int rows = (N - r0 < step) ? (N - r0) : step;
+      const size_t mcc = (size_t)rows * N * C;
+      flashGridHalfAt<D, 8, 48>(qkvg + (size_t)r0 * N * 4 * C, bias,
+                                /*biasStride*/ N, mask, outHp,
+                                /*n*/ N, /*heads*/ H, r0, rows, /*tr*/ false,
+                                /*scale*/ 1.f, /*qBias*/ nullptr,
+                                avHp ? avHp + (size_t)r0 * N * C : nullptr,
+                                lseFp ? lseFp + (size_t)r0 * H * N : nullptr);
+      // outH is chunk-sized: widen it into `ag` before the next chunk lands on
+      // it.  (The haveFlash path rebuilds `ag` from avH instead and never
+      // touches outH, so it stays outside this loop.)
+      halfToBf16K<<<(mcc + 255) / 256, 256, 0, st>>>(outHp, ag + (size_t)r0 * N * C, mcc);
+    }
+  }
+
   void forward(const __nv_bfloat16* pairIn, const float* maskIn,
                bool haveFlash = false, bool haveBias = false) {
     const __nv_bfloat16* pair = pairIn;
@@ -819,13 +870,26 @@ struct TriAttn {
     }
     size_t mc = (size_t)M * C;
     LF_STREAM = st;
-    PROF_STEP("ta.f lnFwd",
-      lnFwdHalfK<<<(M + 7) / 8, 256, 0, st>>>(pair, ln_scale, ln_offset, xh, mu, rstd, M));
-    // Nn = QKVG makes D a row-major [M, 4C] f16 block, which IS qkvgH's layout,
-    // so the flash kernel reads the GEMM's output with no copy in between.
-    PROF_STEP("ta.f gemm qkvg",
-      lt.matmul(M, QKVG, C, xh, wqkvgTh, qkvgH, CUDA_R_16F,
-                CUBLASLT_EPILOGUE_BIAS, bqkvgH, nullptr, st));
+    // ROW CHUNKS.  xh is chunk-sized, so the LN and the two GEMMs that read it
+    // run per chunk; mu/rstd outlive the forward (lnBwd reads them) and are
+    // offset instead.  With TA_ROWS unset this is one pass over all N rows.
+    for (int cr0 = 0; cr0 < N; cr0 += taRows) {
+      const int crows = (N - cr0 < taRows) ? (N - cr0) : taRows;
+      const size_t Mc = (size_t)crows * N;
+      PROF_STEP("ta.f lnFwd",
+        lnFwdHalfK<<<(Mc + 7) / 8, 256, 0, st>>>(pair + (size_t)cr0 * N * C,
+          ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
+      PROF_STEP("ta.f gemm qkvg",
+        lt.matmul((int)Mc, QKVG, C, xh, wqkvgTh, qkvgH + (size_t)cr0 * N * QKVG,
+                  CUDA_R_16F, CUBLASLT_EPILOGUE_BIAS, bqkvgH, nullptr, st));
+      if (!haveBias)
+        PROF_STEP("ta.f gemm nbb",
+          lt.matmul((int)Mc, H, C, xh, wnbbTh, nbbMH + (size_t)cr0 * N * H,
+                    CUDA_R_16F, CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
+    }
+    // (Nn = QKVG makes D a row-major [M, 4C] f16 block, which IS qkvgH's
+    // layout, so the flash kernel reads the GEMM's output with no copy; the
+    // GEMM itself now runs inside the chunk loop above.)
     // the pair bias is its own GEMM only because it would otherwise widen the
     // one above past the 4C stride flash assumes.  H = 4 columns: 33 MFLOP.
     // THE BIAS IS ITS OWN TIER.  It used to ride on haveFlash, which was right
@@ -835,9 +899,6 @@ struct TriAttn {
     // BACKWARD reads biasH either way, so it is rebuilt here whenever it is
     // not held, flash kept or not.
     if (!haveBias) {
-      PROF_STEP("ta.f gemm nbb",
-        lt.matmul(M, H, C, xh, wnbbTh, nbbMH, CUDA_R_16F,
-                  CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
       PROF_STEP("ta.f nbbToChan",
         nbbRowToChanHalfK<<<(M + 255) / 256, 256, 0, st>>>(nbbMH, biasH, M));
       if (envOn("NO_NBB"))
@@ -868,15 +929,12 @@ struct TriAttn {
                                  false, 1.f, nullptr, avH, lseF,
                                  /*rs*/ (size_t)4 * H * 32, /*ps*/ (size_t)N * 4 * H * 32,
                                  /*ors*/ (size_t)H * 32, /*ops*/ (size_t)N * H * 32)
-          : flashGridHalfAt<D, 8, 48>(qkvgH, biasH, /*biasStride*/ N, mask, outH, /*n*/ N,
-                                 /*heads*/ H, /*r0*/ 0, /*rows*/ N, /*tr*/ false,
-                                 /*scale*/ 1.f, /*qBias*/ nullptr, avH, lseF));
+          : flashRows(qkvgH, biasH, mask, outH, avH, lseF));
     if (haveFlash)
       // outH was never written this pass, so rebuild the gated output from avH
       PROF_STEP("ta.f gateFromAv",
         gateFromAvK<<<(mc + 255) / 256, 256, 0, st>>>(avH, qkvgH, ag, M));
-    else
-      PROF_STEP("ta.f halfToBf16", halfToBf16K<<<(mc + 255) / 256, 256, 0, st>>>(outH, ag, mc));
+    // (the !haveFlash path widened outH into `ag` inside flashRows, per chunk)
     PROF_STEP("ta.f gemm out",
       lt.matmul(M, C, C, ag, woT, ending ? outT : out, CUDA_R_16BF,
               CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st));
