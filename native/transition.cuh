@@ -372,6 +372,19 @@ struct Trans {
   }
 
   size_t trRows = 0;   // pair elements a chunk; M when unchunked
+  // CHUNKING `h` WAS TRIED AGAIN AND REVERTED AGAIN.  279 MB at N=522 and
+  // the biggest thing this module holds, so it keeps being tempting.  The
+  // plan was sound on paper -- keepSlots() really does return hbit/mu/rstd
+  // and not `h` when is_pair, so the keep-slot objection above is not the
+  // blocker -- and the standalone gate was green at four chunk sizes.
+  //
+  // IT WAS GREEN BECAUSE IT TESTED NOTHING.  `is_pair` is set by Block for
+  // `ptr` and the standalone gate never sets it, so the guard
+  // (`... && is_pair && ...`) was false in every gate run and `h` stayed
+  // whole.  In the model it is true, and |grad| went 7.54635 -> 2.66972 at
+  // 487.  This is the SECOND time this exact buffer has been chunked, passed
+  // the standalone gate on a branch the gate does not reach, and been caught
+  // by the model.  Next time: gate the branch, not the module.
   __nv_bfloat16* hAt(size_t t0) { return h + t0 * I; }   // h is whole
 
   void alloc(int M_, int C_, cudaStream_t s = nullptr, int factor = 4) {

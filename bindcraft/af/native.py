@@ -16,6 +16,7 @@ install() is a no-op if the library is missing, so an environment without the
 build still runs stock.
 """
 
+import functools
 import os
 import sys
 
@@ -617,6 +618,13 @@ def _register():
     if _registered:
         return
     import ctypes
+    # THE CHUNK THRESHOLD SCALES WITH THE CARD TOO, and it has to be in the
+    # environment BEFORE the library reads it -- nbChunkOn() caches it in a
+    # function-local static on first use, so a later setenv is ignored.  480
+    # is the measured A10 value in PADDED residues (the kernels pad to a
+    # multiple of 32, so a 457 complex arrives as 480); a card with more room
+    # should start chunking later, by the same sqrt as the length limit.
+    os.environ.setdefault('NB_CHUNK_N', str(_chunk_threshold()))
     lib = ctypes.CDLL(_LIB)
     # THE EXPORTED SYMBOL IS THE C++ HANDLER'S NAME, not a snake_case
     # convention: XLA_FFI_DEFINE_HANDLER_SYMBOL(NativeEvoformerFwd, ...)
@@ -681,7 +689,7 @@ def supported_length(n: int) -> bool:
     not mean anything.  BC2_NATIVE_MAX_N overrides it -- raise it on a bigger
     card, where the ceiling is proportionally further out.
     """
-    limit = int(os.environ.get('BC2_NATIVE_MAX_N', 512))
+    limit = _length_limit()
     if n <= limit:
         return True
     if n not in _DECLINED_LENGTHS:
@@ -691,6 +699,67 @@ def supported_length(n: int) -> bool:
               f'does not run out of memory mid-step). BC2_NATIVE_MAX_N raises '
               f'the limit.', flush=True)
     return False
+
+
+# --------------------------------------------------------------- the limit
+# 512 WAS MEASURED ON ONE CARD, and a hardcoded 512 is wrong for every other
+# one.  The native path's footprint is dominated by per-block save sets that
+# are N*N*C -- QUADRATIC in length -- so the ceiling moves with the square
+# root of the memory budget, and an 80 GB card would otherwise decline to JAX
+# at 513 residues and pay 2.6x for nothing.
+#
+# WHY TOTAL AND NOT FREE.  This is asked at TRACE time, before XLA has
+# allocated anything, so a free-VRAM reading describes a moment that has not
+# happened yet.  `bytes_limit` is the device budget XLA will work inside --
+# stable, known up front, and proportional to the card.
+#
+# WHAT IS NOT MODELLED: the part of the footprint that is NOT quadratic --
+# weights, the cuBLASLt workspace, XLA's own pool.  Ignoring it UNDERSTATES
+# the headroom on a card bigger than the A10 (safe) and OVERSTATES it on a
+# smaller one (not), so cards below the measured point take an extra margin.
+#
+# ONLY THE A10 POINT IS MEASURED.  Everything else is this extrapolation.
+# native/length_ladder.py is how to replace a guess with a number, and
+# BC2_NATIVE_MAX_N overrides it outright in either direction.
+_A10_BYTES = 17763631104       # jax bytes_limit on the 23.7 GB A10
+_A10_MAX_N = 512               # measured there, with the interface loss
+
+
+def _device_budget() -> int:
+    """Bytes XLA will work inside on this device, or 0 if it cannot be read."""
+    try:
+        import jax
+        return int(jax.local_devices()[0].memory_stats()['bytes_limit'])
+    except Exception:
+        return 0
+
+
+@functools.lru_cache(maxsize=1)
+def _length_limit() -> int:
+    env = os.environ.get('BC2_NATIVE_MAX_N')
+    if env:
+        return int(env)
+    budget = _device_budget()
+    if not budget:
+        return _A10_MAX_N                      # unreadable: keep the measured one
+    scale = (budget / _A10_BYTES) ** 0.5
+    if scale < 1.0:
+        scale *= 0.9                           # the unmodelled fixed cost bites here
+    # a multiple of 32, because the kernels pad to one anyway
+    n = int(_A10_MAX_N * scale) // 32 * 32
+    return max(128, min(2048, n))
+
+
+@functools.lru_cache(maxsize=1)
+def _chunk_threshold() -> int:
+    """Padded N above which the pair modules chunk themselves."""
+    budget = _device_budget()
+    if not budget:
+        return 480
+    scale = (budget / _A10_BYTES) ** 0.5
+    if scale < 1.0:
+        scale *= 0.9
+    return max(128, min(2048, int(480 * scale) // 32 * 32))
 
 
 _DECLINED_LENGTHS: set = set()
