@@ -654,9 +654,12 @@ def supported_length(n: int) -> bool:
     for the backward replay where XLA rematerialises, so the native path
     needs about 15 GB at 427 residues where JAX peaks at 1.3 GB -- the same
     design choice that makes it 1.6-1.8x faster per step.  Measured on a
-    23.7 GB A10: a 487-residue complex runs, 537 dies in the middle of a
-    step (cublas ALLOC_FAILED, and the site moves -- heads, ipa, quatrigid --
-    because it is a general shortfall, not one fat buffer).
+    23.7 GB A10, re-measured after the shallow stack stopped taking the keep
+    tiers the rest of the step needed: 537 residues RUNS, at 1987 ms, and 587
+    does not (triattn_body.cuh:726).  So the limit is the 544 bucket.  It was
+    512 when the ceiling was 487, and leaving it there cost 3x on exactly the
+    lengths that fix rescued -- 537 took the fallback at 5919 ms when the
+    kernels do it in 1987.
 
     Dying mid-campaign is the worst outcome available, so above the limit
     this declines and JAX runs the span: slower, but it finishes.  The limit
@@ -665,7 +668,7 @@ def supported_length(n: int) -> bool:
     not mean anything.  BC2_NATIVE_MAX_N overrides it -- raise it on a bigger
     card, where the ceiling is proportionally further out.
     """
-    limit = int(os.environ.get('BC2_NATIVE_MAX_N', 512))
+    limit = int(os.environ.get('BC2_NATIVE_MAX_N', 544))
     if n <= limit:
         return True
     if n not in _DECLINED_LENGTHS:
