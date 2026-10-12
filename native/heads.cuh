@@ -81,7 +81,19 @@ struct Heads {
     CU(cudaMalloc(&half, np * NDGRAM * 4));
     CU(cudaMalloc(&dgram, np * NDGRAM * 4));
     CU(cudaMalloc(&pae, np * NPAE * 4));
-    CU(cudaMalloc(&dhalf, np * NDGRAM * 4));
+    // dhalf ALIASES half.  `half` is the distogram's pre-symmetrisation
+    // logits: written by the gemm + addRowBiasK and consumed by symmetriseK,
+    // all three in the forward, dead immediately after.  `dhalf` is its
+    // cotangent: written by symmetriseBwdK and consumed by the gemmNT, both
+    // in the backward.  Same extent (np * NDGRAM * 4), live ranges that
+    // cannot overlap -- the forward rewrites `half` from scratch every call.
+    // 67 MB at N=512.  It does NOT by itself lift the length ceiling -- a
+    // 487-residue complex dies two lines up, in `pae`, with 6 MB free, and
+    // freeing something allocated AFTER the failing malloc cannot help that.
+    // It is kept because the memory is real and the margin is thin: of the
+    // 21.1 GB a 427-residue design holds, ~15 GB is this library's (XLA's
+    // pool is 5.4), so every buffer that need not exist should not.
+    dhalf = half;
     CU(cudaMalloc(&pln, (size_t)N * CS * 4));
     CU(cudaMalloc(&h0, (size_t)N * PL_C * 4));
     CU(cudaMalloc(&h1, (size_t)N * PL_C * 4));
