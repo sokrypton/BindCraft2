@@ -585,6 +585,34 @@ static void gbmm(cublasHandle_t h, bool ta, bool tb, int Mo, int No, int K,
 }
 
 // ---------------------------------------------------------------- the module
+// dnbb's contribution to dx, added in place.  The chunked backward cannot use
+// the fused scatterDxK: that one wants dnbb FINISHED while dKf/dVf are still
+// the chunk's, and dnbb only finishes when every chunk has run.  Splitting the
+// GEMM by columns is exact --
+//     dx = dcomb[:, :QKVG] @ wcat[:QKVG]   (per chunk, in the loop)
+//        + dcomb[:, QKVG:] @ wcat[QKVG:]   (once, here)
+// -- and the second term is a rank-H update with H = 4, so it is cheaper as a
+// kernel than as a GEMM into a 51 MB temp that then has to be added.
+// dnbbF is [H][M]; wnbb is wcat's last H rows, [H][C].
+__global__ void nbbAddDxK(const float* __restrict__ dnbbF,
+                          const __nv_bfloat16* __restrict__ wnbb,
+                          __nv_bfloat16* __restrict__ dx, size_t M, int Hh, int Cc,
+                          int tot, int off) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M * (size_t)Cc) return;
+  const size_t m = i / Cc;
+  const int c = (int)(i % Cc);
+  // wcat is [C][TOT], NOT [TOT][C] -- the prep writes the raw param into wcat
+  // and the TRANSPOSE into wcatT -- so the nbb weight for (h, c) is at
+  // c * TOT + QKVG + h.  Reading it as [TOT][C] gives a gradient that is the
+  // right size and the wrong direction: cos 0.8719, caught by the gate.
+  float acc = 0.f;
+  for (int h = 0; h < Hh; ++h)
+    acc += dnbbF[(size_t)h * M + m] *
+           __bfloat162float(wnbb[(size_t)c * tot + off + h]);
+  dx[i] = __float2bfloat16(__bfloat162float(dx[i]) + acc);
+}
+
 struct TriAttn {
   Lt lt;
   cublasHandle_t cub;
@@ -676,7 +704,8 @@ struct TriAttn {
     size_t mc = (size_t)M * C, mt = (size_t)M * TOT;
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
     B(&x, mc); B(&ag, mc); B(&out, mc);
-    B(&dcomb, mt); B(&dx, mc);
+    B(&dcomb, (size_t)taChunkRows(N_) * N_ * TOT); B(&dx, mc);   // dx stays whole: the
+    // nbb term has to land in it before lnBwd, and that term needs every chunk
     // dag is chunk-sized: the output GEMM writes it and dGateK reads it, both
     // inside one row chunk.  dKf/dVf/dcomb cannot follow -- scatterDxK and
     // nbbScatterK consume them only once dnbb is complete, and dnbb sums over
@@ -706,8 +735,11 @@ struct TriAttn {
     // an instance, 67 MB a block.  nullptr rather than removed, so the
     // parameter still documents what the kernel can do.
     dQf = nullptr;
-    CU(cudaMalloc(&dKf, mc * 4));
-    CU(cudaMalloc(&dVf, mc * 4));
+    // dKf/dVf/dcomb are chunk-sized too.  They are per-row, and with the
+    // column-split GEMM below the scatter that consumes them runs INSIDE the
+    // chunk, so nothing waits for dnbb.  ~413 MB a module at N=448.
+    CU(cudaMalloc(&dKf, (size_t)taRows * N * C * 4));
+    CU(cudaMalloc(&dVf, (size_t)taRows * N * C * 4));
     CU(cudaMalloc(&lseD, (size_t)N * H * N * 4));
     CU(cudaMalloc(&dnbbF, (size_t)H * M * 4));
     if (!envOn("NE_NONDET_NBB")) CU(cudaMalloc(&dnbbI, (size_t)H * M * 8));
@@ -999,13 +1031,11 @@ struct TriAttn {
     // README.  The model is what ships.
     if (!envOn("PROBE_NOZERO")) {
       if (!envOn("TA_ZEROK")) {
-        CU(cudaMemsetAsync(dKf, 0, mc * 4, st));
-        CU(cudaMemsetAsync(dVf, 0, mc * 4, st));
+        // dKf/dVf are zeroed per chunk inside the loop now; dnbb is not --
+        // it sums over every row and must survive the whole loop.
         CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * M * 4, st));
         if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
       } else {
-        zeroFast(dKf, mc * 4, st);
-        zeroFast(dVf, mc * 4, st);
         zeroFast(dnbbF, (size_t)H * M * 4, st);
         if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
       }
@@ -1086,22 +1116,46 @@ struct TriAttn {
                     CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
         PROF_STEP("ta.b gate",
           dGateK<<<Mc, C, 0, st>>>(dag, avH + (size_t)cr0 * N * C,
-            qkvgH + (size_t)cr0 * N * QKVG, davH, dcomb + (size_t)cr0 * N * TOT,
+            qkvgH + (size_t)cr0 * N * QKVG, davH, dcomb,
             lseD + (size_t)cr0 * H * N, N, Mc));
+        if (!envOn("PROBE_NOZERO")) {
+          CU(cudaMemsetAsync(dKf, 0, (size_t)Mc * C * 4, st));
+          CU(cudaMemsetAsync(dVf, 0, (size_t)Mc * C * 4, st));
+        }
         dim3 gc((N + TA_FB::BM - 1) / TA_FB::BM, H, crows);
         PROF_STEP("ta.b flashBwd",
           TA_FB::flashBwdK<true, true, false, true><<<gc, 32 * TA_FB::WARPS, TA_FB::bwdSmem(), st>>>(
             qkvgH + (size_t)cr0 * N * QKVG, 4 * C, biasH, davH,
             lseF + (size_t)cr0 * H * N, lseD + (size_t)cr0 * H * N,
-            mask + (size_t)cr0 * N, nullptr, dQf, dKf + (size_t)cr0 * N * C,
-            dVf + (size_t)cr0 * N * C, N, H,
-            dnbbF, dnbbI, nullptr, 0, dcomb + (size_t)cr0 * N * TOT, TOT));
+            mask + (size_t)cr0 * N, nullptr, dQf, dKf, dVf, N, H,
+            dnbbF, dnbbI, nullptr, 0, dcomb, TOT));
+        // THE SCATTER AND ITS GEMM COME INSIDE THE CHUNK.  dcomb/dKf/dVf hold
+        // only these rows, so they must be consumed before the next chunk --
+        // which is exactly what lets them be chunk-sized.  The nbb columns of
+        // dcomb are still zero here; their contribution is added to dx after
+        // the loop, once dnbb is complete.
+        if (taRows < N) {
+          PROF_STEP("ta.b scatterQKV",
+            scatterQKVK<<<((size_t)Mc * C + 255) / 256, 256, 0, st>>>(
+                nullptr, dKf, dVf, dcomb, Mc, TOT, C));
+          PROF_STEP("ta.b gemm dx",
+            lt.matmul((int)Mc, C, TOT, dcomb, wcat, dx + (size_t)cr0 * N * C,
+                      CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
+        }
       }
     // fixed point -> float, once, in a kernel nothing else races with
     if (dnbbI)
       TA_FB::nbbFromFixedK<<<(int)(((size_t)H * M + 255) / 256), 256, 0, st>>>(
           dnbbI, dnbbF, (size_t)H * M);
     }
+    // CHUNKED: the scatter and its GEMM already ran, inside each chunk, on the
+    // QKVG columns alone.  All that is left is dnbb's term, which could not be
+    // added until every chunk had contributed to it.
+    if (taRows < N) {
+      PROF_STEP("ta.b nbbAddDx",
+        nbbAddDxK<<<(size_t)(mc + 255) / 256, 256, 0, st>>>(
+            dnbbF, wcat, dx, M, H, C, TOT, QKVG));
+    } else
     // TA_SPLIT runs the old scatter-then-GEMM pair, which is the A/B this was
     // decided on and the fallback if a card ever disagrees.
     if (envOn("TA_SPLIT")) {
