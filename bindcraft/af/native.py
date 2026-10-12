@@ -660,7 +660,13 @@ def supported_length(n: int) -> bool:
     half the size; under them 537 runs.  Add interface_contacts -- which is
     what a binder campaign actually optimises -- and the complex's distogram
     comes into the backward, the step roughly doubles, and 487 dies in
-    ipa.cuh:558.  Measured with it: 457 runs at 5988 ms, 487 does not.
+    ipa.cuh:558.  Measured with it: 457 runs at 5988 ms, 487 did not.
+
+    487-512 RUN NOW, because the three big pair modules chunk themselves
+    above 457 residues (nbChunkOn in common.cuh).  487 was a 16320 ms JAX
+    failover and is 7078 ms native; 512 is 7279.  The ceiling is 512 because
+    522 and 532 die in triangle attention's own whole-module buffers, which
+    chunking does not reach.
 
     A limit that is too HIGH is a crash in the middle of a campaign, which is
     the thing this exists to prevent; too low is a slower run.  So it is set
@@ -675,7 +681,7 @@ def supported_length(n: int) -> bool:
     not mean anything.  BC2_NATIVE_MAX_N overrides it -- raise it on a bigger
     card, where the ceiling is proportionally further out.
     """
-    limit = int(os.environ.get('BC2_NATIVE_MAX_N', 480))
+    limit = int(os.environ.get('BC2_NATIVE_MAX_N', 512))
     if n <= limit:
         return True
     if n not in _DECLINED_LENGTHS:

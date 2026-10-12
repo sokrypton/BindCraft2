@@ -125,7 +125,8 @@ struct StructureModule {
 
   void backward(const float* dact, const float* drout, const float* dtout,
                 const float* single, float* dsingle, float* dpair,
-                const float* datom = nullptr, const float* aatype = nullptr) {
+                const float* datom = nullptr, const float* aatype = nullptr,
+                bool acc_pair = false) {
     size_t nc = (size_t)N * C;
     int gc = (int)((nc + 255) / 256);
     stack.backward(dact, drout, dtout, act0, pairN, dact0, dpairN, drot0,
@@ -143,8 +144,15 @@ struct StructureModule {
                     dact0, C, &beta, dinitial, C));
     foldit::lnBwdK<><<<(N + 7) / 8, 256, 0, st>>>(dinitial, single, lnS, muS,
                                                   rsS, dsingle, N);
-    foldit::lnBwdK<CZ><<<((size_t)N * N + 7) / 8, 256, 0, st>>>(
-        dpairN, pairIn, lnP, muP, rsP, dpair, (int)((size_t)N * N));
+    // `acc_pair`: add into dpair rather than overwrite it, so a caller that
+    // already has another module's share sitting there does not have to copy
+    // it aside.  ffi.cu's post-trunk backward is the one that does.
+    if (acc_pair)
+      foldit::lnBwdK<CZ, true><<<((size_t)N * N + 7) / 8, 256, 0, st>>>(
+          dpairN, pairIn, lnP, muP, rsP, dpair, (int)((size_t)N * N));
+    else
+      foldit::lnBwdK<CZ, false><<<((size_t)N * N + 7) / 8, 256, 0, st>>>(
+          dpairN, pairIn, lnP, muP, rsP, dpair, (int)((size_t)N * N));
     (void)gc;
   }
 };

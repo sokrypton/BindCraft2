@@ -64,7 +64,13 @@ __global__ void lnFwdK(const float* __restrict__ x, const float* __restrict__ sc
   for (int c = lane; c < C; c += 32) Y[c] = (X[c] - m) * r * scale[c] + offset[c];
 }
 
-template <int C = foldit_C>
+// ACC adds into `dx` instead of overwriting it.  It exists so that
+// structmod::backward can hand its pair gradient straight into the buffer the
+// HEADS already wrote theirs into -- see ffi.cu, where that used to cost a
+// full f32 copy of dpair aside and a second pass to add it back (139 MB and
+// two 139 MB passes at N=522).  It is OFF by default because the standalone
+// gates hand in a fresh, UNZEROED dpair; accumulating into that is garbage.
+template <int C = foldit_C, bool ACC = false>
 __global__ void lnBwdK(const float* __restrict__ dy, const float* __restrict__ x,
                        const float* __restrict__ scale, const float* __restrict__ mu,
                        const float* __restrict__ rstd, float* __restrict__ dx,
@@ -90,7 +96,8 @@ __global__ void lnBwdK(const float* __restrict__ dy, const float* __restrict__ x
   float* DX = dx + (size_t)row * C;
   for (int c = lane; c < C; c += 32) {
     float g = DY[c] * scale[c];
-    DX[c] = r * (g - s1 - (X[c] - m) * r * s2);
+    float v = r * (g - s1 - (X[c] - m) * r * s2);
+    DX[c] = ACC ? DX[c] + v : v;
   }
 }
 

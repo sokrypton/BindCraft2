@@ -628,7 +628,14 @@ struct TriAttn {
   // to f16 and wrote qkvgH directly; `av`/`dav` went when dGateK started
   // reading and writing half.  776 MB across the two triangle attentions,
   // allocated every run and touched by nothing.
-  __nv_bfloat16 *x, *ag, *out;
+  // `x` WAS HERE AND IT WAS DEAD.  The module allocated M*C bf16 -- 70 MB an
+  // instance at N=522, 139 MB across the trunk's two and as much again in the
+  // template stack -- and then never read or wrote it: the input LayerNorm
+  // writes the HALF `xh`, which is already chunk-sized, and nothing else ever
+  // wanted a bf16 copy.  It survived because an unused pointer costs nothing
+  // but memory and memory is the thing nobody was counting.  Found while
+  // listing what triangle attention holds at the length ceiling.
+  __nv_bfloat16 *ag, *out;
   half *xh = nullptr, *wqkvgTh = nullptr, *bqkvgH = nullptr,
        *wnbbTh = nullptr, *nbbMH = nullptr;
   __nv_bfloat16 *dcomb, *dag, *dx;
@@ -689,9 +696,11 @@ struct TriAttn {
   // module did before.  Measured on the standalone gate at N=128: a chunk of
   // N/2 and N/4 are bit-identical to the unchunked run and cost 0% and 1.9%;
   // N/8 costs 12.7%.
+  // Unset, it follows nbChunkOn(): N/4 above the threshold, whole below.
+  // TA_ROWS overrides at any length; TA_ROWS=0 forces it off.
   static int taChunkRows(int n) {
     const char* e = getenv("TA_ROWS");
-    const int r = e ? atoi(e) : 0;
+    const int r = e ? atoi(e) : (nbChunkOn((size_t)n) ? n / 4 : 0);
     return (r > 0 && r < n) ? r : n;
   }
 
@@ -703,7 +712,11 @@ struct TriAttn {
     CUB(cublasSetStream(cub, st));
     size_t mc = (size_t)M * C, mt = (size_t)M * TOT;
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
-    B(&x, mc); B(&ag, mc); B(&out, mc);
+    // `ag` is CHUNK-SIZED.  It is the gated attention output on its way into
+    // the output projection, and both ends of that journey now happen inside
+    // one row chunk -- see flashRows and forward().  70 MB an instance at
+    // N=522.  `out` is the module's output and stays whole.
+    B(&ag, (size_t)taChunkRows(N_) * N_ * C); B(&out, mc);
     B(&dcomb, (size_t)taChunkRows(N_) * N_ * TOT); B(&dx, mc);   // dx stays whole: the
     // nbb term has to land in it before lnBwd, and that term needs every chunk
     // dag is chunk-sized: the output GEMM writes it and dGateK reads it, both
@@ -758,7 +771,13 @@ struct TriAttn {
     size_t mc = (size_t)M * C;
     CU(cudaMalloc(&pairT, mc * 2)); CU(cudaMalloc(&outT, mc * 2));
     CU(cudaMalloc(&maskT, (size_t)M * 4));
-    CU(cudaMalloc(&doutT, mc * 4)); CU(cudaMalloc(&dpairT, mc * 4));
+    // `doutT` IS ALLOCATED ON FIRST USE, and on the default path there is
+    // never one.  It stages the ENDING node's f32 cotangent transpose, which
+    // only the !narrow path does -- with the bf16 chain (BLK_BF16CHAIN, the
+    // default) the transpose goes straight into `dx` and this is 139 MB at
+    // N=522 that is allocated and never touched.  `dpairT` is used on BOTH
+    // paths and stays f32: lnBwd writes it and transposePairOut narrows it.
+    CU(cudaMalloc(&dpairT, mc * 4));
   }
 
   // Same argument as tri-mul's: every d* here is internal to backward(),
@@ -873,8 +892,17 @@ struct TriAttn {
   // launches costs in speed.
   void flashRows(const half* qkvg, const half* bias, const float* mask,
                  half* outHp, half* avHp, float* lseFp) {
-    static const int chunk = getenv("TA_ROWS") ? atoi(getenv("TA_ROWS")) : 0;
-    const int step = (chunk > 0 && chunk < N) ? chunk : N;
+    // THE MODULE'S OWN taRows, NOT A SECOND READ OF THE ENVIRONMENT.  This
+    // line used to call getenv("TA_ROWS") itself, which was harmless only
+    // while the env var was the only way chunking could be on.  The moment
+    // alloc() can also decide from nbChunkOn(), a direct read here sizes the
+    // BUFFERS one way and the LAUNCHES the other: the whole row grid runs
+    // into chunk-sized scratch.  It does not come out as a wrong gradient --
+    // it comes out as "lt.cuh:152 cublasLt: 15" from a GEMM whose shapes no
+    // longer agree -- but only because this module happens to hit cuBLAS
+    // first.  `static` made it worse still, caching the first instance's
+    // answer for every later one.
+    const int step = (taRows > 0 && taRows < N) ? taRows : N;
     // THE CALLER OFFSETS THE DATA POINTERS.  Inside the kernel the row is
     // `rl = blockIdx.y % rowsHere` and outAt()/base index with rl, NOT with
     // the absolute `r = r0 + rl` -- r0 reaches only the mask and the bias.
@@ -892,7 +920,13 @@ struct TriAttn {
       // outH is chunk-sized: widen it into `ag` before the next chunk lands on
       // it.  (The haveFlash path rebuilds `ag` from avH instead and never
       // touches outH, so it stays outside this loop.)
-      halfToBf16K<<<(mcc + 255) / 256, 256, 0, st>>>(outHp, ag + (size_t)r0 * N * C, mcc);
+      halfToBf16K<<<(mcc + 255) / 256, 256, 0, st>>>(outHp, ag, mcc);
+      // AND PROJECT IT NOW, while it is still this chunk's.  `ag` is
+      // chunk-sized, so the output GEMM cannot wait until after the loop the
+      // way it used to -- the next chunk would overwrite its input.
+      lt.matmul(rows * N, C, C, ag, woT,
+                (ending ? outT : out) + (size_t)r0 * N * C, CUDA_R_16BF,
+                CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st);
     }
   }
 
@@ -969,13 +1003,21 @@ struct TriAttn {
                                  /*ors*/ (size_t)H * 32, /*ops*/ (size_t)N * H * 32)
           : flashRows(qkvgH, biasH, mask, outH, avH, lseF));
     if (haveFlash)
-      // outH was never written this pass, so rebuild the gated output from avH
-      PROF_STEP("ta.f gateFromAv",
-        gateFromAvK<<<(mc + 255) / 256, 256, 0, st>>>(avH, qkvgH, ag, M));
-    // (the !haveFlash path widened outH into `ag` inside flashRows, per chunk)
-    PROF_STEP("ta.f gemm out",
-      lt.matmul(M, C, C, ag, woT, ending ? outT : out, CUDA_R_16BF,
-              CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st));
+      // outH was never written this pass, so rebuild the gated output from
+      // avH -- and project it -- a chunk at a time, mirroring flashRows.
+      for (int r0 = 0; r0 < N; r0 += taRows) {
+        const int rows = (N - r0 < taRows) ? (N - r0) : taRows;
+        const size_t mcc = (size_t)rows * N * C;
+        PROF_STEP("ta.f gateFromAv",
+          gateFromAvK<<<(mcc + 255) / 256, 256, 0, st>>>(
+              avH + (size_t)r0 * N * C, qkvgH + (size_t)r0 * N * QKVG, ag,
+              (size_t)rows * N));
+        PROF_STEP("ta.f gemm out",
+          lt.matmul(rows * N, C, C, ag, woT,
+                    (ending ? outT : out) + (size_t)r0 * N * C, CUDA_R_16BF,
+                    CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st));
+      }
+    // (the !haveFlash path widened AND projected each chunk inside flashRows)
     if (ending) transposePairVec(outT, out, N, C * 2, st);
   }
 
@@ -1007,6 +1049,7 @@ struct TriAttn {
         PROF_STEP("ta.b transpose", transposePairVec(doutIn, dx, N, C * 2, st));
         dxin = dx;
       } else {
+        if (!doutT) CU(cudaMalloc(&doutT, (size_t)M * C * 4));
         transposePairVec(doutIn, doutT, N, C * 4, st);
         dout = doutT;
       }

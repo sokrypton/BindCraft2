@@ -1100,9 +1100,11 @@ struct TriMul {
   //
   // Rounding to 1024 gives both, and leaves the tail chunk a multiple of 1024
   // as well.
-  static size_t tmChunk(size_t m) {
+  // Unset, it follows nbChunkOn(): M/16 above the threshold, whole below.
+  // TM_ROWS overrides at any length; TM_ROWS=0 forces it off.
+  static size_t tmChunk(size_t m, size_t n) {
     const char* e = getenv("TM_ROWS");
-    size_t r = e ? (size_t)atoll(e) : 0;
+    size_t r = e ? (size_t)atoll(e) : (nbChunkOn(n) ? m / 16 : 0);
     r &= ~(size_t)1023;
     return (r > 0 && r < m) ? r : m;
   }
@@ -1121,7 +1123,7 @@ struct TriMul {
     // with the grid's own M; both are A/B fallbacks, and teaching them the
     // two-stride convention buys nothing.  Asking for both is not an error,
     // it just runs one chunk.
-    tmRows = (split_cdx || !three_pass) ? (size_t)M : tmChunk((size_t)M);
+    tmRows = (split_cdx || !three_pass) ? (size_t)M : tmChunk((size_t)M, (size_t)N_);
     const size_t rc = tmRows * C, ri = tmRows * I;
     // MEASURED, NOT ASSUMED: computing `pre` in row blocks small enough to keep
     // the GEMM's output in L2 (so the gate kernel reads it back from cache

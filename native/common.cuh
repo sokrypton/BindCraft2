@@ -35,6 +35,51 @@ inline bool envOn(const char* name) {
   return envOnDef(name, false);
 }
 
+// ------------------------------------------------------------ auto-chunking
+// ONE DECISION, FROM N, BEFORE ANYTHING ALLOCATES.
+//
+// Triangle attention, both tri-muls and the pair transition can each run a
+// chunk of their N^2 rows at a time instead of materialising every
+// intermediate whole.  Each is exact -- no replay, no cross-chunk accumulator
+// -- and each costs a few percent.  This says WHEN to do it.
+//
+// THE DECISION CANNOT BE PER-MODULE, and that is the whole reason this lives
+// here rather than in three `alloc()`s.  The tempting version is for each
+// module to call cudaMemGetInfo and chunk if memory looks tight.  That is the
+// greedy first grant wearing a new hat: it is what the shallow extra-MSA
+// stack did when it sized its keep-tier margin from its own depth, granted
+// itself 3.66 GB and starved the trunk, the structure module and the heads.
+// Whichever module allocates FIRST always sees plenty free, so it would not
+// chunk and the last one would still run out -- and the chunk size would then
+// depend on allocation ORDER, so a run would not reproduce.  One threshold,
+// read before the first cudaMalloc, has neither problem.
+//
+// THE NUMBER IS A PADDED N, AND GETTING THAT WRONG COSTS A WHOLE BUCKET.
+// Every caller pads to a multiple of 32 (`pad = (-n) % 32`, four places in
+// bindcraft/af/native.py), so these modules are never handed the complex's
+// real length: a 457-residue complex arrives here as 480.  The threshold was
+// first set to 457, the longest complex measured to fit unchunked -- and that
+// complex then chunked anyway, because 480 > 457.  It cost nothing but 3% and
+// a |grad| that moved in the fourth digit (7.24374 -> 7.24925, the keep tiers
+// granting differently once the chunking freed room), which is exactly why it
+// would have shipped unnoticed.  480 is the same measurement expressed in the
+// units this function is actually called with.
+//
+// MEASURED on a 23.7 GB A10 with a real target and the interface loss:
+// complex 457 (padded 480) is the longest that fits unchunked, and complex
+// 512 (padded 512) the longest that fits chunked.  Below the threshold
+// nothing changes at all -- chunking costs 0.7-8.5% and buys nothing when the
+// step already fits.
+//
+// NB_CHUNK_N moves the threshold (0 disables chunking entirely); each
+// module's own knob -- TM_ROWS, TA_ROWS, TR_ROWS -- still overrides the chunk
+// SIZE outright, at any length.
+inline bool nbChunkOn(size_t n) {
+  static const char* e = getenv("NB_CHUNK_N");
+  static const size_t thresh = e ? (size_t)atoll(e) : 480;
+  return thresh > 0 && n > thresh;
+}
+
 
 #define CU(x)                                                                  \
   do {                                                                         \

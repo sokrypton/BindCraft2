@@ -358,9 +358,16 @@ struct Trans {
   // dy/dr/dxn live inside one phase and become chunk-sized with no replay;
   // `h` crosses into the backward (maskDxK reads it unless KEEP_RELU supplied
   // the sign bits) and `out` is the module's output, so both stay whole.
-  static size_t trChunk(size_t m) {
+  // Unset, it follows nbChunkOn(): M/8 above the threshold, whole below --
+  // and only for the PAIR transition, whose M is N*N.  The MSA transition's
+  // M is S*N, it is 2.2 ms of the stack, and `n` would be meaningless there.
+  // TR_ROWS overrides at any length; TR_ROWS=0 forces it off.
+  static size_t trChunk(size_t m, bool pair) {
     const char* e = getenv("TR_ROWS");
-    const size_t r = e ? (size_t)atoll(e) : 0;
+    size_t r;
+    if (e) r = (size_t)atoll(e);
+    else if (pair && nbChunkOn((size_t)llround(sqrt((double)m)))) r = m / 8;
+    else r = 0;
     return (r > 0 && r < m) ? r : m;
   }
 
@@ -371,7 +378,7 @@ struct Trans {
     M = M_; C = C_; I = factor * C; st = s;
     lt.init();
     size_t mc = (size_t)M * C, mi = (size_t)M * I;
-    trRows = trChunk((size_t)M);
+    trRows = trChunk((size_t)M, is_pair);
     const size_t cc = trRows * C, ci = trRows * I;
     CU(cudaMalloc(&xn, cc * 2));
     // h STAYS WHOLE.  Making it chunk-sized and having the backward read the
