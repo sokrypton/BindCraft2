@@ -250,7 +250,16 @@ struct Stack {
     // right option for anyone with room.  NE_KEEP_ACTS=1.
     if (const char* kb = getenv("KEEP_BUDGET_MB"))
       budget = (size_t)atoll(kb) * 1000000;
-    const bool no_keep = envOn("NO_FLASH_KEEP");
+    // DEFER THE KEEP, which is what a trace-time prealloc needs.  alloc()
+    // sizes the tiers from cudaMemGetInfo, and at trace time the card is
+    // EMPTY -- so a stack built then grants itself everything and the step
+    // that follows has nothing.  Measured: the N=192 depth-48 stack took
+    // 6.10 GB preallocated against 0.84 lazily, and the N=576 pair-only
+    // 7.48 against 4.30.  With this set the prealloc takes only what the
+    // block cannot run without, and regrant() -- which exists for exactly
+    // this, and runs on the first save forward once XLA has stopped growing
+    // -- hands out the tiers from what is genuinely spare.
+    const bool no_keep = envOn("NO_FLASH_KEEP") || defer_keep;
     // NO_FLASH_KEEP keeps its old meaning -- drop EVERYTHING -- because it is
     // what the scaling sweep and the L=384 fallback measurement used, and a
     // flag that silently started meaning "drop one tier" would make those
@@ -641,6 +650,7 @@ struct Stack {
   // is real and measured, and because the next attempt should start from this
   // evidence rather than rediscover it.
   bool graph_on = envOn("STACK_GRAPH_UNSAFE");
+  bool defer_keep = false;   // set before alloc(); see the first grant
   bool save_probe = envOn("SAVE_BF16");  // missed by the envOn sweep
 
   // CAPTURE ON THE SECOND CALL, NOT THE FIRST.  The obvious shape -- run it

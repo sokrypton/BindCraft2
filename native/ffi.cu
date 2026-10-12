@@ -114,7 +114,8 @@ double now_ms() {
 }
 
 stack::Stack* get(int N, int S, int depth, const std::string& dir,
-                  bool pair_only, bool opm_first, bool dropout) {
+                  bool pair_only, bool opm_first, bool dropout,
+                  bool defer_keep = false) {
   std::lock_guard<std::mutex> lk(g_mu);
   Oracle*& w = g_weights[dir];
   if (!w) w = new Oracle(dir);
@@ -154,6 +155,9 @@ stack::Stack* get(int N, int S, int depth, const std::string& dir,
   // dropout decides whether alloc() reserves the two mask scratches, so it
   // has to be set before alloc and it has to be in the key
   s->b.use_dropout = dropout;
+  // a stack built at trace time takes only the mandatory buffers; the keep
+  // tiers come from regrant(), once XLA has stopped growing
+  s->defer_keep = defer_keep;
   if (pair_only) s->b.do_msa = false;
   s->alloc(N, S, depth);
   s->setWeights(*w);
@@ -770,6 +774,78 @@ ffi::Error TeBwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> ct,
 }
 
 }  // namespace
+
+// BUILD THE STACK AT TRACE TIME, BEFORE XLA HAS ALLOCATED ANYTHING.
+//
+// The block scratch is 4-5 GB at these lengths, and whether it fits is
+// decided by WHO ALLOCATES FIRST.  Measured on the A10 with BLK_MEM, two
+// complexes that differ only in length:
+//
+//   552  the two binder_alone stacks run first, XLA then grows to 17.83 GB
+//        in use, and the complex stack takes its 4.30 GB out of the 5.86
+//        that is left.  The structure module gets 1.47 GB and dies.
+//   587  the COMPLEX stack runs first and takes 4.79 GB with 13.64 GB free.
+//        Everything after it fits, at a LONGER length.
+//
+// Nothing about 552 is bigger.  The order of the two predictions in the
+// step decided it, and that order is not ours to choose from in here.  So
+// the caller says, at TRACE time -- when XLA has allocated nothing at all
+// and the whole card is free -- which stacks the step is going to use, and
+// they are built then.  `get()` caches on the same key the FFI call will
+// use, so the call that follows finds this one rather than making a second.
+//
+// This is NOT the trace-time ballast that was refuted last session.  That
+// held memory nobody would use and XLA grew into whatever was left; this
+// allocates the exact buffers the step is about to run on.  There is
+// nothing to release and nothing to get the release point wrong.
+//
+// It returns 0 on success and prints what it did, because the whole family
+// of defects here is silent: see the five in CHUNK_REPLAY.md.  It is also
+// OUTSIDE the anonymous namespace above, which is where one of those five
+// died -- `extern "C"` inside it exports nothing and `nm -D` says so.
+extern "C" int native_stack_prealloc(int N, int S, int depth,
+                                     const char* weights_dir, int pair_only,
+                                     int opm_first, int dropout) {
+  size_t fb0 = 0, tb = 0;
+  if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) {
+    fprintf(stderr, "native: prealloc N=%d could not read the device\n", N);
+    return 1;
+  }
+  get(N, S, depth, std::string(weights_dir), pair_only != 0, opm_first != 0,
+      dropout != 0, /*defer_keep*/true);
+  size_t fb1 = 0;
+  cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr,
+          "native: prealloc N=%d S=%d depth=%d pair_only=%d took %.2f GB "
+          "(%.2f of %.2f GB free after)\n",
+          N, S, depth, pair_only, (fb0 - fb1) / 1e9, fb1 / 1e9, tb / 1e9);
+  return 0;
+}
+
+// THE TEMPLATE PAIR STACK WAS TRIED HERE AND IS NOT PREALLOCATED.
+//
+// Once the evoformer stacks stopped racing, 617 and 647 started dying in
+// tplblock/tplstack instead, so the obvious next move was to build the
+// template stack at trace time too.  MEASURED, AND IT IS A REGRESSION: it
+// takes 2.97 GB at N=608 and 3.58 at N=672 before XLA has allocated, and
+//
+//   617  moved from tplstack to trimul_body -- still out of memory
+//   647  still out of memory
+//   600, 608  structure module, as before
+//   577  structmod.cuh:68 -- WAS PASSING
+//   587  ipa.cuh:534      -- WAS PASSING
+//
+// It bought nothing above 587 and cost the two lengths just below it.  The
+// difference from the evoformer stacks is that the template stack is not
+// on the critical path for the big allocation: taking its 3 GB early only
+// moves the squeeze onto the structure module, which allocates last and
+// has no keep tiers to give back.
+//
+// There is a second reason not to extend this family further: `sm_get`,
+// `emb_get` and `te_get` key their caches on the CUDA STREAM, and at trace
+// time there is no XLA stream to pass.  Preallocating those with a null
+// stream builds a second copy the real call never finds, which is worse
+// than being late.
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     NativeEvoformerFwd, FwdImpl,
