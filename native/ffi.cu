@@ -1,3 +1,4 @@
+#include <set>
 // The CUDA Evoformer stack as an XLA custom call, so JAX can run it.
 //
 // Two handlers, one a VJP of the other:
@@ -177,6 +178,32 @@ ffi::Error FwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> pair,
                    ffi::Result<ffi::Buffer<ffi::F32>> msa_out,
                    ffi::Result<ffi::Buffer<ffi::BF16>> psave,
                    ffi::Result<ffi::Buffer<ffi::F32>> msave) {
+  // BLK_MEM: WHAT XLA HANDED US, ONCE PER SHAPE.  The 7.59 GB that appears
+  // before the N=522 main stack allocates is mostly on this side of the FFI,
+  // and these are the buffers it consists of -- measuring them beats guessing
+  // at them, which is what the note in CHUNK_REPLAY.md asks for.
+  if (envOn("BLK_MEM")) {
+    static std::set<std::pair<long long, long long>> seen_shape;
+    auto key = std::make_pair((long long)pair.size_bytes(),
+                              (long long)psave->size_bytes());
+    if (seen_shape.insert(key).second) {
+      size_t fb = 0, tb = 0; cudaMemGetInfo(&fb, &tb);
+      auto gb = [](size_t b) { return b / 1e9; };
+      fprintf(stderr,
+              "ffi fwd buffers: pair %.2f  msa %.2f  masks %.2f  pair_out %.2f"
+              "  msa_out %.2f  PSAVE %.2f  msave %.2f  = %.2f GB"
+              "   (free %.2f of %.2f)\n",
+              gb(pair.size_bytes()), gb(msa.size_bytes()),
+              gb(pair_mask.size_bytes() + msa_mask.size_bytes()),
+              gb(pair_out->size_bytes()), gb(msa_out->size_bytes()),
+              gb(psave->size_bytes()), gb(msave->size_bytes()),
+              gb(pair.size_bytes() + msa.size_bytes() + pair_mask.size_bytes()
+                 + msa_mask.size_bytes() + pair_out->size_bytes()
+                 + msa_out->size_bytes() + psave->size_bytes()
+                 + msave->size_bytes()),
+              gb(fb), gb(tb));
+    }
+  }
   auto pd = pair.dimensions(), md = msa.dimensions();
   if (pd.size() != 3 || md.size() != 3)
     return ffi::Error::InvalidArgument("pair must be [N,N,Cz], msa [S,N,Cm]");

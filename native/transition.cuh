@@ -385,7 +385,20 @@ struct Trans {
   // 487.  This is the SECOND time this exact buffer has been chunked, passed
   // the standalone gate on a branch the gate does not reach, and been caught
   // by the model.  Next time: gate the branch, not the module.
-  __nv_bfloat16* hAt(size_t t0) { return h + t0 * I; }   // h is whole
+  // `h` IS CHUNK-SIZED when the backward can take the relu sign from `hbit`:
+  // the pair width, chunking on, and not the TR_SPLIT fallback (whose
+  // maskByReluK reads h itself).  279 MB at N=522 and what 522 is short by.
+  //
+  // ATTEMPT FOUR.  The first three failed against an `hbit` whose chunk
+  // offset was four times too far -- see the note below -- so every one of
+  // them was testing a broken buffer, not this idea.
+  //
+  // GATE IT AT 215 WITH TR_ROWS FORCED, NOT AT 487.  The branch is reachable
+  // only in the model: `is_pair` is set by Block for `ptr` and no standalone
+  // harness sets it, so a standalone gate runs the OLD path and reports green
+  // whatever this does.  That is how it shipped broken once already.
+  bool h_chunked = false;
+  __nv_bfloat16* hAt(size_t t0) { return h_chunked ? h : h + t0 * I; }
 
   void alloc(int M_, int C_, cudaStream_t s = nullptr, int factor = 4) {
     M = M_; C = C_; I = factor * C; st = s;
@@ -402,7 +415,8 @@ struct Trans {
     // illegal access surfacing in trimul_body and opm -- somewhere else
     // entirely, asynchronously.  Freeing it needs the keep-slot contract
     // changed too, which is a bigger change than it is worth here.
-    CU(cudaMalloc(&h, mi * 2));
+    h_chunked = trRows < (size_t)M && is_pair && C_ == 128 && !split_mask;
+    CU(cudaMalloc(&h, (h_chunked ? trRows * I : mi) * 2));
     CU(cudaMalloc(&out, mc * 2));
     CU(cudaMalloc(&dy, cc * 2));
     CU(cudaMalloc(&dr, ci * 2));
@@ -470,10 +484,29 @@ struct Trans {
       PROF_STEP("tr.f gemm1+relu",
         lt.matmul((int)tm, I, C, xn, w1t, hAt(t0), CUDA_R_16BF,
                   CUBLASLT_EPILOGUE_RELU_BIAS, b1, nullptr, st));
-      if (want_mask && hbit)
+  // THE CHUNK OFFSET INTO `hbit` IS IN WORDS, NOT BYTES, and it was bytes.
+  // hbit is `unsigned*` holding one bit an element -- packReluMaskK writes
+  // bits[i >> 5] -- so a chunk starting at element t0*I starts at WORD
+  // t0*I/32.  Every call site said `hbit + t0 * I / 8`, which on an unsigned*
+  // advances four times too far and runs off the end of an mi/8-BYTE
+  // allocation.
+  //
+  // IT NEVER FIRED, which is why it shipped.  packReluMaskK runs only when
+  // `have(KEEP_RELU, i) && save_full`, so it needs the relu tier granted AND
+  // chunking on at the same time; in every length measured the tier granted 0
+  // of 48 and the pack was skipped.  Forcing the pack (the `h` bisect) is
+  // what exposed it, as an illegal access surfacing at a cudaFree in
+  // stack.cuh -- somewhere else entirely, asynchronously.
+      // TR_PACK=1 forces the pack without touching use_bits, so the answer
+      // must stay correct.  It is how the offset bug above was found and it
+      // is how the fix is checked: without it the pack never runs at a
+      // chunked depth and the bug is invisible.
+      // ALWAYS when h is chunk-sized: the backward has no other way to learn
+      // the relu sign, because h itself will be gone.
+      if ((want_mask || h_chunked || (is_pair && envOn("TR_PACK"))) && hbit)
         PROF_STEP("tr.f packMask",
           packReluMaskK<<<(ti + 255) / 256, 256, 0, st>>>(hAt(t0),
-              hbit + t0 * I / 8, ti));
+              hbit + t0 * I / 32, ti));
       if (!tail) continue;
       PROF_STEP("tr.f gemm2",
         lt.matmul((int)tm, C, I, hAt(t0), w2t, out + t0 * C, CUDA_R_16BF,
@@ -490,6 +523,7 @@ struct Trans {
   // `use_bits`: the relu sign came from KEEP_RELU and `h` was never rebuilt.
   void backward(const DT* dout, const __nv_bfloat16* x, DT* dx,
                 bool acc = false, bool use_bits = false) {
+    use_bits = use_bits || h_chunked;   // a chunked h leaves no choice
     size_t mc = (size_t)M * C, mi = (size_t)M * I;
     // SAME CHUNKS AS THE FORWARD.  dy/dr/dxn are chunk-sized and used at
     // base; h, hbit, mu, rstd and the caller's dout/x/dx are whole and
@@ -527,10 +561,10 @@ struct Trans {
       PROF_STEP("tr.b maskDx",
         if (use_bits)
           maskDxK<128, true><<<(tm + BMD - 1) / BMD, 32 * WD, maskDxSmem(), st>>>(
-              dr, hAt(t0), hbit + t0 * I / 8, w1t, dxn, tm, I);
+              dr, hAt(t0), hbit + t0 * I / 32, w1t, dxn, tm, I);
         else
           maskDxK<128, false><<<(tm + BMD - 1) / BMD, 32 * WD, maskDxSmem(), st>>>(
-              dr, h + t0 * I, hbit + t0 * I / 8, w1t, dxn, tm, I);
+              dr, h + t0 * I, hbit + t0 * I / 32, w1t, dxn, tm, I);
         CU(cudaGetLastError()));
     } else {
       maskByReluK<<<(ti + 255) / 256, 256, 0, st>>>(dr, hAt(t0), ti);
