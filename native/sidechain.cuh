@@ -142,6 +142,10 @@ struct Sidechain {
                     Nn, &beta, D, K));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const std::string& nm, float** dst, size_t cnt) {
       // THE PREFIX IS THE DUMP'S.  A --part sc dump builds these Linears at

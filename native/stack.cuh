@@ -230,6 +230,14 @@ struct Stack {
     // before the change: 552 foldit cublas:3, 567 ipa OOM, 587 foldit OOM,
     // all reproducible twice.  The number is a proxy for "the rest of the
     // step", not for the save-set it is written in terms of.
+    //
+    // AND IT IS DEAD FOR A PREALLOCATED STACK.  `margin` only ever reaches
+    // `budget`, and `budget` only feeds the keep-tier loop below, which
+    // `defer_keep` skips outright -- so a stack built by
+    // native_stack_prealloc never reads this number.  It still governs the
+    // stacks nobody preallocated (NB_NO_PREALLOC, or a shape the trace did
+    // not announce), which is why the measurement above still stands and
+    // why this is not the place to go looking for memory.
     if (depth <= 8) margin += np * 2 * 48;
     size_t budget = freeb > margin ? freeb - margin : 0;
     // KEEP_BUDGET_MB FORCES the budget, so the partial-grant path can be

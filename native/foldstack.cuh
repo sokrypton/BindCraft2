@@ -56,6 +56,11 @@ struct FoldStack {
     CU(cudaMalloc(&dtransS, (size_t)N * 3 * 4));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s;
+    for (auto& f : it) f.setStream(s);
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     it[0].setWeights(o, P);
     for (int i = 1; i < depth; ++i) it[i].shareWeights(it[0]);

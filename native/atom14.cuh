@@ -330,6 +330,10 @@ struct Atom14 {
 
   // the tables are AF2's own constants and travel in the dump; see the note
   // in oracle_ipa.py about why they are not re-derived here.
+  void setStream(cudaStream_t s) {
+    st = s;
+  }
+
   void setTables(Oracle& o) {
     auto get = [&](const char* k, float** dst) {
       Tensor& t = o[k];

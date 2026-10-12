@@ -191,6 +191,10 @@ struct QuatRigid {
     CU(cudaMalloc(&dtransu, n * 3 * 4));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const char* name, float** dst, size_t cnt) {
       Tensor& t = o[P + name];
