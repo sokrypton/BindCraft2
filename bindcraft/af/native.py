@@ -649,8 +649,35 @@ def supported_length(n: int) -> bool:
     and a key that has been used cannot be handed to the JAX fallback -- it
     raises 'Random key has been used previously'.  So support is decided
     first and the key is touched only on the path that will use it.
+
+    Length is also where the kernels STOP.  They hold a save-set per block
+    for the backward replay where XLA rematerialises, so the native path
+    needs about 15 GB at 427 residues where JAX peaks at 1.3 GB -- the same
+    design choice that makes it 1.6-1.8x faster per step.  Measured on a
+    23.7 GB A10: a 487-residue complex runs, 537 dies in the middle of a
+    step (cublas ALLOC_FAILED, and the site moves -- heads, ipa, quatrigid --
+    because it is a general shortfall, not one fat buffer).
+
+    Dying mid-campaign is the worst outcome available, so above the limit
+    this declines and JAX runs the span: slower, but it finishes.  The limit
+    is a measured length, not a memory query, because the decision is made at
+    TRACE time when XLA has not yet allocated and a free-VRAM reading would
+    not mean anything.  BC2_NATIVE_MAX_N overrides it -- raise it on a bigger
+    card, where the ceiling is proportionally further out.
     """
-    return True   # every length: run() pads to 32 and masks the pad out
+    limit = int(os.environ.get('BC2_NATIVE_MAX_N', 512))
+    if n <= limit:
+        return True
+    if n not in _DECLINED_LENGTHS:
+        _DECLINED_LENGTHS.add(n)
+        print(f'native: {n} residues is past the kernels\' measured limit of '
+              f'{limit}; running this span on JAX instead (slower, but it '
+              f'does not run out of memory mid-step). BC2_NATIVE_MAX_N raises '
+              f'the limit.', flush=True)
+    return False
+
+
+_DECLINED_LENGTHS: set = set()
 
 
 class Unsupported(Exception):
