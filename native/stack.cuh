@@ -221,6 +221,15 @@ struct Stack {
     // The REGRANT is why this is not simply giving the memory up: it runs on
     // the first save forward, once everything else has allocated and XLA has
     // stopped growing, and hands the tiers back what is genuinely spare.
+    // AND IT STAYS np*2*48 UNDER STRIDE REMAT, which is deliberate and was
+    // measured.  The trunk's save-set is only saveSlots(48) slots now -- 15
+    // at NB_STRIDE=4 -- so this looks like 2.8 GB of over-reserve at N=576,
+    // and shrinking it to the real figure is a REGRESSION: the shallow
+    // stack spends the difference on its own keep tiers and the structure
+    // module dies instead.  Measured, NB_STRIDE=4, three lengths that ran
+    // before the change: 552 foldit cublas:3, 567 ipa OOM, 587 foldit OOM,
+    // all reproducible twice.  The number is a proxy for "the rest of the
+    // step", not for the save-set it is written in terms of.
     if (depth <= 8) margin += np * 2 * 48;
     size_t budget = freeb > margin ? freeb - margin : 0;
     // KEEP_BUDGET_MB FORCES the budget, so the partial-grant path can be
@@ -489,8 +498,8 @@ struct Stack {
     if (psave) { setSaveBuffers(psave, msave); return; }
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
     if (!osp) {
-      CU(cudaMalloc(&osp, (size_t)depth * np * 2));
-      CU(cudaMalloc(&osm, (size_t)depth * nm * 4));
+      CU(cudaMalloc(&osp, (size_t)saveSlots() * np * 2));
+      CU(cudaMalloc(&osm, (size_t)saveSlots() * nm * 4));
     }
     setSaveBuffers(osp, osm);
   }
@@ -501,9 +510,57 @@ struct Stack {
   void ensureSaveSet() {
     if (pin[0] || psave) return;
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
-    CU(cudaMalloc(&psave, np * 2 * depth));
-    CU(cudaMalloc(&msave, nm * 4 * depth));
+    CU(cudaMalloc(&psave, np * 2 * saveSlots()));
+    CU(cudaMalloc(&msave, nm * 4 * saveSlots()));
     setSaveBuffers(psave, msave);
+  }
+
+  // STRIDE REMAT.  `NB_STRIDE=k` keeps only every k-th block's input and
+  // rebuilds the rest of a segment, into a scratch of k-1 slots, just
+  // before the backward walks that segment.  k = 1 is the historical
+  // behaviour -- one slot per depth -- and is the default.
+  //
+  // The save-set is the biggest single allocation in the step (np*2*depth
+  // is 3.35 GB at N=512, most of XLA's 4.69 GB largest_alloc_size), and it
+  // is XLA that allocates it, so `saveSlots` is DUPLICATED on the Python
+  // side in bindcraft/af/native.py.  The two must agree: a mismatch is not
+  // a compile error, it is a buffer that is too small and a backward that
+  // reads whatever is past the end of it.
+  //
+  // AND IT TURNS ITSELF ON, for the same reason the chunk policy does: a
+  // knob nobody sets is a knob that does not run.  The stride costs 21% of
+  // a step at 215 and buys nothing below the length where memory is the
+  // binding constraint, so it is off (k = 1, bit-for-bit the old path)
+  // up to `NB_STRIDE_N` and k = 4 above it.  `NB_STRIDE` forces a value
+  // either way, which is how the gates run the segment logic at 215.
+  //
+  // THE POLICY READS N, AND N IS THE SAME NUMBER ON BOTH SIDES: the FFI
+  // takes it from `pair.dimensions()[0]` and Python from `pair.shape[0]`.
+  // Anything else here -- a length the caller passes, a padded figure one
+  // side computes -- would be a save-set the two disagree about.
+  int strideK() const {
+    static const char* e = getenv("NB_STRIDE");
+    static const char* t = getenv("NB_STRIDE_N");
+    int k;
+    if (e) k = atoi(e);
+    else k = N > (t ? atoi(t) : 512) ? 4 : 1;
+    if (k < 1) k = 1;
+    if (k > depth) k = depth;
+    return k;
+  }
+  int saveSlots() const {
+    const int k = strideK();
+    return k <= 1 ? depth : (depth + k - 1) / k + k - 1;
+  }
+  // depth i's input lives in slot i/k when i is a checkpoint, and in the
+  // shared scratch slot otherwise.  The forward writes every slot (the
+  // scratch ones get overwritten segment after segment and nobody reads
+  // them until the rebuild puts them back); only the checkpoints survive.
+  int slotOf(int i) const {
+    const int k = strideK();
+    if (k <= 1) return i;
+    const int r = i % k;
+    return r == 0 ? i / k : (depth + k - 1) / k + r - 1;
   }
 
   void setSaveBuffers(__nv_bfloat16* p, float* m, bool single = false) {
@@ -518,8 +575,8 @@ struct Stack {
     }
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
     for (int i = 0; i < depth; ++i) {
-      pin[i] = single ? p : p + (size_t)i * np;
-      min_[i] = single ? m : m + (size_t)i * nm;
+      pin[i] = single ? p : p + (size_t)slotOf(i) * np;
+      min_[i] = single ? m : m + (size_t)slotOf(i) * nm;
     }
   }
 
@@ -760,6 +817,46 @@ struct Stack {
     CU(cudaMemcpyAsync(mout, m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
   }
 
+  // STRIDE REMAT's second forward.  The backward is walking down and has
+  // just reached the TOP of segment [s, i]; only `pin[s]` survived the
+  // first forward, so run blocks s .. i-1 again and park each one's output
+  // in the next block's scratch slot.  After this the segment looks exactly
+  // as it did under k = 1 and the loop below needs no other change.
+  //
+  // This is a THIRD pass over those blocks -- forward, rebuild, replay --
+  // so it is paid in time to be saved in memory.  It is bit-identical to
+  // the first forward by construction: same weights, same input bytes
+  // (pin[s] is the narrowed bf16 the first forward wrote), same
+  // deterministic kernels.  `wantMask` is false because the KEEP_RELU pack
+  // is still there from the differentiated forward, and nothing here
+  // overwrites it.
+  void rebuildSegment(int i, const float* pair_mask, const float* msa_mask) {
+    const int k = strideK();
+    if (k <= 1) return;
+    const int s = (i / k) * k;
+    if (i == s) return;                 // a checkpoint: its input was kept
+    // only on the way IN to a segment, which is its highest index
+    if (i != depth - 1 && (i % k) != k - 1) return;
+    const size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
+    for (int j = s; j < i; ++j) {
+      use(j);
+      b.forward(pin[j], min_[j], pair_mask, msa_mask, /*tail*/true,
+                /*haveFlash*/false, /*haveStats*/false, /*haveBias*/false,
+                /*haveActs*/false, /*haveT*/false, /*haveMsa*/false,
+                /*haveRelu*/false, /*wantMask*/false,
+                /*keepGates*/have(KEEP_ACTS, j));
+      if (BLK_BF16CHAIN)
+        CU(cudaMemcpyAsync(pin[j + 1], b.p6b, np * 2,
+                           cudaMemcpyDeviceToDevice, b.st));
+      else
+        toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pin[j + 1], b.p6, np);
+      CU(cudaMemcpyAsync(min_[j + 1], b.m3, nm * 4,
+                         cudaMemcpyDeviceToDevice, b.st));
+      if (save_probe)
+        roundInPlaceK<<<(nm + 255) / 256, 256, 0, b.st>>>(min_[j + 1], nm);
+    }
+  }
+
   // Must follow forward() with the same inputs.  b.dp / b.dm end up holding the
   // cotangents on the stack's own pair and msa inputs.
   void backward_(const float* ct_pair, const float* ct_msa,
@@ -790,6 +887,7 @@ struct Stack {
         CU(cudaStreamSynchronize(b.st));
         printf("  %5d %14.6e %14.6e\n", i, nrm(dp, np), nrm(dm, nm));
       }
+      rebuildSegment(i, pair_mask, msa_mask);
       use(i);
       // Rematerialise: this block's save-set is gone, only its input was kept.
       // `tail` false because the replay exists to rebuild what backward() reads

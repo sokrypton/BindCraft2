@@ -625,6 +625,16 @@ def _register():
     # multiple of 32, so a 457 complex arrives as 480); a card with more room
     # should start chunking later, by the same sqrt as the length limit.
     os.environ.setdefault('NB_CHUNK_N', str(_chunk_threshold()))
+    # SAME DISCIPLINE FOR THE STRIDE: strideK() caches it in a function-local
+    # static, so it has to be in the environment before the library loads.
+    os.environ.setdefault('NB_STRIDE_N', str(_stride_threshold()))
+    # SAY IT OUT LOUD.  The stride is a trade of time for memory and it is
+    # read in two places (here and stack.cuh); a silent one is exactly the
+    # kind of setting that gets blamed on something else.
+    _k = os.environ.get('NB_STRIDE')
+    if _k:
+        print(f'native: stride remat FORCED to NB_STRIDE={_k} at every length '
+              f'-- {_save_slots(48, 0)} of 48 save slots', file=sys.stderr)
     lib = ctypes.CDLL(_LIB)
     # THE EXPORTED SYMBOL IS THE C++ HANDLER'S NAME, not a snake_case
     # convention: XLA_FFI_DEFINE_HANDLER_SYMBOL(NativeEvoformerFwd, ...)
@@ -722,7 +732,30 @@ def supported_length(n: int) -> bool:
 # native/length_ladder.py is how to replace a guess with a number, and
 # BC2_NATIVE_MAX_N overrides it outright in either direction.
 _A10_BYTES = 17763631104       # jax bytes_limit on the 23.7 GB A10
-_A10_MAX_N = 512               # measured there, with the interface loss
+# 544 since stride remat: the save-set is 15 of 48 slots above
+# _A10_STRIDE_N, and 537 and 545 residues run where 512 was the wall.  Not
+# higher, although 587 and 617 also run: 552, 567 and 577 do NOT, twice over,
+# and the reason is not ours to fix from here -- at those lengths XLA grows
+# its pool AFTER the extra-MSA stack has allocated rather than before, so the
+# trunk arrives at 1.47 GB free instead of 7.26.  An XLA cap does not change
+# it (0.55 and 0.40 fail identically).  A ceiling is a number every length
+# below it must clear, so it is 544.
+_A10_MAX_N = 544
+# Padded N above which the save-set goes stride-remat.  It is the OLD
+# ceiling on purpose: below it memory is not the binding constraint and the
+# stride is 21% of a step for nothing.
+_A10_STRIDE_N = 512
+
+
+def _scaled(a10_value: int) -> int:
+    """An A10 measurement moved to this card by the sqrt of its budget."""
+    budget = _device_budget()
+    if not budget:
+        return a10_value
+    scale = (budget / _A10_BYTES) ** 0.5
+    if scale < 1.0:
+        scale *= 0.9                   # the unmodelled fixed cost bites here
+    return max(128, min(2048, int(a10_value * scale) // 32 * 32))
 
 
 def _device_budget() -> int:
@@ -739,27 +772,19 @@ def _length_limit() -> int:
     env = os.environ.get('BC2_NATIVE_MAX_N')
     if env:
         return int(env)
-    budget = _device_budget()
-    if not budget:
-        return _A10_MAX_N                      # unreadable: keep the measured one
-    scale = (budget / _A10_BYTES) ** 0.5
-    if scale < 1.0:
-        scale *= 0.9                           # the unmodelled fixed cost bites here
-    # a multiple of 32, because the kernels pad to one anyway
-    n = int(_A10_MAX_N * scale) // 32 * 32
-    return max(128, min(2048, n))
+    return _scaled(_A10_MAX_N)
+
+
+@functools.lru_cache(maxsize=1)
+def _stride_threshold() -> int:
+    """Padded N above which the save-set keeps every 4th block, not every one."""
+    return _scaled(_A10_STRIDE_N)
 
 
 @functools.lru_cache(maxsize=1)
 def _chunk_threshold() -> int:
     """Padded N above which the pair modules chunk themselves."""
-    budget = _device_budget()
-    if not budget:
-        return 480
-    scale = (budget / _A10_BYTES) ** 0.5
-    if scale < 1.0:
-        scale *= 0.9
-    return max(128, min(2048, int(480 * scale) // 32 * 32))
+    return _scaled(480)
 
 
 _DECLINED_LENGTHS: set = set()
@@ -1044,6 +1069,42 @@ def _make_extra_runner(weights_dir, depth=4, dropout=False):
     return run
 
 
+def _stride_k(depth: int, n: int) -> int:
+    """How many blocks the save-set skips.  Mirrors Stack::strideK."""
+    env = os.environ.get('NB_STRIDE')
+    if env:
+        k = int(env)
+    else:
+        k = 4 if n > int(os.environ.get('NB_STRIDE_N') or 512) else 1
+    return max(1, min(k, depth))
+
+
+def _save_slots(depth: int, n: int) -> int:
+    """How many blocks' worth of input the save-set holds.
+
+    THIS IS A DUPLICATE of Stack::saveSlots in dev/native_block/stack.cuh and
+    the two must agree exactly.  The save-set is an FFI buffer: XLA allocates
+    it from the shape declared below and the C++ slices it.  If this says
+    `depth` and the C++ says fewer, the tail is merely wasted; if this says
+    fewer than the C++ slices, the backward reads past the end of someone
+    else's buffer.  Neither is a compile error and neither raises -- the
+    first costs memory, the second is a wrong gradient.
+
+    `n` is `pair.shape[0]`, which is the same number the FFI reads out of
+    `pair.dimensions()[0]`; the policy keys on it so that both sides reach
+    the same answer without either being told.
+
+    Stride remat keeps every k-th block's input and rebuilds the rest of
+    each segment during the backward, into a scratch of k-1 slots: the
+    save-set goes from `depth` slots to `ceil(depth/k) + k - 1` -- 15 of 48
+    at k = 4 -- at the price of a second forward over every non-checkpoint
+    block.  Measured on the A10: a 215 step costs 21% more with it on, and
+    537, 545 and 587 residues run with it where 512 was the ceiling.
+    """
+    k = _stride_k(depth, n)
+    return depth if k <= 1 else (depth + k - 1) // k + k - 1
+
+
 def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
     """Build the custom_vjp for ONE (depth, weights) pair.
 
@@ -1071,8 +1132,10 @@ def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
             'native_evoformer_fwd',
             (jax.ShapeDtypeStruct(pair.shape, jnp.float32),
              jax.ShapeDtypeStruct(msa.shape, jnp.float32),
-             jax.ShapeDtypeStruct((depth,) + pair.shape, jnp.bfloat16),
-             jax.ShapeDtypeStruct((depth,) + msa.shape, jnp.float32)),
+             jax.ShapeDtypeStruct((_save_slots(depth, pair.shape[0]),)
+                                  + pair.shape, jnp.bfloat16),
+             jax.ShapeDtypeStruct((_save_slots(depth, pair.shape[0]),)
+                                  + msa.shape, jnp.float32)),
             vmap_method='sequential')
         return out(pair, msa, pair_mask, msa_mask, seed,
                    depth=np.int64(depth), save=np.int64(1),
