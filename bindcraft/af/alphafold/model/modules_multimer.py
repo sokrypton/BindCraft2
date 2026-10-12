@@ -226,7 +226,12 @@ class AlphaFoldIteration(hk.Module):
       # most of what a design step pays XLA before its first gradient.  The
       # native path replaces the lot; the loss above it stays ordinary
       # differentiable Python.
-      if NATIVE_POST_TRUNK is not None:
+      # THE SMALL HOOKS HAVE TO DECLINE TOO.  The trunk standing aside at a
+      # length it cannot hold does not help if the post-trunk step then
+      # allocates its own heads and dies: measured at 837 residues, where the
+      # trunk declined and heads.cuh:81 ran out of memory anyway.
+      from ...native import supported_length as _fits
+      if NATIVE_POST_TRUNK is not None and _fits(representations['single'].shape[0]):
         safe_key, post_subkey = safe_key.split()
         native_post = _native_post_trunk(representations, batch, self.config,
                                          post_subkey)
@@ -444,7 +449,9 @@ class EmbeddingsAndEvoformer(hk.Module):
       # `max_relative_idx` block below is skipped.  The recycle terms between
       # here and there are not folded in: they are added afterwards instead,
       # which is the same sum because every one of them is a `+=`.
-      native_emb = NATIVE_EMBEDDER is not None
+      from ...native import supported_length as _fits_emb
+      native_emb = (NATIVE_EMBEDDER is not None
+                    and _fits_emb(target_feat.shape[0]))
       if native_emb:
         NATIVE_EMBEDDER_TRACES[0] += 1
         if NATIVE_EMBEDDER_TRACES[0] == 1:
