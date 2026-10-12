@@ -66,7 +66,17 @@ struct Stack {
   std::vector<float*> min_;
   __nv_bfloat16* psave = nullptr;
   float* msave = nullptr;                            // the default storage
-  float *pout = nullptr, *mout = nullptr;
+  float *pout = nullptr, *mout = nullptr;      // where forward() writes
+  float *pown = nullptr, *mown = nullptr;      // ours, only if nobody lends one
+
+  // Point the outputs at buffers we own.  The standalone gates need this;
+  // the FFI sets pout/mout to XLA's own and never calls it.
+  void useOwnOut() {
+    size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
+    if (!pown) CU(cudaMalloc(&pown, np * 4));
+    if (!mown) CU(cudaMalloc(&mown, nm * 4));
+    pout = pown; mout = mown;
+  }
   __nv_bfloat16* dpc = nullptr;
   float* dmc = nullptr;   // the cotangent carried between depths
   // the 48 weight sets, as the values the block's slots should hold
@@ -154,8 +164,24 @@ struct Stack {
     // stack die, AT THIS LINE, with 3.62 GB it would have thrown away.
     // ensureSaveSet() makes it on demand for the standalone path, which has
     // nobody to hand it one.
-    CU(cudaMalloc(&pout, np * 4));
-    CU(cudaMalloc(&mout, nm * 4));
+    // `pout`/`mout` ARE NOT ALLOCATED HERE EITHER, for the same reason the
+    // save set is not: in the in-model path the FFI has an output buffer
+    // already and we can write it directly.  pout is np*4 -- 139 MB at N=522
+    // -- and ffi.cu used to copy this buffer straight into it, so it was 139
+    // MB of memory and a 139 MB device-to-device copy for nothing.
+    //
+    // WRITING THE CALLER'S BUFFER IS SAFE HERE, and that is worth spelling
+    // out because the obvious objection is real elsewhere.  The widen at the
+    // end of forward_ is `widenBf16K(pout, pb, np)`, and if its SOURCE could
+    // alias its destination that would corrupt: thread i reads 2 bytes at 2i
+    // and writes 4 bytes at 4i, landing on the elements threads 2i and 2i+1
+    // have not read yet.  It cannot alias.  `pb` there is `b.p6b`, a
+    // block-internal buffer, not the stack's `pair` argument -- the loop
+    // reassigns it after the first block.  The caller's `pair` is read only
+    // by block 0's toBf16K, which is long finished.
+    //
+    // useOwnOut() covers the standalone path, which has nobody to hand it a
+    // buffer.
     CU(cudaMalloc(&dpc, np * 2));
     CU(cudaMalloc(&dmc, nm * 4));
 
@@ -674,6 +700,7 @@ struct Stack {
   void forward_(const float* pair, const float* msa,
                const float* pair_mask, const float* msa_mask) {
     ensureSaveSet();
+    if (!pout || !mout) useOwnOut();
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
     const float *p = pair, *m = msa;
     // BLK_BF16CHAIN: from block 1 on, the previous block's output is ALREADY
