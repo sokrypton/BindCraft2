@@ -22,6 +22,7 @@
 // THE SAVE-SET IS THEREFORE TOTAL: every one of the five inputs is kept, which
 // is what lets backward() run with no replay.
 #pragma once
+#include <vector>
 #include "trimul.cuh"
 #include "triattn.cuh"
 #include "transition.cuh"
@@ -90,6 +91,18 @@ struct TplBlock {
     CUB(cublasSetStream(tmi.cub, s));
     CUB(cublasSetStream(tas.cub, s));
     CUB(cublasSetStream(tae.cub, s));
+  }
+
+  // Every module's weight pointers, in a fixed order -- block.cuh's
+  // weightSlots(), minus the MSA modules a template block does not have.
+  // TplStack uses it to run ONE block at every depth, swapping the pointers
+  // instead of holding a block (and a module scratch set) per depth.
+  std::vector<void**> weightSlots() {
+    std::vector<void**> v;
+    auto app = [&](std::vector<void**> w) { v.insert(v.end(), w.begin(), w.end()); };
+    app(tmo.weightSlots()); app(tmi.weightSlots());
+    app(tas.weightSlots()); app(tae.weightSlots()); app(ptr.weightSlots());
+    return v;
   }
 
   void setWeights(Oracle& o, const std::string& P = "param/") {

@@ -36,7 +36,16 @@ static const int NSAVE = 5;                // p1..p5 of each block
 struct TplStack {
   int N = 0, depth = 0;
   cudaStream_t st = nullptr;
-  std::vector<tplblock::TplBlock> blk;
+  // ONE BLOCK FOR EVERY DEPTH, as stack.cuh already does for its 48.  A
+  // block per depth meant a MODULE SCRATCH SET per depth -- tmo/tmi/tas/tae/
+  // ptr, 2.7 GB each at N=448 -- and two of them is why the template
+  // embedding was the largest single allocation in the library (5.98 GB of
+  // 21.1).  The weights differ per depth, so they move instead: weightSlots()
+  // hands out the pointers and use(b) re-points them.
+  tplblock::TplBlock blk;
+  std::vector<void**> slots;              // the block's weight pointers
+  std::vector<std::vector<void*>> wsets;  // what they should hold, per depth
+  __nv_bfloat16* ctmp = nullptr;          // the cotangent between blocks
   // where a restored p1 lives: the block borrows its input pointer, and on the
   // backward there is no caller to borrow from
   std::vector<__nv_bfloat16*> p1store;
@@ -46,33 +55,43 @@ struct TplStack {
 
   void alloc(int N_, int depth_, cudaStream_t s = nullptr) {
     N = N_; depth = depth_; st = s;
-    blk.resize(depth);
+    blk.alloc(N, st);
+    slots = blk.weightSlots();
+    wsets.assign(depth, std::vector<void*>(slots.size(), nullptr));
+    // p1store[b] is block b's INPUT.  The chain cannot feed a block from its
+    // own p6b now that there is one block: forward() only POINTS p1b at what
+    // it is given, so input and output would alias.  stack.cuh solves it the
+    // same way, with pin[i].
     p1store.resize(depth, nullptr);
-    for (int b = 0; b < depth; ++b) {
-      blk[b].alloc(N, st);
+    for (int b = 0; b < depth; ++b)
       CU(cudaMalloc(&p1store[b], pairElems() * 2));
-    }
+    CU(cudaMalloc(&ctmp, pairElems() * 2));
+  }
+
+  // the depth's weights, and its own dropout masks
+  void use(int b) {
+    blk.drop_depth = (uint32_t)b;
+    for (size_t k = 0; k < slots.size(); ++k) *slots[k] = wsets[b][k];
   }
 
   void setStream(cudaStream_t s) {
     st = s;
-    for (auto& b : blk) b.setStream(s);
+    blk.setStream(s);
   }
 
   // every block gets its own drop_depth, so the two do not draw one mask
   void setDropout(bool on, const uint32_t* seed) {
-    for (int b = 0; b < depth; ++b) {
-      blk[b].use_dropout = on;
-      blk[b].drop_seed = seed;
-      blk[b].drop_depth = (uint32_t)b;
-    }
+    blk.use_dropout = on;
+    blk.drop_seed = seed;      // drop_depth is set per depth by use()
   }
 
   // the manifest names blocks the way weights.py writes them for every other
   // stack here: param/block{b}/<module>/<param>
   void setWeights(Oracle& o) {
-    for (int b = 0; b < depth; ++b)
-      blk[b].setWeights(o, "param/block" + std::to_string(b) + "/");
+    for (int b = 0; b < depth; ++b) {
+      blk.setWeights(o, "param/block" + std::to_string(b) + "/");
+      for (size_t k = 0; k < slots.size(); ++k) wsets[b][k] = *slots[k];
+    }
   }
 
   // EVERY BLOCK FROM ONE FLAT PREFIX.  The oracle's template dump is a single
@@ -80,11 +99,14 @@ struct TplStack {
   // The stack gate reuses it: giving both blocks the same weights still
   // exercises the chaining and the save-set, which is what a stack adds.
   void setWeightsFlat(Oracle& o, const std::string& P = "param/") {
-    for (int b = 0; b < depth; ++b) blk[b].setWeights(o, P);
+    for (int b = 0; b < depth; ++b) {
+      blk.setWeights(o, P);
+      for (size_t k = 0; k < slots.size(); ++k) wsets[b][k] = *slots[k];
+    }
   }
 
-  __nv_bfloat16* out() { return blk[depth - 1].p6b; }
-  __nv_bfloat16* dpair() { return blk[0].dp; }
+  __nv_bfloat16* out() { return blk.p6b; }
+  __nv_bfloat16* dpair() { return ctmp; }   // block 0's dp, relayed
 
   // save may be null, for a forward whose gradient is not wanted
   void forward(const __nv_bfloat16* pair, const float* pair_mask,
@@ -92,10 +114,20 @@ struct TplStack {
     const size_t np = pairElems();
     if (save)
       CU(cudaMemcpyAsync(save, pair, np * 2, cudaMemcpyDeviceToDevice, st));
-    const __nv_bfloat16* in = pair;
+    // CHAIN THROUGH p1store, NOT THROUGH p6b.  With one block, p6b is both
+    // this depth's output and the next depth's input, and forward() only
+    // points p1b at what it is handed -- so the next block would overwrite
+    // its own input.  Copying each output into the next depth's input buffer
+    // breaks that, and the copy is the same np*2 the save already costs.
     for (int b = 0; b < depth; ++b) {
-      blk[b].forward(in, pair_mask);
-      in = blk[b].p6b;
+      const __nv_bfloat16* in = pair;
+      if (b) {
+        CU(cudaMemcpyAsync(p1store[b], blk.p6b, np * 2,
+                           cudaMemcpyDeviceToDevice, st));
+        in = p1store[b];
+      }
+      use(b);
+      blk.forward(in, pair_mask);
     }
   }
 
@@ -106,15 +138,31 @@ struct TplStack {
     // where it lands, because the first block borrows its input pointer and
     // `save` is the caller's buffer, which must not be aliased by the chain.
     CU(cudaMemcpyAsync(p1store[0], save, np * 2, cudaMemcpyDeviceToDevice, st));
-    const __nv_bfloat16* in = p1store[0];
+    // PASS 1 recovers every depth's INPUT.  It used to leave every depth's
+    // intermediates live at once, which is exactly what cost a module scratch
+    // set per depth; here only the last block's survive, and p1store holds
+    // what is needed to regenerate the rest.
     for (int b = 0; b < depth; ++b) {
-      blk[b].forward(in, pair_mask);
-      in = blk[b].p6b;
+      use(b);
+      blk.forward(p1store[b], pair_mask);
+      if (b + 1 < depth)
+        CU(cudaMemcpyAsync(p1store[b + 1], blk.p6b, np * 2,
+                           cudaMemcpyDeviceToDevice, st));
     }
+    // PASS 2 walks back, replaying each block immediately before its own
+    // backward -- stack.cuh's pattern.  The block that pass 1 finished on is
+    // already current, so it is not replayed twice.  dp must be relayed
+    // through ctmp: it is ONE buffer now, and the next replay would clobber
+    // the cotangent in flight.
     const __nv_bfloat16* c = ct;
     for (int b = depth - 1; b >= 0; --b) {
-      blk[b].backward(c, pair_mask);
-      c = blk[b].dp;
+      if (b != depth - 1) {
+        use(b);
+        blk.forward(p1store[b], pair_mask);
+      }
+      blk.backward(c, pair_mask);
+      CU(cudaMemcpyAsync(ctmp, blk.dp, np * 2, cudaMemcpyDeviceToDevice, st));
+      c = ctmp;
     }
   }
 };
