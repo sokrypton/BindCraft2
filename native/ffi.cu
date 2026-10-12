@@ -256,12 +256,18 @@ ffi::Error FwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> pair,
   bool timing = envOn("NE_TIME");
   double w0 = 0;
   if (timing) { w0 = now_ms(); g_tf.begin(stream); }
+  // THE STACK WRITES XLA'S OUTPUT BUFFERS DIRECTLY.  This used to let the
+  // stack allocate its own pout/mout and then copy them here -- 139 MB and a
+  // 139 MB device-to-device copy at N=522, for a value that was already in
+  // the right shape.  See stack.cuh's note on why the widen that produces it
+  // cannot alias its source.
+  //
+  // SET EVERY CALL, not once: the Stack is cached across calls (g_stacks) and
+  // XLA's buffers move.
+  s->pout = pair_out->typed_data();
+  s->mout = msa_out->typed_data();
   s->forward(pb, mb, pair_mask.typed_data(), msa_mask.typed_data());
-  size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
-  CU(cudaMemcpyAsync(pair_out->typed_data(), s->pout, np * 4,
-                     cudaMemcpyDeviceToDevice, stream));
-  CU(cudaMemcpyAsync(msa_out->typed_data(), s->mout, nm * 4,
-                     cudaMemcpyDeviceToDevice, stream));
+  size_t np = (size_t)N * N * block::CZ;
   if (timing) { g_tf.end(stream, now_ms() - w0); g_tf.report("fwd");
                 prof().report("fwd"); prof().reset(); }
   if (getenv("NE_DEBUG")) {
@@ -274,9 +280,9 @@ ffi::Error FwdImpl(cudaStream_t stream, ffi::Buffer<ffi::F32> pair,
     };
     fprintf(stderr, "NE_DEBUG N=%d S=%d depth=%d np=%zu\n", N, S, (int)depth, np);
     peek("in pair", pb);
-    peek("s->pout", s->pout);
+    // s->pout IS pair_out now -- the stack wrote it in place -- so these are
+    // one buffer, not two, and there is no copy between them to check.
     peek("pair_out", pair_out->typed_data());
-    peek("s->mout", s->mout);
     peek("msa_out", msa_out->typed_data());
     fprintf(stderr, "  pair_out bytes=%zu  expected=%zu\n",
             pair_out->size_bytes(), np * 4);
