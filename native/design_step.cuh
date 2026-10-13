@@ -444,6 +444,32 @@ struct DesignStep {
   // the real call never finds.  Nothing here is stream-ordered: every
   // buffer comes from plain cudaMalloc and the stream is used only for
   // launches and cublasSetStream.  See the prealloc note in ffi.cu.
+  // CARRY THE TRUNK ACROSS THE fwd -> bwd BOUNDARY.
+  //
+  // The backward handler replays the WHOLE forward before doing anything,
+  // because a design step runs every state's forward before any backward
+  // and C++ member state is stale by then -- the bug that cost i_pTM
+  // 0.79 -> 0.23.  Measured, that replay is the entire speed gap against
+  // the staged path: complex 487 goes 8766.8 -> 7385.5 ms with it skipped
+  // (the staged path is 7308.2), and 537 goes 12150.5 -> 10427.2 (10350.7).
+  //
+  // The fix is not to delete it but to make the expensive part
+  // unnecessary.  The trunk is 48 of the 54 blocks, and everything after
+  // `trunk.forward` needs only its pout/mout -- so when the save set and
+  // those two outputs live in XLA BUFFERS rather than in members, they
+  // survive the boundary as data, interleaving and all, and the replay can
+  // skip the trunk while emb/tpl/extra/sm/hd (cheap) still run honestly.
+  // That is the same arrangement the staged path has always had: its
+  // `psave` is an ffi::Result the caller owns.
+  bool skip_trunk = false;
+
+  void setTrunkCarry(__nv_bfloat16* psave, float* msave, float* pout,
+                     float* mout) {
+    trunk.setSaveBuffers(psave, msave);
+    trunk.pout = pout;
+    trunk.mout = mout;
+  }
+
   void setStream(cudaStream_t s) {
     st = s;
     emb.setStream(s); tpl.setStream(s);
@@ -576,7 +602,12 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   t1d.forward(t_aatype, t_pos, t_mask, in.n, t1d_tab,
               trunk_msa + (size_t)plan.msa_rows * rowc,
               trunk_msa_mask + (size_t)plan.msa_rows * N);
-  trunk.forward(extra.pout, trunk_msa, pair_mask, trunk_msa_mask);
+  // SKIPPED when the caller carried the trunk across the boundary: its
+  // save set and pout/mout are XLA buffers holding the forward's results
+  // already, so recomputing 48 blocks would only overwrite them with the
+  // same numbers.
+  if (!skip_trunk)
+    trunk.forward(extra.pout, trunk_msa, pair_mask, trunk_msa_mask);
 
   dsDump("extra_pout", extra.pout, nn_cz * 4);
   dsDump("trunk_msa", trunk_msa,

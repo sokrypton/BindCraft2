@@ -1368,7 +1368,12 @@ ffi::Error DesignStepImpl(
     ffi::Result<ffi::Buffer<ffi::F32>> out_iptm,
     ffi::Result<ffi::Buffer<ffi::F32>> out_iptm_pr,
     ffi::Result<ffi::Buffer<ffi::F32>> out_expres,
-    ffi::Result<ffi::Buffer<ffi::F32>> out_dgram) {
+    ffi::Result<ffi::Buffer<ffi::F32>> out_dgram,
+    // the trunk, carried to the backward: save set + the two outputs
+    ffi::Result<ffi::Buffer<ffi::BF16>> carry_psave,
+    ffi::Result<ffi::Buffer<ffi::F32>> carry_msave,
+    ffi::Result<ffi::Buffer<ffi::F32>> carry_pout,
+    ffi::Result<ffi::Buffer<ffi::F32>> carry_mout) {
   const int NMAX = (int)sequence.dimensions()[0];
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
                       t1437.typed_data(), t3714.typed_data()};
@@ -1404,6 +1409,13 @@ ffi::Error DesignStepImpl(
   out.expres_ca = out_expres->typed_data();
   out.distogram = out_dgram->typed_data();
 
+  // THE TRUNK'S SAVE SET AND OUTPUTS GO TO XLA, not to members, so the
+  // backward can use them instead of recomputing 48 blocks.  See
+  // design_step.cuh's setTrunkCarry.
+  m->setTrunkCarry(reinterpret_cast<__nv_bfloat16*>(carry_psave->typed_data()),
+                   carry_msave->typed_data(), carry_pout->typed_data(),
+                   carry_mout->typed_data());
+  m->skip_trunk = false;
   m->forward(in, out, /*want_save*/true);
   return ffi::Error::Success();
 }
@@ -1430,6 +1442,11 @@ ffi::Error DesignStepBwdImpl(
     ffi::Buffer<ffi::F32> ct_iptm, ffi::Buffer<ffi::F32> ct_iptm_pr,
     ffi::Buffer<ffi::F32> ct_expres, ffi::Buffer<ffi::F32> ct_dgram,
     ffi::Buffer<ffi::F32> scalars,
+    // ALL Args BEFORE ALL Attrs: the binder's order is the parameter
+    // order, and getting it wrong is a static_assert inside api.h that
+    // prints the whole signature twice and names nothing.
+    ffi::Buffer<ffi::BF16> carry_psave, ffi::Buffer<ffi::F32> carry_msave,
+    ffi::Buffer<ffi::F32> carry_pout, ffi::Buffer<ffi::F32> carry_mout,
     int64_t recycles, int64_t msa_rows,
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
@@ -1460,7 +1477,23 @@ ffi::Error DesignStepBwdImpl(
   in.seed = seed.typed_data();
   in.scalars = scalars.typed_data();
 
+  // NB_NO_REPLAY: a THROWAWAY PROBE, wrong results on purpose.  The
+  // replay is one whole forward a backward, and this times what removing
+  // it would be worth before anything is built to remove it properly.
+  // THE REPLAY, MINUS THE TRUNK.  The caller hands back the save set and
+  // pout/mout the forward wrote, so emb/tpl/extra/sm/hd rerun (cheap and
+  // stateless) while the 48 blocks do not.  NB_NO_TRUNK_CARRY falls back
+  // to the full replay, which is what this did before and is the thing to
+  // compare against.
+  const bool carry = !getenv("NB_NO_TRUNK_CARRY");
+  if (carry)
+    m->setTrunkCarry(
+        reinterpret_cast<__nv_bfloat16*>(carry_psave.typed_data()),
+        carry_msave.typed_data(), carry_pout.typed_data(),
+        carry_mout.typed_data());
+  m->skip_trunk = carry;
   m->forward(in, m->scratch, /*want_save*/true);
+  m->skip_trunk = false;
 
   design_step::Cotangents ct{};
   ct.atoms = ct_atoms.typed_data();
@@ -1492,6 +1525,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
         .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
         .Arg<ffi::Buffer<ffi::F32>>()      // the four design scalars [4]
+        // the trunk carried from the forward: save set + pout/mout
+        .Arg<ffi::Buffer<ffi::BF16>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
         .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
         .Attr<std::string_view>("trunk_dir")
         .Attr<std::string_view>("extra_dir")
@@ -1522,4 +1558,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::BF16>>().Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>());
