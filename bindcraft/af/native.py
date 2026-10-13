@@ -780,61 +780,6 @@ def _device_budget() -> int:
         return 0
 
 
-# THE FUSED STEP HAS ITS OWN CEILING, and it is NOT the staged one.
-#
-# It allocates differently -- one DesignStep per state below
-# BC2_NATIVE_STEP_SHARE_N, one shared object above it -- so it reaches
-# further than the staged path and fails in different places.  Measured on
-# the A10 with the realistic four-term loss, hIL2R_beta_gamma plus a binder:
-#
-#   complex  NMAX   result
-#      647    672   runs (shared object)
-#      667    672   runs
-#      687    704   OOM in stack.cuh:540, prealloc 17.89 GB
-#      707     --   OOM in XLA
-#
-# Set to the largest MEASURED length that runs, not the first that fails.
-_A10_STEP_MAX_N = 667
-
-
-def supported_step_length(n: int) -> bool:
-    """Can the ONE-CALL design step run a complex this long?
-
-    The staged path has had supported_length() since it had a ceiling; the
-    fused path had nothing, because it was opt-in and whoever set
-    BC2_NATIVE_STEP was choosing it deliberately.  It is the default now, so
-    every campaign meets it.  Above the limit this returns False and af2
-    falls back to the STAGED native path, which keeps its own per-piece caps
-    and declines to JAX above those.
-
-    BE HONEST ABOUT WHAT THIS BUYS, because the obvious justification is
-    wrong here.  Measured on the A10 with the realistic four-term loss, JAX
-    runs complex 647 and dies at 667, while the fused step runs 667 and dies
-    at 687 -- so on THIS card every length past the fused ceiling is past
-    JAX's too, and declining swaps one out-of-memory for another.  The fused
-    step also fails at PREALLOC, on the first call, which is the failure
-    mode you want: early and total, not halfway through a campaign.
-
-    It earns its place in two narrower cases.  Variable-length design is the
-    real one: a contig RANGE can meet a longer shape partway through a
-    campaign, and that is a genuine mid-run death this turns into a
-    fallback.  The other is a different card or a lighter loss set, where
-    the two ceilings move independently -- _scaled() tracks ours with the
-    memory budget and JAX's does not follow it.
-    """
-    env = os.environ.get('BC2_NATIVE_STEP_MAX_N')
-    limit = int(env) if env else _scaled(_A10_STEP_MAX_N)
-    if n <= limit:
-        return True
-    if ('step', n) not in _DECLINED_LENGTHS:
-        _DECLINED_LENGTHS.add(('step', n))
-        print(f'native: {n} residues is past the one-call step\'s measured '
-              f'limit of {limit}; running this span through the staged '
-              f'native path instead. BC2_NATIVE_STEP_MAX_N raises the limit.',
-              flush=True)
-    return False
-
-
 @functools.lru_cache(maxsize=1)
 def _length_limit() -> int:
     env = os.environ.get('BC2_NATIVE_MAX_N')
