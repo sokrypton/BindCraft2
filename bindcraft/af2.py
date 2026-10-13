@@ -212,6 +212,12 @@ def _native_step_off() -> bool:
     return 'step' in _bcn.disabled_pieces()
 
 
+def _native_step_fits(n: int) -> bool:
+    """Is this complex short enough for the one-call step on this card?"""
+    from .af import native as _bcn
+    return _bcn.supported_step_length(n)
+
+
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
     def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, backend: str='auto', evoformer_backend: str | None=None, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
@@ -424,7 +430,16 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             # weights_from_params writes a manifest to disk and must not
             # run under a trace.
             native_step_dirs = None
-            if self.native_installed and not _native_step_off():
+            # LENGTH IS A CEILING HERE TOO, and the fused path had no check
+            # for it: supported_length() guards the staged hooks only.  Above
+            # the limit, fall through to the staged path, which keeps its own
+            # per-piece caps.  See supported_step_length for what this does
+            # and does not buy -- on the A10 every length past the fused
+            # ceiling is past JAX's as well, so it matters for variable
+            # lengths and other cards rather than for a long fixed one.
+            _longest = max(sum(cl) for _, _, cl in complex_shapes)
+            if (self.native_installed and not _native_step_off()
+                    and _native_step_fits(_longest)):
                 from .af import native as _bcn
                 _p = self.model_parameters[model]
                 native_step_dirs = {
@@ -475,13 +490,36 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                     # costs ~2x the step.
                     #
                     # Per-state objects are faster and hold two
-                    # allocations: 640+256 fits, 672+288 does not (4.26 GB
-                    # of it a binder_alone idle while the complex runs),
-                    # and that is what puts 647 over the card.  So share
-                    # only above the measured point where per-state stops
-                    # fitting.  BC2_NATIVE_STEP_SHARE_N moves it.
+                    # allocations, so share only above the measured point
+                    # where per-state stops fitting.
+                    #
+                    # THAT POINT MOVED when the fused step started being
+                    # handed its keep tiers (it never was -- see
+                    # design_step.cuh's regrant).  A tier is memory, taken
+                    # from exactly the headroom the second allocation needs,
+                    # and 640 was measured when there were none.  It left a
+                    # HOLE: complex 627 took per-state at 640+256 and died
+                    # in trimul, while 647 was above the threshold, shared
+                    # one 672 object, and ran.  A longer complex running
+                    # where a shorter one crashes is the signature.
+                    #
+                    # Re-measured 2026-10-13, hIL2R_beta_gamma + a binder,
+                    # the realistic four-term loss, A10:
+                    #
+                    #   complex  per-state      shared
+                    #      597   14.1 s         --
+                    #      607   14.2 s         --
+                    #      617   OOM (trimul)   --
+                    #      627   OOM (trimul)   29.3 s
+                    #      647   --             33.8 s
+                    #      667   --             34.0 s
+                    #      687   --             OOM (stack.cuh:540)
+                    #
+                    # So 607, and the ~2x that sharing costs is visible in
+                    # the jump from 14.2 to 29.3 across the boundary.
+                    # BC2_NATIVE_STEP_SHARE_N moves it.
                     _share_n = int(os.environ.get(
-                        'BC2_NATIVE_STEP_SHARE_N', '640'))
+                        'BC2_NATIVE_STEP_SHARE_N', '607'))
                     _biggest = _pad_to(max(sum(cl) for _, _, cl
                                            in complex_shapes))
                     _nmax = _biggest if _biggest > _share_n else _pad_to(_n)
