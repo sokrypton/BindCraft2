@@ -1423,6 +1423,19 @@ ffi::Error DesignStepImpl(
                    carry_msave->typed_data(), carry_pout->typed_data(),
                    carry_mout->typed_data());
   m->skip_trunk = false;
+#if NE_CUPTI
+  // The fused step never reaches the stack handler's CUPTI window, so it had
+  // no kernel breakdown at all -- which is how the +15% at complex 215 stayed
+  // a guess.  Same window, counted in fused forwards: one a state a step.
+  if (envOn("NE_CUPTI")) {
+    static int steps = 0;
+    const int warm = getenv("NE_CUPTI_WARM") ? atoi(getenv("NE_CUPTI_WARM")) : 6;
+    const int span = getenv("NE_CUPTI_SPAN") ? atoi(getenv("NE_CUPTI_SPAN")) : 2;
+    ++steps;
+    if (steps == warm) { cuprof::init(); cuprof::start(); }
+    else if (steps == warm + span) cuprof::stop(getenv("NE_CUPTI_TOP") ? atoi(getenv("NE_CUPTI_TOP")) : 40);
+  }
+#endif
   const bool tm = envOn("NB_DS_TIME");
   cudaEvent_t f0, f1;
   if (tm) {
