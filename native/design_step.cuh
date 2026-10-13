@@ -481,6 +481,32 @@ struct DesignStep {
     trunk.mout = mout;
   }
 
+  // THE SECOND KEEP GRANT, FOR THE FUSED STEP.
+  //
+  // `defer_keep` tells both Evoformer stacks to take NO keep tiers in their
+  // first grant -- alloc() runs at trace time, before XLA has grown into the
+  // backward, and a tier taken then is a tier taken from the thing that has
+  // to fit.  regrant() is what hands them out once the arena has settled.
+  //
+  // It was never called.  regrant() lived at exactly one call site, the top
+  // of the STACK handler's save forward, and the fused step does not go
+  // through that handler -- it owns its stacks.  So the fused step ran with
+  // zero kept activations for its whole life, and its backward recomputed
+  // per block what the staged path rebuilds from avH: flash attention in
+  // full instead of gateFromAvK, and a second projGateK for the trimul
+  // gates.  Measured at complex 215 that is +104 flashGridHalf launches and
+  // +208 projGateK<false>, which is most of the 181 ms a step the fused path
+  // was behind the staged one -- the gap that had been blamed first on the
+  // replay and then on the structure module, and was neither.
+  //
+  // Same safe point as the staged path, for the same reason: a save forward
+  // is the one moment when no kept buffer is live, because the backward that
+  // reads them has not run yet.
+  void regrant() {
+    extra.regrant();
+    trunk.regrant();
+  }
+
   void setStream(cudaStream_t s) {
     st = s;
     emb.setStream(s); tpl.setStream(s);

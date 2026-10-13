@@ -1422,6 +1422,9 @@ ffi::Error DesignStepImpl(
   m->setTrunkCarry(reinterpret_cast<__nv_bfloat16*>(carry_psave->typed_data()),
                    carry_msave->typed_data(), carry_pout->typed_data(),
                    carry_mout->typed_data());
+  // Hand the two stacks their keep tiers now that XLA has stopped growing.
+  // The stack handler does this for the staged path; nothing did it here.
+  m->regrant();
   m->skip_trunk = false;
 #if NE_CUPTI
   // The fused step never reaches the stack handler's CUPTI window, so it had
