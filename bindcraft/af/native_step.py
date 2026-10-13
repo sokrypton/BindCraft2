@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import functools
 import os
+import sys
 
 import numpy as np
 import jax
@@ -139,6 +140,40 @@ def _step_bwd(cfg, res, cts):
 _step.defvjp(_step_fwd, _step_bwd)
 
 
+_PREALLOCED: set = set()
+
+
+def _prealloc(nmax, recycles, msa_rows, weight_dirs):
+    """Build the fused step now, while the card is still empty.
+
+    A failure here is not fatal: the step is built on first call as before,
+    in the order that loses the race.
+    """
+    if os.environ.get('NB_NO_PREALLOC'):
+        return
+    key = (nmax, int(recycles), int(msa_rows),
+           tuple(sorted(weight_dirs.items())))
+    if key in _PREALLOCED:
+        return
+    _PREALLOCED.add(key)
+    from . import native as _bcn
+    _bcn._register()
+    fn = getattr(_bcn._LIBH, 'native_design_step_prealloc', None)
+    if fn is None:
+        print('native: this libnative_evoformer.so has no '
+              'native_design_step_prealloc; the fused step will be built '
+              'in call order', file=sys.stderr)
+        return
+    import ctypes
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int] * 3 + [ctypes.c_char_p] * 5
+    d = weight_dirs
+    fn(int(nmax), int(recycles), int(msa_rows),
+       str(d['trunk']).encode(), str(d['extra']).encode(),
+       str(d['tpl']).encode(), str(d['post']).encode(),
+       str(d['emb']).encode())
+
+
 TILE = 32
 
 
@@ -170,6 +205,14 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     shape.  That is the whole point: an attribute or a shape would put the
     graph back to one per 32-residue bucket and the port would buy nothing.
     """
+    # BUILD IT AT TRACE TIME, for the same reason the staged path does.
+    # Built on first CALL, the fused step finds XLA already holding 22.54
+    # of 23.68 GB at complex 487 and dies with 0.77 GB to work in -- it is
+    # losing the allocation race, not carrying a bigger footprint, and it
+    # loses harder because ONE call allocates everything at once.
+    _prealloc(pad_to_tile(sequence.shape[0]), recycles, msa_rows,
+              weight_dirs)
+
     # THE SEQUENCE ARRIVES float16 FROM bc2 AND THE CALL IS float32.
     # custom_vjp requires a cotangent to carry its primal's dtype exactly,
     # so a f32 d_sequence against a f16 primal is an AssertionError that

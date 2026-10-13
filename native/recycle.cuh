@@ -105,6 +105,10 @@ struct Recycle {
     CU(cudaMemsetAsync(prev_msa0, 0, n1 * 256 * 4, st));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const std::string& nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
