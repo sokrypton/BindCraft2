@@ -130,6 +130,15 @@ struct Plan {
   // that needs about 1.2.  regrant() hands them out later, once XLA has
   // stopped growing.
   bool defer_keep = false;
+  // DOES THIS STEP EVER DROP?  Not "is dropout on now" -- that rides in
+  // seed[1] and changes per call, because bc2 flips it between the stages
+  // of one trajectory and a static flag would build a SECOND DesignStep
+  // beside this one (two graphs is tolerable; two sets of N^2 buffers is
+  // not).  This decides only whether the two Evoformer stacks RESERVE the
+  // two mask scratches, which has to happen before alloc and therefore has
+  // to be in the cache key.  The template and structure-module blocks
+  // allocate theirs unconditionally, so they need nothing here.
+  bool dropout = false;
 };
 
 // ffi.cu keeps its own bf16ToF32OutK next to the custom calls; a header
@@ -342,6 +351,8 @@ struct DesignStep {
     // gate found it missing here twice, because the first fix copied only
     // the two lines the comment mentioned.
     extra.b.do_msa = false;
+    extra.b.use_dropout = p.dropout;
+    trunk.b.use_dropout = p.dropout;
     extra.defer_keep = p.defer_keep;
     trunk.defer_keep = p.defer_keep;
     extra.alloc(N, 1, p.extra_depth, s);     // pair-only: one msa row
@@ -506,6 +517,28 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   const int gn = (int)(((size_t)N * N + 127) / 128);
   const size_t nn = (size_t)N * N;
   const size_t nn_cz = nn * embed::CZ;
+
+  // 0. DROPOUT, pointed at the caller's seed buffer.  The two Evoformer
+  //    stacks take the device pointer directly (b.drop_seed, the same
+  //    thing ffi.cu's stack handler does); the template embedding and the
+  //    structure module take it through their own setDropout.  Whether a
+  //    mask is actually drawn is seed[1] at RUNTIME -- dropScale returns 1
+  //    when it is zero -- so a trajectory that turns dropout off between
+  //    stages costs no rebuild and no second object.
+  //
+  //    EVERY PASS OF A RECYCLE DRAWS THE SAME MASKS, because the hash is
+  //    (seed, depth, module, index) and nothing here varies per pass.  AF2
+  //    splits a fresh key per recycle, so this is a real difference -- and
+  //    an unexercised one: every gate here runs at recycles=0.  The
+  //    backward's replay DEPENDS on the masks being reproducible, so
+  //    whatever varies per pass must stay a function of the pass index and
+  //    never of a counter.
+  if (plan.dropout) {
+    trunk.b.drop_seed = const_cast<uint32_t*>(in.seed);
+    extra.b.drop_seed = const_cast<uint32_t*>(in.seed);
+    tpl.setDropout(true, in.seed);
+    sm.setDropout(true, in.seed);
+  }
 
   // 1. the designed sequence -> features AlphaFold reads, and the profile
   seqfeat::Scalars sc{};

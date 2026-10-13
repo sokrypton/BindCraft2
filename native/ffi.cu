@@ -1272,11 +1272,16 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // native_stack_prealloc fixed for the staged path, not a larger footprint.
 struct DsKey {
   int nmax, recycles, msa_rows;
+  // CAN this step drop, not does it drop now: it decides whether the two
+  // Evoformer stacks reserve their mask scratches, which happens inside
+  // alloc.  Whether a mask is drawn is seed[1], per call.
+  int dropout;
   std::string trunk, extra, tpl, post, emb;
   bool operator<(const DsKey& o) const {
-    return std::tie(nmax, recycles, msa_rows, trunk, extra, tpl, post, emb)
-         < std::tie(o.nmax, o.recycles, o.msa_rows, o.trunk, o.extra, o.tpl,
-                    o.post, o.emb);
+    return std::tie(nmax, recycles, msa_rows, dropout, trunk, extra, tpl,
+                    post, emb)
+         < std::tie(o.nmax, o.recycles, o.msa_rows, o.dropout, o.trunk,
+                    o.extra, o.tpl, o.post, o.emb);
   }
 };
 static std::map<DsKey, design_step::DesignStep*> g_ds;
@@ -1304,6 +1309,7 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   p.nmax = k.nmax; p.recycles = k.recycles; p.msa_rows = k.msa_rows;
   p.trunk_depth = 48; p.extra_depth = 4; p.tpl_depth = 2; p.sm_depth = 8;
   p.defer_keep = defer_keep;
+  p.dropout = k.dropout != 0;
   m->alloc(p, st);
   auto W = [&](const std::string& d) -> Oracle& {
     Oracle*& w = g_weights[d];
@@ -1322,7 +1328,7 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
 // race, and it loses it harder because ONE call allocates everything where
 // the staged path spreads it over several the prealloc already covers.
 extern "C" int native_design_step_prealloc(int nmax, int recycles,
-                                           int msa_rows,
+                                           int msa_rows, int dropout,
                                            const char* trunk_dir,
                                            const char* extra_dir,
                                            const char* tpl_dir,
@@ -1330,7 +1336,7 @@ extern "C" int native_design_step_prealloc(int nmax, int recycles,
                                            const char* emb_dir) {
   size_t fb0 = 0, tb = 0;
   if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
-  DsKey k{nmax, recycles, msa_rows, std::string(trunk_dir),
+  DsKey k{nmax, recycles, msa_rows, dropout, std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
   ds_get(k, inputfeat::Tables{}, tpl1d::Tables{}, /*stream*/nullptr,
@@ -1357,7 +1363,7 @@ ffi::Error DesignStepImpl(
     ffi::Buffer<ffi::S32> t1437, ffi::Buffer<ffi::S32> t3714,
     ffi::Buffer<ffi::S32> chi_idx, ffi::Buffer<ffi::F32> chi_mask,
     ffi::Buffer<ffi::F32> scalars,
-    int64_t recycles, int64_t msa_rows,
+    int64_t recycles, int64_t msa_rows, int64_t dropout,
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
     std::string_view emb_dir,
@@ -1378,7 +1384,8 @@ ffi::Error DesignStepImpl(
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
                       t1437.typed_data(), t3714.typed_data()};
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
-  DsKey k{NMAX, (int)recycles, (int)msa_rows, std::string(trunk_dir),
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout,
+          std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
@@ -1462,7 +1469,7 @@ ffi::Error DesignStepBwdImpl(
     // prints the whole signature twice and names nothing.
     ffi::Buffer<ffi::BF16> carry_psave, ffi::Buffer<ffi::F32> carry_msave,
     ffi::Buffer<ffi::F32> carry_pout, ffi::Buffer<ffi::F32> carry_mout,
-    int64_t recycles, int64_t msa_rows,
+    int64_t recycles, int64_t msa_rows, int64_t dropout,
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
     std::string_view emb_dir,
@@ -1471,7 +1478,8 @@ ffi::Error DesignStepBwdImpl(
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
                       t1437.typed_data(), t3714.typed_data()};
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
-  DsKey k{NMAX, (int)recycles, (int)msa_rows, std::string(trunk_dir),
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout,
+          std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
@@ -1567,6 +1575,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::BF16>>().Arg<ffi::Buffer<ffi::F32>>()
         .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
         .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
+        .Attr<int64_t>("dropout")
         .Attr<std::string_view>("trunk_dir")
         .Attr<std::string_view>("extra_dir")
         .Attr<std::string_view>("tpl_dir")
@@ -1588,6 +1597,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
         .Arg<ffi::Buffer<ffi::F32>>()      // the four design scalars [4]
         .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
+        .Attr<int64_t>("dropout")
         .Attr<std::string_view>("trunk_dir")
         .Attr<std::string_view>("extra_dir")
         .Attr<std::string_view>("tpl_dir")
