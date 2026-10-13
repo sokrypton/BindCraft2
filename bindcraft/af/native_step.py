@@ -112,11 +112,19 @@ def _step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
 
 
 def _call(name, result, args, cfg):
-    recycles, msa_rows, dirs = cfg
+    recycles, msa_rows, dropout, dirs = cfg
     d = dict(dirs)
     return jax.ffi.ffi_call(name, result)(
         *args,
         recycles=np.int64(recycles), msa_rows=np.int64(msa_rows),
+        # CAN this step drop, not does it drop now.  The attribute decides
+        # whether the two Evoformer stacks reserve their mask scratches,
+        # which happens once when the step is built; WHETHER a mask is drawn
+        # is seed[1], a traced value, because bc2 flips dropout between the
+        # stages of one trajectory and a static flag would build a second
+        # step beside this one -- two graphs is tolerable, two sets of N^2
+        # buffers is not.
+        dropout=np.int64(dropout),
         trunk_dir=d['trunk'], extra_dir=d['extra'],
         tpl_dir=d['tpl'], post_dir=d['post'], emb_dir=d['emb'])
 
@@ -127,7 +135,7 @@ def _step_fwd(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     nmax = sequence.shape[0]
     args = (sequence, atoms, atom_mask, flags, residue_index, asym_id,
             entity_id, interface_asym_id, seq_mask, act_const, length, seed)
-    recycles, msa_rows, _ = cfg
+    recycles, msa_rows, _, _ = cfg
     out = _call('native_design_step', _out_shapes(nmax, msa_rows),
                 args + _tables() + (scalars,), cfg)
     # THE RESIDUAL IS THE INPUT, never the forward's device-side state.  A
@@ -162,7 +170,7 @@ _step.defvjp(_step_fwd, _step_bwd)
 _PREALLOCED: set = set()
 
 
-def _prealloc(nmax, recycles, msa_rows, weight_dirs):
+def _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs):
     """Build the fused step now, while the card is still empty.
 
     A failure here is not fatal: the step is built on first call as before,
@@ -170,7 +178,7 @@ def _prealloc(nmax, recycles, msa_rows, weight_dirs):
     """
     if os.environ.get('NB_NO_PREALLOC'):
         return
-    key = (nmax, int(recycles), int(msa_rows),
+    key = (nmax, int(recycles), int(msa_rows), int(dropout),
            tuple(sorted(weight_dirs.items())))
     if key in _PREALLOCED:
         return
@@ -185,9 +193,9 @@ def _prealloc(nmax, recycles, msa_rows, weight_dirs):
         return
     import ctypes
     fn.restype = ctypes.c_int
-    fn.argtypes = [ctypes.c_int] * 3 + [ctypes.c_char_p] * 5
+    fn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_char_p] * 5
     d = weight_dirs
-    fn(int(nmax), int(recycles), int(msa_rows),
+    fn(int(nmax), int(recycles), int(msa_rows), int(dropout),
        str(d['trunk']).encode(), str(d['extra']).encode(),
        str(d['tpl']).encode(), str(d['post']).encode(),
        str(d['emb']).encode())
@@ -216,7 +224,7 @@ def pad_to_tile(n):
 def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                 entity_id, interface_asym_id, seq_mask, act_const, length,
                 seed, *, softmax_weight, one_hot_weight, temperature,
-                logit_scale, recycles, msa_rows, weight_dirs
+                logit_scale, recycles, msa_rows, weight_dirs, dropout=True
                 ) -> DesignStepOutputs:
     """One call, sequence to the nine arrays boundary.py lists.
 
@@ -229,7 +237,7 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     # of 23.68 GB at complex 487 and dies with 0.77 GB to work in -- it is
     # losing the allocation race, not carrying a bigger footprint, and it
     # loses harder because ONE call allocates everything at once.
-    _prealloc(pad_to_tile(sequence.shape[0]), recycles, msa_rows,
+    _prealloc(pad_to_tile(sequence.shape[0]), recycles, msa_rows, dropout,
               weight_dirs)
 
     # THE SEQUENCE ARRIVES float16 FROM bc2 AND THE CALL IS float32.
@@ -239,7 +247,8 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     # an ordinary convert in the graph, and JAX takes the f32 cotangent
     # back through it to f16 on its own.
     sequence = jnp.asarray(sequence, F32)
-    cfg = (recycles, msa_rows, tuple(sorted(weight_dirs.items())))
+    cfg = (recycles, msa_rows, int(bool(dropout)),
+           tuple(sorted(weight_dirs.items())))
     scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
                          jnp.asarray(one_hot_weight, F32),
                          jnp.asarray(temperature, F32),

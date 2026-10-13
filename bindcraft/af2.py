@@ -507,12 +507,26 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                             _pad_id),
                         _p1(seq_mask), _ac,
                         jnp.asarray([_n], jnp.int32),
-                        jnp.asarray([0, 0], jnp.uint32),
+                        # [seed, enabled], exactly as the staged trunk hook
+                        # builds it.  The seed comes from the model's own
+                        # key so a run stays reproducible from it; `enabled`
+                        # is the TRACED dropout flag, because bc2 flips it
+                        # between the stages of one trajectory and a static
+                        # one would build a second step -- a second set of
+                        # N^2 buffers -- beside this one.  It was [0, 0]
+                        # here, which ran every campaign without dropout and
+                        # said nothing about it.
+                        jnp.stack([
+                            jax.random.bits(key, (), jnp.uint32),
+                            jnp.asarray(dropout, jnp.uint32).reshape(())]),
                         softmax_weight=softmax_weight,
                         one_hot_weight=one_hot_weight,
                         temperature=temperature, logit_scale=logit_scale,
                         recycles=self.num_recycle, msa_rows=1,
-                        weight_dirs=native_step_dirs)
+                        weight_dirs=native_step_dirs,
+                        # CAN it drop: whether the stacks reserve their mask
+                        # scratches, decided once when the step is built.
+                        dropout=bool(self.dropout))
                     predicted_atom_positions = _out.atoms[:_n]
                     predicted_atom_mask = _out.atom_mask[:_n]
                     metrics = {'plddt': _out.plddt[:_n],
