@@ -441,8 +441,26 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                     # it is what puts the step 2 GB over the card.  One
                     # NMAX across the states shares the allocation AND the
                     # graph.
-                    _nmax = _pad_to(max(sum(cl) for _, _, cl
-                                        in complex_shapes))
+                    # SHARE ONE DesignStep ONLY WHERE IT BUYS SOMETHING.
+                    # `length` is a runtime input, so one object sized NMAX
+                    # serves every length <= NMAX -- but `n` is a DEVICE
+                    # value, so host-side launch dimensions cannot depend
+                    # on it: the kernels mask past `n` and still launch
+                    # NMAX threads.  A 260-residue binder_alone in a 672
+                    # buffer therefore pays 672-sized compute, and sharing
+                    # costs ~2x the step.
+                    #
+                    # Per-state objects are faster and hold two
+                    # allocations: 640+256 fits, 672+288 does not (4.26 GB
+                    # of it a binder_alone idle while the complex runs),
+                    # and that is what puts 647 over the card.  So share
+                    # only above the measured point where per-state stops
+                    # fitting.  BC2_NATIVE_STEP_SHARE_N moves it.
+                    _share_n = int(os.environ.get(
+                        'BC2_NATIVE_STEP_SHARE_N', '640'))
+                    _biggest = _pad_to(max(sum(cl) for _, _, cl
+                                           in complex_shapes))
+                    _nmax = _biggest if _biggest > _share_n else _pad_to(_n)
                     _dn = _nmax - _n
                     _pad_id = len(chain_names)
 
