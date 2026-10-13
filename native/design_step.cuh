@@ -124,6 +124,12 @@ struct Plan {
   int tpl_depth;       // 2
   int sm_depth;        // 8
   int msa_rows;        // S
+  // DEFER THE KEEP TIERS, for a trace-time build.  Stack::alloc sizes them
+  // from cudaMemGetInfo, and on an empty card they take everything -- the
+  // staged prealloc hit exactly this and 4.51 GB went to a NMAX=128 step
+  // that needs about 1.2.  regrant() hands them out later, once XLA has
+  // stopped growing.
+  bool defer_keep = false;
 };
 
 // ffi.cu keeps its own bf16ToF32OutK next to the custom calls; a header
@@ -336,6 +342,8 @@ struct DesignStep {
     // gate found it missing here twice, because the first fix copied only
     // the two lines the comment mentioned.
     extra.b.do_msa = false;
+    extra.defer_keep = p.defer_keep;
+    trunk.defer_keep = p.defer_keep;
     extra.alloc(N, 1, p.extra_depth, s);     // pair-only: one msa row
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     t1d.alloc(N, s);
@@ -430,6 +438,20 @@ struct DesignStep {
   // Each component keeps its own directory, exactly as the per-piece FFI
   // factories do -- one Oracle per directory, shared across components that
   // read the same one.
+  // REBIND EVERY MEMBER'S STREAM.  This is what lets the whole step be
+  // BUILT AT TRACE TIME, before XLA's stream exists -- without it `DsKey`
+  // has to carry the stream, and then a trace-time build is a second copy
+  // the real call never finds.  Nothing here is stream-ordered: every
+  // buffer comes from plain cudaMalloc and the stream is used only for
+  // launches and cublasSetStream.  See the prealloc note in ffi.cu.
+  void setStream(cudaStream_t s) {
+    st = s;
+    emb.setStream(s); tpl.setStream(s);
+    extra.setStream(s); trunk.setStream(s);
+    sm.setStream(s); hd.setStream(s);
+    t1d.setStream(s); rec.setStream(s);
+  }
+
   void setWeights(Oracle& trunk_w, Oracle& extra_w, Oracle& tpl_w,
                   Oracle& post_w, Oracle& emb_w, inputfeat::Tables t,
                   tpl1d::Tables t1) {

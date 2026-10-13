@@ -1263,28 +1263,48 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ret<ffi::Buffer<ffi::F32>>());
 
 // ===================== the whole design step in one call ===============
+// OFF THE STREAM KEY, so the whole step can be built at TRACE time.
+// design_step::setStream rebinds every member; nothing in the tree is
+// stream-ordered.  Without this the fused step builds on first CALL, by
+// which point XLA has grown -- measured at complex 487, "before any stack
+// allocation, 22.54 GB of 23.68 is already in use", and the step then dies
+// with 0.77 GB to work in.  That is the SAME allocation race
+// native_stack_prealloc fixed for the staged path, not a larger footprint.
 struct DsKey {
   int nmax, recycles, msa_rows;
   std::string trunk, extra, tpl, post, emb;
-  cudaStream_t st;
   bool operator<(const DsKey& o) const {
-    return std::tie(nmax, recycles, msa_rows, trunk, extra, tpl, post, emb, st)
+    return std::tie(nmax, recycles, msa_rows, trunk, extra, tpl, post, emb)
          < std::tie(o.nmax, o.recycles, o.msa_rows, o.trunk, o.extra, o.tpl,
-                    o.post, o.emb, o.st);
+                    o.post, o.emb);
   }
 };
 static std::map<DsKey, design_step::DesignStep*> g_ds;
 
 design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
-                                tpl1d::Tables t1) {
+                                tpl1d::Tables t1, cudaStream_t st,
+                                bool defer_keep = false) {
   std::lock_guard<std::mutex> lk(g_mu);
   auto it = g_ds.find(k);
-  if (it != g_ds.end()) return it->second;
+  if (it != g_ds.end()) {
+    it->second->setStream(st);
+    // RE-SET THE TABLE POINTERS EVERY CALL.  setWeights STORES them
+    // (`tables = t`, `t1d_tab = t1`) and they are device pointers into
+    // XLA's buffers, which the trace-time prealloc does not have and which
+    // XLA may move between calls anyway.  Host-side and free.  This is the
+    // cached-bias-pointer bug from the README in a new place: there, a
+    // cuBLASLt descriptor baked a bias POINTER and blocks 1..47 silently
+    // used block 0's.
+    it->second->tables = t;
+    it->second->t1d_tab = t1;
+    return it->second;
+  }
   auto* m = new design_step::DesignStep();
   design_step::Plan p{};
   p.nmax = k.nmax; p.recycles = k.recycles; p.msa_rows = k.msa_rows;
   p.trunk_depth = 48; p.extra_depth = 4; p.tpl_depth = 2; p.sm_depth = 8;
-  m->alloc(p, k.st);
+  p.defer_keep = defer_keep;
+  m->alloc(p, st);
   auto W = [&](const std::string& d) -> Oracle& {
     Oracle*& w = g_weights[d];
     if (!w) w = new Oracle(d);
@@ -1294,6 +1314,36 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   g_ds[k] = m;
   return m;
 }
+
+// THE FUSED STEP, AT TRACE TIME.  Same fix as native_stack_prealloc and for
+// the same reason: built on first CALL, the fused step finds XLA already
+// holding 22.54 of 23.68 GB at complex 487 and dies with 0.77 GB to work
+// in.  It is not a bigger footprint -- it is losing the same allocation
+// race, and it loses it harder because ONE call allocates everything where
+// the staged path spreads it over several the prealloc already covers.
+extern "C" int native_design_step_prealloc(int nmax, int recycles,
+                                           int msa_rows,
+                                           const char* trunk_dir,
+                                           const char* extra_dir,
+                                           const char* tpl_dir,
+                                           const char* post_dir,
+                                           const char* emb_dir) {
+  size_t fb0 = 0, tb = 0;
+  if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
+  DsKey k{nmax, recycles, msa_rows, std::string(trunk_dir),
+          std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
+          std::string(emb_dir)};
+  ds_get(k, inputfeat::Tables{}, tpl1d::Tables{}, /*stream*/nullptr,
+         /*defer_keep*/true);
+  size_t fb1 = 0;
+  cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr,
+          "native: prealloc design_step NMAX=%d took %.2f GB "
+          "(%.2f of %.2f GB free after)\n",
+          nmax, (fb0 - fb1) / 1e9, fb1 / 1e9, tb / 1e9);
+  return 0;
+}
+
 
 ffi::Error DesignStepImpl(
     cudaStream_t st,
@@ -1325,8 +1375,8 @@ ffi::Error DesignStepImpl(
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
   DsKey k{NMAX, (int)recycles, (int)msa_rows, std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
-          std::string(emb_dir), st};
-  auto* m = ds_get(k, t, t1);
+          std::string(emb_dir)};
+  auto* m = ds_get(k, t, t1, st);
   m->st = st;
 
   design_step::Inputs in{};
@@ -1391,8 +1441,8 @@ ffi::Error DesignStepBwdImpl(
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
   DsKey k{NMAX, (int)recycles, (int)msa_rows, std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
-          std::string(emb_dir), st};
-  auto* m = ds_get(k, t, t1);
+          std::string(emb_dir)};
+  auto* m = ds_get(k, t, t1, st);
   m->st = st;
 
   design_step::Inputs in{};

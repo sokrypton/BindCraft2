@@ -110,6 +110,10 @@ struct Tpl1D {
     CU(cudaMalloc(&h0, (size_t)N * CM * 4));
   }
 
+  void setStream(cudaStream_t s) {
+    st = s; CUB(cublasSetStream(cub, st));
+  }
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const std::string& nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
