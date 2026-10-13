@@ -651,7 +651,15 @@ def _register():
                            ('native_embed_fwd', 'EmbedderFwd'),
                            ('native_embed_bwd', 'EmbedderBwd'),
                            ('native_tplembed_fwd', 'TemplateEmbeddingFwd'),
-                           ('native_tplembed_bwd', 'TemplateEmbeddingBwd')):
+                           ('native_tplembed_bwd', 'TemplateEmbeddingBwd'),
+                           # the WHOLE STEP as one call -- native_step.py.
+                           # Registered always, used only under
+                           # BC2_NATIVE_STEP: registering a handler costs
+                           # nothing and a missing one fails at RUN time
+                           # with "No FFI handler registered", which is a
+                           # poor way to find out.
+                           ('native_design_step', 'NativeDesignStep'),
+                           ('native_design_step_bwd', 'NativeDesignStepBwd')):
         jax.ffi.register_ffi_target(
             target, jax.ffi.pycapsule(getattr(lib, symbol)), platform='CUDA')
     _registered = True
