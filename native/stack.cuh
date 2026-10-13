@@ -316,6 +316,16 @@ struct Stack {
     if (freed && getenv("BLK_MEM"))
       fprintf(stderr, "stack: freed %.1f MB of module buffers made dead by "
               "fully-granted tiers\n", freed / 1e6);
+    // A DEFERRED GRANT THAT NOBODY COMPLETES IS A STACK WITH NO TIERS, and
+    // for one release that is exactly what the fused design step was: it
+    // owns its stacks, so it never reached the handler where regrant() is
+    // called, and `no_keep` here meant the first grant said nothing either.
+    // Zero tiers, in silence, costing 181 ms a step at complex 215.  Say it
+    // instead, and name the thing that has to happen next.
+    if (defer_keep)
+      fprintf(stderr, "stack: first grant took NO keep tiers (defer_keep) -- "
+              "regrant() must be called on a save forward or this stack "
+              "replays every block for the life of the process\n");
     if (!no_keep)
       for (int t = 0; t < KEEP_NTIER; ++t)
         if (tdepth[t] < depth && !(t == KEEP_RELU && !envOn("NE_KEEP_RELU")))
