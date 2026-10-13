@@ -431,7 +431,18 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                     # The padded tail is a chain of its own -- id
                     # len(chain_names), the same convention _predict_complex
                     # uses -- with seq_mask 0 so nothing real attends to it.
-                    _nmax = _pad_to(_n)
+                    # ONE DesignStep FOR EVERY STATE.  `length` is a
+                    # runtime input, so an object sized NMAX serves any
+                    # length <= NMAX -- which is the whole reason the call
+                    # takes a length instead of a shape.  Padding each
+                    # state to its OWN tile builds one per state and holds
+                    # both: at complex 647 that is 4.26 GB for a
+                    # binder_alone that is idle while the complex runs, and
+                    # it is what puts the step 2 GB over the card.  One
+                    # NMAX across the states shares the allocation AND the
+                    # graph.
+                    _nmax = _pad_to(max(sum(cl) for _, _, cl
+                                        in complex_shapes))
                     _dn = _nmax - _n
                     _pad_id = len(chain_names)
 
