@@ -500,11 +500,18 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                     #      667   --             34.0 s
                     #      687   --             OOM (stack.cuh:540)
                     #
-                    # So 607, and the ~2x that sharing costs is visible in
-                    # the jump from 14.2 to 29.3 across the boundary.
+                    # THE COMPARISON IS AGAINST THE PADDED LENGTH, which
+                    # is what makes the right answer 608 and not 607.
+                    # `_biggest` is _pad_to(...), so complex 607 arrives
+                    # here as 608 and a threshold of 607 sends it to the
+                    # shared object -- 25.8 s where per-state is 14.2.
+                    # Picking the largest length that FITS rather than the
+                    # bucket it lands in silently cost 1.8x across the whole
+                    # 577-608 band.  Per-state fits at padded 608 and dies
+                    # at padded 640, so the threshold is 608.
                     # BC2_NATIVE_STEP_SHARE_N moves it.
                     _share_n = int(os.environ.get(
-                        'BC2_NATIVE_STEP_SHARE_N', '607'))
+                        'BC2_NATIVE_STEP_SHARE_N', '608'))
                     _biggest = _pad_to(max(sum(cl) for _, _, cl
                                            in complex_shapes))
                     _nmax = _biggest if _biggest > _share_n else _pad_to(_n)
