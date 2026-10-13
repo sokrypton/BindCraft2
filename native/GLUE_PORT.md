@@ -4,10 +4,38 @@ The goal: a design step where **only the loss is JAX**, so a user writes new
 losses in Python and never touches CUDA. The contract for that is
 `bindcraft/af/boundary.py`, checked by `native/boundary_gate.py`.
 
+## Where this stands (2026-10-13)
+
+**The port described below is done and wired.** The whole step is ONE custom
+call -- `bindcraft/af/native_step.py`, kernels in `design_step.cuh` -- taking
+the length as a runtime device value, which is the structural win this
+document argued for. It is opt-in behind `BC2_NATIVE_STEP`.
+
+What the plan below did not anticipate, in the order it cost time:
+
+* **Allocation order, not footprint, is the ceiling.** One card with two
+  allocators: whoever asks first wins. The fused step built on first call
+  found XLA holding 22.54 of 23.68 GB. Prealloc at trace time plus
+  `Plan::defer_keep` fixed it (NMAX=512: 14.64 -> 9.91 GB).
+* **The backward replays the forward**, because a design step runs every
+  state's forward before any backward and C++ member state is stale by
+  then. Carrying the trunk's save set and pout/mout across the boundary as
+  XLA buffers took 48 of 54 blocks out of that replay; what remains is 40 ms
+  of a 1334 ms step at complex 215 (`NB_DS_TIME=1`).
+* **A runtime length does not free the BUFFERS from 32-alignment.** An
+  unaligned NMAX dies in cuBLAS, not in a shape check, and no gate here
+  could have caught it: every benchmark length in this repo is 32-aligned.
+* **Acceptance is a distribution, not a gate** -- `native/outcome_ladder.py`.
+  Parity is unavailable, so the question is where trajectories end up.
+
+Measured against the staged path: within 1.5-2.6% at complex 487/537/617,
++15% at 215, and it reaches 687 where staged stops at 632.
+
 Already native: the trunk, the extra-MSA stack, the template pair stack, the
 whole template embedding, the embedder, and the post-trunk structure module
 and heads. What follows is everything else between a sequence and the nine
-boundary arrays.
+boundary arrays -- all of it now ported; the sections are kept because what
+they say about COST and RISK is still true.
 
 ## Measured
 
