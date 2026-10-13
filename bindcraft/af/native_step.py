@@ -7,12 +7,12 @@ buffers are sized NMAX and whose LENGTH IS A RUNTIME INPUT collapses every
 bucket into one graph -- and a loss is still written in Python, because the
 loss is the only thing left on the JAX side.
 
-NOT YET WIRED IN.  design_step.py still runs the JAX pipeline; this module
-is the adapter that will replace its body once dev/native_block's
-ds_compare.py and ds_grad.py both read green against a real design step.
-Nothing imports it yet, deliberately: a half-gated native step that runs is
-worse than one that does not, because the campaign still finishes and the
-binders are merely worse.
+WIRED IN, OPT-IN.  af2.py's gradient path takes this branch when
+BC2_NATIVE_STEP is set; without it design_step.py runs the staged path.
+It is opt-in and not the default because the acceptance evidence is a
+DISTRIBUTION OVER TRAJECTORIES (native/outcome_ladder.py), not a gate: a
+half-gated native step that runs is worse than one that does not, because
+the campaign still finishes and the binders are merely worse.
 
 The kernels live in ColabDesign2/dev/native_block (design_step.cuh); this
 file only knows the call's signature and the nine-array contract in
@@ -130,12 +130,14 @@ def _step_fwd(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     recycles, msa_rows, _ = cfg
     out = _call('native_design_step', _out_shapes(nmax, msa_rows),
                 args + _tables() + (scalars,), cfg)
-    # THE RESIDUAL IS THE INPUT, not the forward's internal state.  The
-    # backward re-runs the forward on the device for exactly this reason:
-    # a design step runs forwards for every state and every recycle before
-    # any backward, so a residual that referred to device-side state would
-    # be read after something else had overwritten it.
-    # the last four are the carried trunk, not outputs the caller wants
+    # THE RESIDUAL IS THE INPUT, never the forward's device-side state.  A
+    # design step runs forwards for every state and every recycle before
+    # any backward, so anything the backward read off a C++ member would
+    # have been overwritten by another state by then (that is the bug that
+    # cost i_pTM 0.79 -> 0.23).  What the backward can be handed instead is
+    # BUFFERS: the last four outputs are the trunk's save set and its
+    # pout/mout, carried as XLA arrays so the backward skips 48 blocks
+    # rather than recomputing them.  They are residual, not results.
     return out[:8], (args, scalars, out[8:])
 
 

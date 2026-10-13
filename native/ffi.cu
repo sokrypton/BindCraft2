@@ -1416,7 +1416,22 @@ ffi::Error DesignStepImpl(
                    carry_msave->typed_data(), carry_pout->typed_data(),
                    carry_mout->typed_data());
   m->skip_trunk = false;
+  const bool tm = envOn("NB_DS_TIME");
+  cudaEvent_t f0, f1;
+  if (tm) {
+    CU(cudaEventCreate(&f0)); CU(cudaEventCreate(&f1));
+    CU(cudaEventRecord(f0, st));
+  }
   m->forward(in, out, /*want_save*/true);
+  if (tm) {
+    float a = 0;
+    CU(cudaEventRecord(f1, st));
+    CU(cudaEventSynchronize(f1));
+    CU(cudaEventElapsedTime(&a, f0, f1));
+    printf("NB_DS_TIME N=%d forward %7.2f ms\n", NMAX, a);
+    fflush(stdout);
+    CU(cudaEventDestroy(f0)); CU(cudaEventDestroy(f1));
+  }
   return ffi::Error::Success();
 }
 
@@ -1477,9 +1492,6 @@ ffi::Error DesignStepBwdImpl(
   in.seed = seed.typed_data();
   in.scalars = scalars.typed_data();
 
-  // NB_NO_REPLAY: a THROWAWAY PROBE, wrong results on purpose.  The
-  // replay is one whole forward a backward, and this times what removing
-  // it would be worth before anything is built to remove it properly.
   // THE REPLAY, MINUS THE TRUNK.  The caller hands back the save set and
   // pout/mout the forward wrote, so emb/tpl/extra/sm/hd rerun (cheap and
   // stateless) while the 48 blocks do not.  NB_NO_TRUNK_CARRY falls back
@@ -1492,8 +1504,21 @@ ffi::Error DesignStepBwdImpl(
         carry_msave.typed_data(), carry_pout.typed_data(),
         carry_mout.typed_data());
   m->skip_trunk = carry;
+  // NB_DS_TIME: what the replay still costs, against the backward it
+  // serves.  The carry took 48 of 54 blocks out of it; whether the six
+  // that remain are worth carrying too is a question only this answers,
+  // and it is small enough at the lengths that matter (2% at 487) that
+  // guessing would be how the next day gets spent.
+  const bool tm = envOn("NB_DS_TIME");
+  cudaEvent_t e0, e1, e2;
+  if (tm) {
+    CU(cudaEventCreate(&e0)); CU(cudaEventCreate(&e1));
+    CU(cudaEventCreate(&e2));
+    CU(cudaEventRecord(e0, st));
+  }
   m->forward(in, m->scratch, /*want_save*/true);
   m->skip_trunk = false;
+  if (tm) CU(cudaEventRecord(e1, st));
 
   design_step::Cotangents ct{};
   ct.atoms = ct_atoms.typed_data();
@@ -1505,6 +1530,19 @@ ffi::Error DesignStepBwdImpl(
   ct.expres_ca = ct_expres.typed_data();
   ct.distogram = ct_dgram.typed_data();
   m->backward(in, ct, d_sequence->typed_data());
+  if (tm) {
+    float a = 0, b = 0;
+    CU(cudaEventRecord(e2, st));
+    CU(cudaEventSynchronize(e2));
+    CU(cudaEventElapsedTime(&a, e0, e1));
+    CU(cudaEventElapsedTime(&b, e1, e2));
+    printf("NB_DS_TIME N=%d replay %7.2f ms  backward %7.2f ms  "
+           "replay is %4.1f%% of the two\n", NMAX, a, b,
+           100.0 * a / (a + b));
+    fflush(stdout);
+    CU(cudaEventDestroy(e0)); CU(cudaEventDestroy(e1));
+    CU(cudaEventDestroy(e2));
+  }
   return ffi::Error::Success();
 }
 
