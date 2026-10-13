@@ -212,12 +212,6 @@ def _native_step_off() -> bool:
     return 'step' in _bcn.disabled_pieces()
 
 
-def _native_step_fits(n: int) -> bool:
-    """Is this complex short enough for the one-call step on this card?"""
-    from .af import native as _bcn
-    return _bcn.supported_step_length(n)
-
-
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
     def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, backend: str='auto', evoformer_backend: str | None=None, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
@@ -430,16 +424,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             # weights_from_params writes a manifest to disk and must not
             # run under a trace.
             native_step_dirs = None
-            # LENGTH IS A CEILING HERE TOO, and the fused path had no check
-            # for it: supported_length() guards the staged hooks only.  Above
-            # the limit, fall through to the staged path, which keeps its own
-            # per-piece caps.  See supported_step_length for what this does
-            # and does not buy -- on the A10 every length past the fused
-            # ceiling is past JAX's as well, so it matters for variable
-            # lengths and other cards rather than for a long fixed one.
-            _longest = max(sum(cl) for _, _, cl in complex_shapes)
-            if (self.native_installed and not _native_step_off()
-                    and _native_step_fits(_longest)):
+            if self.native_installed and not _native_step_off():
                 from .af import native as _bcn
                 _p = self.model_parameters[model]
                 native_step_dirs = {
