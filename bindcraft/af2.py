@@ -388,17 +388,119 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         compiled_gradient = self.gradient_compile_cache.get(cache_key)
         if compiled_gradient is None:
             state_alphafold_runners = {state_name: self._alphafold_runner(model_family, subbatch_size) for state_name, subbatch_size in state_subbatch_sizes}
+            # THE WHOLE STEP AS ONE CALL.  Scaffolding, not the shipping
+            # shape: it is opt-in ONLY because the acceptance test cannot
+            # reach it otherwise -- design_outcomes.py has no `onecall`
+            # mode while nothing imports native_step.  Once that test has
+            # run enough draws to separate the distributions, this inverts
+            # to the convention every other native piece uses, on by
+            # default with BC2_NATIVE_DISABLE=step to back out.
+            #
+            # The dirs are derived HERE, outside the traced function:
+            # weights_from_params writes a manifest to disk and must not
+            # run under a trace.
+            native_step_dirs = None
+            if os.environ.get('BC2_NATIVE_STEP'):
+                from .af import native as _bcn
+                _p = self.model_parameters[model]
+                native_step_dirs = {
+                    'trunk': _bcn.weights_from_params(_p, depth=48),
+                    'extra': _bcn.weights_from_params(_p, depth=4,
+                                                      prefix=_bcn._EXTRA),
+                    'tpl': _bcn.tplembed_weights_from_params(_p),
+                    'post': _bcn.post_weights_from_params(_p),
+                    'emb': _bcn.embed_weights_from_params(_p)}
+                print('native: THE DESIGN STEP IS ONE CALL '
+                      f'(model {model})', flush=True)
             def predict_complex_arrays(alphafold_runner: af_model.RunModel, model_parameters: Array, key: Array, chain_names: tuple[str, ...], chain_lengths: tuple[int, ...], sequence: Array, atoms: Array, atom_mask: Array, flags: Array, residue_index: Array, dropout: Array, softmax_weight: Array, one_hot_weight: Array, temperature: Array, logit_scale: Array, template_act_const: Array | None=None):
                 asym_id = residue_chain_ids(chain_lengths)
                 entity_id = residue_entity_ids(chain_names, chain_lengths, self.multi_chain_binders)
                 seq_mask = real_residue_weights(flags)
-                sequence_features, sequence_profile = prepare_design_sequence_features(sequence, flags, softmax_weight, one_hot_weight, temperature, logit_scale, self.amino_acid_bias)
-                model_inputs = alphafold_input_features(sequence_features, sequence_profile, atoms, atom_mask, residue_index, asym_id, seq_mask, flags, dropout, self.cyclic_offset_mode, entity_id, self.target_flexibility, self.bigbang_initialization, template_act_const)
-                alphafold_outputs = recycled_alphafold_outputs(alphafold_runner, model_parameters, key, model_inputs, self.num_recycle)
-                predicted_atom_positions = alphafold_outputs['structure_module']['final_atom_positions'].astype(jnp.float16)
-                predicted_atom_mask = alphafold_outputs['structure_module']['final_atom_mask'].astype(bool)
-                metrics = alphafold_prediction_metrics(alphafold_outputs, seq_mask, interface_asym_ids(chain_names, chain_lengths))
-                predicted_atom_positions = align_prediction_to_target_template(predicted_atom_positions, predicted_atom_mask, atoms, atom_mask, flags)
+                if native_step_dirs is not None:
+                    # ONE CALL replaces features -> runner -> metrics ->
+                    # align.  It aligns internally (kabsch.cuh), which is
+                    # why this is the right seam and the predict path is
+                    # not: that one aligns OUTSIDE its compiled function.
+                    from .af.native_step import (design_step as _one_call,
+                                                 pad_to_tile as _pad_to)
+                    _n = sum(chain_lengths)
+                    # PAD TO A TILE THE KERNELS CAN TAKE.  `length` being a
+                    # runtime value collapses the per-bucket graphs; it does
+                    # not excuse the BUFFERS from 32-alignment, and an
+                    # unaligned NMAX dies in cuBLAS, not in a shape check.
+                    # The padded tail is a chain of its own -- id
+                    # len(chain_names), the same convention _predict_complex
+                    # uses -- with seq_mask 0 so nothing real attends to it.
+                    _nmax = _pad_to(_n)
+                    _dn = _nmax - _n
+                    _pad_id = len(chain_names)
+
+                    def _p1(a, v=0):
+                        return jnp.pad(a, [0, _dn], constant_values=v) if _dn else a
+
+                    def _p2(a, v=0):
+                        return (jnp.pad(a, [[0, _dn]] + [[0, 0]] * (a.ndim - 1),
+                                        constant_values=v) if _dn else a)
+
+                    _seq = _p2(sequence)
+                    _atoms = _p2(jnp.asarray(atoms, jnp.float32))
+                    _amask = _p2(jnp.asarray(atom_mask, jnp.float32))
+                    _ac = jnp.asarray(template_act_const[0], jnp.float32)
+                    if _dn:
+                        _ac = jnp.pad(_ac, [[0, _dn], [0, _dn], [0, 0]])
+                    if os.environ.get('BC2_NATIVE_STEP_DEBUG'):
+                        for _nm, _v in (('sequence', sequence), ('atoms', atoms),
+                                        ('atom_mask', atom_mask), ('flags', flags),
+                                        ('residue_index', residue_index),
+                                        ('asym_id', asym_id), ('entity_id', entity_id),
+                                        ('seq_mask', seq_mask),
+                                        ('act_const', template_act_const)):
+                            print(f'  one-call operand {_nm:<16} '
+                                  f'{getattr(_v, "dtype", None)} '
+                                  f'{getattr(_v, "shape", None)}', flush=True)
+                    # THE OPERAND CONTRACT IS EXACT (ffi.cu's Bind list):
+                    # F32 sequence/atoms/atom_mask, U8 flags, S32 index and
+                    # the three id arrays, F32 seq_mask/act_const, S32
+                    # length, U32 seed.  bc2 carries atoms as float16 and
+                    # atom_mask as bool, and a mismatch is not a shape error
+                    # -- it is "Failed to decode all FFI handler operands
+                    # (bad operands at: N)", with N COUNTED FROM 1.
+                    #
+                    # act_const loses its leading TEMPLATE axis here: bc2
+                    # adds it with [None] because template_batch is scanned
+                    # over it, and the one-call step takes the constant
+                    # itself.
+                    _out = _one_call(
+                        _seq, _atoms, _amask,
+                        _p1(flags), _p1(residue_index),
+                        _p1(asym_id, _pad_id), _p1(entity_id, _pad_id),
+                        _p1(interface_asym_ids(chain_names, chain_lengths),
+                            _pad_id),
+                        _p1(seq_mask), _ac,
+                        jnp.asarray([_n], jnp.int32),
+                        jnp.asarray([0, 0], jnp.uint32),
+                        softmax_weight=softmax_weight,
+                        one_hot_weight=one_hot_weight,
+                        temperature=temperature, logit_scale=logit_scale,
+                        recycles=self.num_recycle, msa_rows=1,
+                        weight_dirs=native_step_dirs)
+                    predicted_atom_positions = _out.atoms[:_n]
+                    predicted_atom_mask = _out.atom_mask[:_n]
+                    metrics = {'plddt': _out.plddt[:_n],
+                               'pae': _out.pae[:_n, :_n],
+                               'ptm': _out.ptm, 'iptm': _out.iptm,
+                               'iptm_per_residue': _out.iptm_per_residue[:_n],
+                               'experimentally_resolved_ca':
+                                   _out.experimentally_resolved_ca[:_n],
+                               'distogram': _out.distogram[:_n, :_n]}
+                else:
+                    sequence_features, sequence_profile = prepare_design_sequence_features(sequence, flags, softmax_weight, one_hot_weight, temperature, logit_scale, self.amino_acid_bias)
+                    model_inputs = alphafold_input_features(sequence_features, sequence_profile, atoms, atom_mask, residue_index, asym_id, seq_mask, flags, dropout, self.cyclic_offset_mode, entity_id, self.target_flexibility, self.bigbang_initialization, template_act_const)
+                    alphafold_outputs = recycled_alphafold_outputs(alphafold_runner, model_parameters, key, model_inputs, self.num_recycle)
+                    predicted_atom_positions = alphafold_outputs['structure_module']['final_atom_positions'].astype(jnp.float16)
+                    predicted_atom_mask = alphafold_outputs['structure_module']['final_atom_mask'].astype(bool)
+                    metrics = alphafold_prediction_metrics(alphafold_outputs, seq_mask, interface_asym_ids(chain_names, chain_lengths))
+                    predicted_atom_positions = align_prediction_to_target_template(predicted_atom_positions, predicted_atom_mask, atoms, atom_mask, flags)
                 input_chain_arrays = split_residue_arrays_by_chain(chain_names, chain_lengths, sequence=sequence, atoms=atoms, atom_mask=atom_mask, flags=flags, residue_index=residue_index)
                 predicted_chain_arrays = split_residue_arrays_by_chain(chain_names, chain_lengths, atoms=predicted_atom_positions, atom_mask=predicted_atom_mask)
                 input_complex = {name: Protein(**input_chain_arrays[name]) for name in chain_names}

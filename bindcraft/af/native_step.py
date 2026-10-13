@@ -139,6 +139,26 @@ def _step_bwd(cfg, res, cts):
 _step.defvjp(_step_fwd, _step_bwd)
 
 
+TILE = 32
+
+
+def pad_to_tile(n):
+    """The NMAX the kernels can actually tile.
+
+    THE BUFFERS MUST BE 32-ALIGNED EVEN THOUGH `length` IS A RUNTIME VALUE.
+    The runtime length is what collapses the per-bucket graphs into one; it
+    does NOT free the ALLOCATION from the tiling constraint, and an
+    unaligned NMAX dies in cuBLAS -- `trimul_body.cuh:1016 cublas: 15`
+    (NOT_SUPPORTED), not a shape error.
+
+    No gate could have caught this: ds_compare.py and ds_grad.py both run
+    DS_N=64, and every benchmark length in this repo is 32-aligned, so the
+    whole glue port had never seen a length the kernels cannot tile.  The
+    first real complex is 215.
+    """
+    return (n + TILE - 1) // TILE * TILE
+
+
 def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                 entity_id, interface_asym_id, seq_mask, act_const, length,
                 seed, *, softmax_weight, one_hot_weight, temperature,
@@ -150,6 +170,13 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     shape.  That is the whole point: an attribute or a shape would put the
     graph back to one per 32-residue bucket and the port would buy nothing.
     """
+    # THE SEQUENCE ARRIVES float16 FROM bc2 AND THE CALL IS float32.
+    # custom_vjp requires a cotangent to carry its primal's dtype exactly,
+    # so a f32 d_sequence against a f16 primal is an AssertionError that
+    # names two ShapedArrays and nothing else.  Casting OUTSIDE _step puts
+    # an ordinary convert in the graph, and JAX takes the f32 cotangent
+    # back through it to f16 on its own.
+    sequence = jnp.asarray(sequence, F32)
     cfg = (recycles, msa_rows, tuple(sorted(weight_dirs.items())))
     scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
                          jnp.asarray(one_hot_weight, F32),
