@@ -16,7 +16,10 @@
 # THE ARMS, in the order the step was built:
 #   jax      backend='jax'                       -- XLA does everything
 #   native   backend='native'                    -- staged: our kernels, XLA glue
-#   onecall  backend='native' + BC2_NATIVE_STEP  -- the whole step as one call
+#   onecall  backend='native'                    -- the whole step as one call,
+#                                                   which is now the DEFAULT;
+#                                                   `native` is the one that
+#                                                   has to ask to opt out
 #
 # ONE ARM PER PROCESS, all of its seeds inside it.  The native hooks are
 # module-level globals and g_stacks keys on N with no destructor, so a second
@@ -42,8 +45,11 @@ WEIGHTS = {'weights_plddt_loss': 1.0, 'weights_sequence_entropy': 0.1,
 
 
 def one(arm, seeds):
-    if arm == 'onecall':
-        os.environ['BC2_NATIVE_STEP'] = '1'
+    # THE OPT-OUT MOVED, not the arm.  The fused step is the default since
+    # 2026-10-13, so it is the staged arm that now sets a variable -- and
+    # this file is the reason that arm still has to be reachable at all.
+    if arm == 'native':
+        os.environ['BC2_NATIVE_DISABLE'] = 'step'
     import bindcraft                     # FIRST: it sets PREALLOCATE=false
     import jax, jax.numpy as jnp
     from bindcraft.af2 import AlphaFoldDesignModel as AF2

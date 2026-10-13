@@ -9,7 +9,8 @@ losses in Python and never touches CUDA. The contract for that is
 **The port described below is done and wired.** The whole step is ONE custom
 call -- `bindcraft/af/native_step.py`, kernels in `design_step.cuh` -- taking
 the length as a runtime device value, which is the structural win this
-document argued for. It is opt-in behind `BC2_NATIVE_STEP`.
+document argued for. On by default since 2026-10-13;
+`BC2_NATIVE_DISABLE=step` runs the staged path instead.
 
 What the plan below did not anticipate, in the order it cost time:
 

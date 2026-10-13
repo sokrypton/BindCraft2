@@ -50,27 +50,41 @@ python bindcraft.py mycampaign.json --jax
 python bindcraft.py mycampaign.json backend=jax              # the same thing
 ```
 
-### The whole step as one call (`BC2_NATIVE_STEP=1`)
+### The whole step as one call (on by default)
 
-Opt-in, and a different thing from the backend above. With it set, a design
-step is ONE custom call -- features, embedder, stacks, trunk, structure
-module, heads, confidence and the superposition -- instead of a dozen native
-calls with XLA between them, and the LENGTH is a runtime input rather than a
-shape. That collapses the per-32-bucket graphs into one graph, cuts XLA's
-share of the card to a 0.16 memory fraction, and raises the longest complex
-that runs here from 632 residues to 687.
+A design step is ONE custom call -- features, embedder, stacks, trunk,
+structure module, heads, confidence and the superposition -- instead of a
+dozen native calls with XLA between them, and the LENGTH is a runtime input
+rather than a shape. That collapses the per-32-bucket graphs into one graph,
+cuts XLA's share of the card to a 0.16 memory fraction, and raises the
+longest complex that runs here from 632 residues to 687.
 
-It is within a few percent of the staged path's speed at the lengths a
-campaign spends its time in, and about 2.2x JAX. It is opt-in because the
-evidence that it DESIGNS as well is a distribution over trajectories
-(`native/outcome_ladder.py`), not a gate -- and a half-gated design step is
-worse than none, because the campaign still finishes and the binders are
-merely worse.
+It follows the kernels: where `backend` falls back to JAX, so does this.
+
+Six seeds x 50 iters, hPDL1 with a 100-mer binder (complex 215), minutes a
+trajectory and the loss each arm reached:
+
+| | jax | staged native | one call |
+| --- | --- | --- | --- |
+| minutes | 1.7520 | 1.0129 | 1.0386 |
+| loss | 2.8905 | 2.6025 | 2.6184 |
+| complex.iptm | 0.7777 | 0.8446 | 0.8341 |
+
+It was opt-in until 2026-10-13, because the evidence that it DESIGNS as well
+is a distribution over trajectories (`native/outcome_ladder.py`) and not a
+gate -- a bf16 Evoformer has no reproducible trajectory, so there is no
+parity to check. A half-gated design step is worse than none: the campaign
+still finishes and the binders are merely worse, which is exactly how this
+path ran for weeks without applying dropout at all. What it took to turn on:
+twelve seeds x 50 iters putting the fused distribution on top of the staged
+one, dropout wired and gated (`native/dropout_gate.py`), and the +15% it used
+to cost at 215 traced to its stacks never being handed their keep tiers.
 
 ```bash
-BC2_NATIVE_STEP=1 python bindcraft.py mycampaign.json
+BC2_NATIVE_DISABLE=step python bindcraft.py mycampaign.json  # staged instead
 NB_NO_TRUNK_CARRY=1 ...   # back out the fwd->bwd carry (slower, same numbers)
 NB_DS_TIME=1 ...          # what the backward's replay costs
+NE_CUPTI=1 ...            # every kernel in the step, by device time
 ```
 
 ## What it is not

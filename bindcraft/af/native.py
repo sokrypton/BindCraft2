@@ -653,8 +653,8 @@ def _register():
                            ('native_tplembed_fwd', 'TemplateEmbeddingFwd'),
                            ('native_tplembed_bwd', 'TemplateEmbeddingBwd'),
                            # the WHOLE STEP as one call -- native_step.py.
-                           # Registered always, used only under
-                           # BC2_NATIVE_STEP: registering a handler costs
+                           # Registered always, skipped only under
+                           # BC2_NATIVE_DISABLE=step: registering a handler costs
                            # nothing and a missing one fails at RUN time
                            # with "No FFI handler registered", which is a
                            # poor way to find out.
@@ -1343,7 +1343,13 @@ def _make_stack(depth, weights_dir, dropout=False, pair_only=False):
 # list of pieces to leave on JAX while the rest stay native -- for bisecting
 # a bad campaign, not a performance dial.  There is no speed reason to use
 # it: all-on is the fastest configuration measured (native/flag_sweep.py).
-_PIECES = ('extra', 'template', 'tplembed', 'post', 'embed')
+# `step` is not one of the five: it does not leave a piece on JAX, it
+# chooses between two native paths -- the whole design step as ONE call,
+# or the same work staged through the per-piece handlers.  It lives here
+# anyway because it is the same question a user is asking ("back this out
+# without giving up the native path") and a second variable for it would
+# be a second thing to remember.
+_PIECES = ('extra', 'template', 'tplembed', 'post', 'embed', 'step')
 # the five that used to be separate.  They are REFUSED rather than ignored:
 # someone with BC2_NATIVE_POST=0 in a script should learn that it moved, not
 # silently get the opposite of what they asked for.
@@ -1353,6 +1359,15 @@ _RETIRED = {'BC2_NATIVE_EXTRA': 'extra', 'BC2_NATIVE_TEMPLATE': 'template',
 
 
 def _disabled_pieces():
+    # BC2_NATIVE_STEP WAS THE OPT-IN AND IS NOW THE DEFAULT.  It is refused
+    # rather than ignored for the same reason the five below are: someone
+    # carrying BC2_NATIVE_STEP=0 in a script is asking for the staged path
+    # and would silently get the opposite.
+    if os.environ.get('BC2_NATIVE_STEP') is not None:
+        raise ValueError(
+            'BC2_NATIVE_STEP no longer exists: the whole design step as one '
+            'call is the default.  Remove it, or use '
+            'BC2_NATIVE_DISABLE=step to run the staged path instead.')
     for old, piece in _RETIRED.items():
         if os.environ.get(old) is not None:
             raise ValueError(
@@ -1368,6 +1383,16 @@ def _disabled_pieces():
             f'BC2_NATIVE_DISABLE: unknown piece(s) {sorted(unknown)}; '
             f'known are {list(_PIECES)}')
     return names
+
+
+def disabled_pieces():
+    """The pieces BC2_NATIVE_DISABLE asks to leave off, validated.
+
+    Public because af2 has to ask about `step` before it builds the weight
+    directories for the one-call path, and a caller reaching for the
+    underscore name would not get the retired-variable check with it.
+    """
+    return _disabled_pieces()
 
 
 def use_model(name: str):

@@ -494,7 +494,7 @@ set them before starting a run.
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `BC2_NATIVE_EXTRA` | on | The extra-MSA stack. `0` returns it to JAX. |
-| `BC2_NATIVE_DISABLE` | unset | **Debugging only.** Comma separated list of native pieces to leave on JAX while the rest stay native: `extra`, `template`, `tplembed`, `post`, `embed`. For bisecting a bad campaign, never for speed -- all-on is the fastest configuration measured. An unknown name is refused rather than ignored. |
+| `BC2_NATIVE_DISABLE` | unset | **Debugging only.** Comma separated list of native pieces to leave on JAX while the rest stay native: `extra`, `template`, `tplembed`, `post`, `embed`. `step` is the odd one out -- it does not return anything to JAX, it runs the design step staged through the per-piece handlers instead of as one fused call. For bisecting a bad campaign, never for speed -- all-on is the fastest configuration measured. An unknown name is refused rather than ignored. |
 
 ONE SWITCH, NOT FIVE.  `backend` in the settings file (`auto`, `native` or
 `jax`), or `--jax`, or `BC2_NATIVE=0`, turns the whole native path on or
