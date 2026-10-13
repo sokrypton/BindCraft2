@@ -74,11 +74,26 @@ def _tables():
     return tuple(jnp.asarray(a) for a in _table_arrays())
 
 
-def _out_shapes(nmax):
+CZ, CM, TRUNK_DEPTH = 128, 256, 48
+
+
+def _out_shapes(nmax, msa_rows):
     s = jax.ShapeDtypeStruct
+    from . import native as _bcn
+    # THE TRUNK, CARRIED TO THE BACKWARD.  Four more outputs: the save set
+    # the forward already writes, plus pout/mout, so the backward does not
+    # replay 48 blocks it has computed.  The save-set shape must match
+    # Stack::saveSlots() EXACTLY -- both sides key on the same depth and N,
+    # and a mismatch is not a shape error, it is a backward reading past
+    # the end of someone else's buffer.
+    slots = _bcn._save_slots(TRUNK_DEPTH, nmax)
+    sm = msa_rows + 1          # the trunk carries the template row too
     return (s((nmax, 37, 3), F32), s((nmax,), F32), s((nmax, nmax), F32),
             s((), F32), s((), F32), s((nmax,), F32), s((nmax,), F32),
-            s((nmax, nmax, DBINS), F32))
+            s((nmax, nmax, DBINS), F32),
+            s((slots, nmax, nmax, CZ), jnp.bfloat16),
+            s((slots, sm, nmax, CM), F32),
+            s((nmax, nmax, CZ), F32), s((sm, nmax, CM), F32))
 
 
 # cfg is nondiff, so every member of it must be HASHABLE: the weight
@@ -112,18 +127,20 @@ def _step_fwd(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     nmax = sequence.shape[0]
     args = (sequence, atoms, atom_mask, flags, residue_index, asym_id,
             entity_id, interface_asym_id, seq_mask, act_const, length, seed)
-    out = _call('native_design_step', _out_shapes(nmax),
+    recycles, msa_rows, _ = cfg
+    out = _call('native_design_step', _out_shapes(nmax, msa_rows),
                 args + _tables() + (scalars,), cfg)
     # THE RESIDUAL IS THE INPUT, not the forward's internal state.  The
     # backward re-runs the forward on the device for exactly this reason:
     # a design step runs forwards for every state and every recycle before
     # any backward, so a residual that referred to device-side state would
     # be read after something else had overwritten it.
-    return out, (args, scalars)
+    # the last four are the carried trunk, not outputs the caller wants
+    return out[:8], (args, scalars, out[8:])
 
 
 def _step_bwd(cfg, res, cts):
-    args, scalars = res
+    args, scalars, carry = res
     nmax = args[0].shape[0]
     # THE COTANGENTS GO IN THE CONTRACT'S ORDER and the scalars last, which
     # is the order ffi.cu binds them.  A reordering here is silent: every
@@ -131,7 +148,7 @@ def _step_bwd(cfg, res, cts):
     d_sequence = _call(
         'native_design_step_bwd', jax.ShapeDtypeStruct((nmax, 20), F32),
         args + _tables()
-        + tuple(jnp.asarray(c, F32) for c in cts) + (scalars,), cfg)
+        + tuple(jnp.asarray(c, F32) for c in cts) + (scalars,) + carry, cfg)
     zeros = tuple(jnp.zeros_like(a) for a in args[1:]) + (
         jnp.zeros_like(scalars),)
     return (d_sequence,) + zeros
