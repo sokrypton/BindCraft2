@@ -2,7 +2,7 @@
 #
 #   python native/dropout_gate.py
 #
-# It did not, and nothing said so.  `BC2_NATIVE_STEP` passed [0, 0] as the
+# It did not, and nothing said so.  af2.py passed [0, 0] as the
 # seed -- seed 0, dropout DISABLED -- and DesignStep never pointed its stacks
 # at a seed at all, so every campaign run through the one-call step trained
 # without the dropout its settings asked for.  A silent difference in the
@@ -20,7 +20,6 @@
 #      ignored passes 1 and 2)
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ['BC2_NATIVE_STEP'] = '1'
 import bindcraft                      # FIRST: it sets PREALLOCATE=false
 import jax, numpy as np
 from bindcraft.af2 import AlphaFoldDesignModel as AF2

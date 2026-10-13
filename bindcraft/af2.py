@@ -206,6 +206,12 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
         return subbatch_size
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
+def _native_step_off() -> bool:
+    """BC2_NATIVE_DISABLE=step: run the staged native path, not the fused one."""
+    from .af import native as _bcn
+    return 'step' in _bcn.disabled_pieces()
+
+
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
     def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, backend: str='auto', evoformer_backend: str | None=None, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
@@ -245,6 +251,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         # 'native' INSISTS: it is a request, so a card or build that cannot
         # serve it should say so rather than quietly run something else.
         self.native_evoformer = backend in ('auto', 'native')
+        self.native_installed = False
         #for the desperation autotuner only
         self.num_recycle = num_recycle
         self.target_flexibility = target_flexibility
@@ -285,6 +292,12 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             # batch like stock's, because bindcraft flips it between stages
             # of one trajectory and a static flag would recompile there.
             installed = native.install_models(self.model_parameters, dropout=bool(dropout))
+            # THE ONE-CALL STEP NEEDS THIS, and `installed` was a local.  A
+            # campaign that asked for backend=auto on a card without the
+            # kernels falls back to JAX, and the fused step must fall back
+            # with it rather than reach for handlers that were never
+            # registered.
+            self.native_installed = bool(installed)
             if not installed and self.evoformer_backend == 'native':
                 raise RuntimeError(
                     'evoformer_backend=native was asked for but the kernels '
@@ -388,19 +401,30 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         compiled_gradient = self.gradient_compile_cache.get(cache_key)
         if compiled_gradient is None:
             state_alphafold_runners = {state_name: self._alphafold_runner(model_family, subbatch_size) for state_name, subbatch_size in state_subbatch_sizes}
-            # THE WHOLE STEP AS ONE CALL.  Scaffolding, not the shipping
-            # shape: it is opt-in ONLY because the acceptance test cannot
-            # reach it otherwise -- design_outcomes.py has no `onecall`
-            # mode while nothing imports native_step.  Once that test has
-            # run enough draws to separate the distributions, this inverts
-            # to the convention every other native piece uses, on by
-            # default with BC2_NATIVE_DISABLE=step to back out.
+            # THE WHOLE STEP AS ONE CALL, on by default since 2026-10-13,
+            # which is the convention every other native piece uses:
+            # BC2_NATIVE_DISABLE=step leaves the staged path in place.
+            #
+            # What it took to get here, since "it is faster" was never the
+            # question: the acceptance ladder (native/outcome_ladder.py) at
+            # 12 seeds x 50 iters put the fused arm's outcome distribution
+            # on top of the staged one and both ahead of jax, which is the
+            # only answerable form of the question -- a bf16 Evoformer has
+            # no reproducible trajectory, so there is no parity to check.
+            # Dropout, which this path silently never applied, is wired and
+            # gated (native/dropout_gate.py).  And the +15% it used to cost
+            # at complex 215 is gone: its stacks were never handed their
+            # keep tiers, so every block replayed.  6 seeds x 50 iters now
+            # read 1.7520 min (jax) / 1.0129 (staged) / 1.0386 (fused).
+            #
+            # It follows the kernels, not the flag: on a card where they
+            # cannot run, `backend=auto` falls back to JAX and so does this.
             #
             # The dirs are derived HERE, outside the traced function:
             # weights_from_params writes a manifest to disk and must not
             # run under a trace.
             native_step_dirs = None
-            if os.environ.get('BC2_NATIVE_STEP'):
+            if self.native_installed and not _native_step_off():
                 from .af import native as _bcn
                 _p = self.model_parameters[model]
                 native_step_dirs = {

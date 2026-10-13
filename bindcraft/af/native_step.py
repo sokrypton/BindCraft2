@@ -7,12 +7,16 @@ buffers are sized NMAX and whose LENGTH IS A RUNTIME INPUT collapses every
 bucket into one graph -- and a loss is still written in Python, because the
 loss is the only thing left on the JAX side.
 
-WIRED IN, OPT-IN.  af2.py's gradient path takes this branch when
-BC2_NATIVE_STEP is set; without it design_step.py runs the staged path.
-It is opt-in and not the default because the acceptance evidence is a
-DISTRIBUTION OVER TRAJECTORIES (native/outcome_ladder.py), not a gate: a
+WIRED IN AND ON BY DEFAULT (2026-10-13).  af2.py's gradient path takes this
+branch whenever the kernels installed; BC2_NATIVE_DISABLE=step runs the
+staged path instead.
+
+It was opt-in for as long as it was, because the acceptance evidence is a
+DISTRIBUTION OVER TRAJECTORIES (native/outcome_ladder.py) and not a gate --
+a bf16 Evoformer has no reproducible trajectory to be right against.  A
 half-gated native step that runs is worse than one that does not, because
-the campaign still finishes and the binders are merely worse.
+the campaign still finishes and the binders are merely worse; this path
+spent weeks applying no dropout at all, which is exactly that failure.
 
 The kernels live in ColabDesign2/dev/native_block (design_step.cuh); this
 file only knows the call's signature and the nine-array contract in
