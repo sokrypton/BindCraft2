@@ -709,7 +709,21 @@ struct TriAttn {
   // TA_ROWS overrides at any length; TA_ROWS=0 forces it off.
   static int taChunkRows(int n) {
     const char* e = getenv("TA_ROWS");
-    const int r = e ? atoi(e) : (nbChunkOn((size_t)n) ? n / 4 : 0);
+    // nbChunkOnAt, NOT nbChunkOn: the pin is deliberately not applied here.
+    //
+    // The claim above -- N/2 and N/4 bit-identical to the unchunked run --
+    // holds at the Evoformer's width and NOT at the template's.  Gated
+    // directly (realloc_gate GATE_TPL, 512 -> 128): with the chunk policy
+    // pinned the template stack differs, with TA_ROWS=0 it is bit-identical,
+    // and the full-step stage diff named `tpl_out` as the first stage to
+    // diverge with the embedder before it matching exactly.  So a short
+    // state must chunk as ITS length says, not as the allocation's does.
+    //
+    // The cost is that the row buffers grow when a short state runs
+    // unchunked where the long one chunked -- 224 rows against 608/4 = 152.
+    // That is one bounded fresh allocation, and the adopt in this file
+    // re-aliases after it, because a reuse pass re-runs alloc() in order.
+    const int r = e ? atoi(e) : (nbChunkOnAt((size_t)n) ? n / 4 : 0);
     return (r > 0 && r < n) ? r : n;
   }
 

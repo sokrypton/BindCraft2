@@ -79,6 +79,8 @@ inline bool envOn(const char* name) {
 // because nbChunkOn is.
 namespace nbrealloc { inline int& allocN() { static int n = 0; return n; } }
 
+inline bool nbChunkOnAt(size_t n);   // defined just below nbChunkOn
+
 inline bool nbChunkOn(size_t n) {
   // CHUNK AS THE ALLOCATION DID, not as this length would on its own.
   //
@@ -95,6 +97,20 @@ inline bool nbChunkOn(size_t n) {
   // length in the long length's chunks is the same arithmetic in more
   // iterations, and keeps every buffer inside what it already has.
   if (nbrealloc::allocN()) n = (size_t)nbrealloc::allocN();
+  return nbChunkOnAt(n);
+}
+
+// The policy for a length, with no pin applied.  The pair TRANSITION asks
+// this instead, because chunking is not neutral there the way it is for the
+// tri-muls and the triangle attentions: it flips `h_chunked`, and with it
+// whether the 512-wide hidden activation is materialised whole or
+// RECOMPUTED per chunk in the backward.  Pinning it made a short state take
+// the long state's backward path and the gradient moved 0.4% at complex
+// 487 -- reproducible in both arms, so a real divergence and not the
+// bf16 run-to-run noise.  The buffer it sizes is 51 MB against 47 at the
+// lengths where that costs anything, so leaving it unpinned costs one small
+// fresh allocation and buys a gradient identical to the per-state path.
+inline bool nbChunkOnAt(size_t n) {
   static const char* e = getenv("NB_CHUNK_N");
   static const size_t thresh = e ? (size_t)atoll(e) : 480;
   return thresh > 0 && n > thresh;

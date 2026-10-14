@@ -366,7 +366,7 @@ struct Trans {
     const char* e = getenv("TR_ROWS");
     size_t r;
     if (e) r = (size_t)atoll(e);
-    else if (pair && nbChunkOn((size_t)llround(sqrt((double)m)))) r = m / 8;
+    else if (pair && nbChunkOnAt((size_t)llround(sqrt((double)m)))) r = m / 8;
     else r = 0;
     return (r > 0 && r < m) ? r : m;
   }
