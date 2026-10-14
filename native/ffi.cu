@@ -1284,13 +1284,21 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // buffers it already has, so neither is necessary.  With NB_ONE_OBJECT the
 // key drops `nmax` and the longest allocation serves every state.
 //
-// OFF BY DEFAULT while it earns its keep.  The failure it has to be trusted
-// not to make is silent: a stride that kept the long length while the rest
-// moved reads real numbers from the wrong place.  The gate is |grad| against
-// the per-state path at the same length, which must be bit-identical --
-// identical kernels on identical shapes, differing only in base address.
+// ON BY DEFAULT since 2026-10-14, and the evidence is exactness rather than
+// speed: |grad| against the per-state path is BIT-IDENTICAL at every length
+// the two can both run -- complex 487, 547, 587 and 607, 7.54957 / 9.24292
+// / 8.75168 / 9.02069 in both arms.  That is the gate that matters, because
+// the failure this has to be trusted not to make is silent: a stride that
+// kept the long length while the rest moved reads real numbers from the
+// wrong place.  Above 608 there is nothing to compare against -- per-state
+// does not run there, which is the whole point of this.
+//
+// NB_ONE_OBJECT=0 goes back to one DesignStep per 32-bucket, and with it
+// BC2_NATIVE_STEP_SHARE_N's threshold.  Both paths are KEPT, and not out of
+// caution about this one: per-state is the ORACLE the exactness gate
+// compares against, and deleting it would delete the gate.
 static bool oneObject() {
-  static bool on = envOn("NB_ONE_OBJECT");
+  static bool on = envOnDef("NB_ONE_OBJECT", true);
   return on;
 }
 
