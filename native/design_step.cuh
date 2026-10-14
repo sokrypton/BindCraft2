@@ -711,6 +711,15 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   //    query + output, and the replay then runs the template embedding on
   //    an input it never saw -- green forward, quietly wrong gradient,
   //    which is the shape of the bug that broke a campaign once already.
+  // NB_TPL_DIRTY: the test the two scribbles above do NOT make.  They
+  // destroy a stack's scratch AFTER it has run, which shows the contents
+  // need not survive.  Sharing imposes the opposite condition: the template
+  // would START on whatever bytes the Evoformer left behind, so every
+  // module must WRITE its scratch before it reads it.  A module that leans
+  // on a zeroed buffer, or on its own leftovers from the previous call,
+  // passes both scribbles and breaks the moment the bytes are shared.
+  if (envOn("NB_TPL_DIRTY"))
+    nbrealloc::scribble(tpl_ledger_first, tpl_ledger_last, st);
   tpl.forward(emb.pair, in.act_const, pair_mask, tpl_out, /*save*/nullptr);
   // NB_TPL_SCRIBBLE: destroy the template stack's scratch the instant its
   // forward returns.  tpl.backward REPLAYS from its query (see the note
@@ -739,6 +748,10 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   //    carry -- but the TRUNK takes the msa with the template row on the
   //    end, and the mask with the template's row mask on the end.
   const size_t rowc = (size_t)N * embed::CM;
+  // NB_EVO_DIRTY: the fourth condition, symmetric to NB_TPL_DIRTY.  Shared
+  // bytes arrive at the Evoformer holding whatever the template stack left.
+  if (envOn("NB_EVO_DIRTY"))
+    nbrealloc::scribble(evo_ledger_first, evo_ledger_last, st);
   extra.forward(pair_all, emb.msa, pair_mask, in.seq_mask);
   for (int r = 0; r < plan.msa_rows; ++r) {
     CU(cudaMemcpyAsync(trunk_msa + r * rowc, emb.msa + r * rowc, rowc * 4,
@@ -947,6 +960,10 @@ inline void DesignStep::backward(const Inputs& in, const Cotangents& ct,
   // trunk stacks' scratch.  Nothing after this point may depend on it.
   if (envOn("NB_EVO_SCRIBBLE"))
     nbrealloc::scribble(evo_ledger_first, evo_ledger_last, st);
+  // and the same for the template's BACKWARD, which replays its forward and
+  // so must also tolerate dirty scratch on entry
+  if (envOn("NB_TPL_DIRTY"))
+    nbrealloc::scribble(tpl_ledger_first, tpl_ledger_last, st);
   tpl.backward(d_pair, emb.pair, in.act_const, pair_mask,
                tpl_save, d_tpl_query);
   foldit::accK<<<(int)((nn_cz + 255) / 256), 256, 0, st>>>(
