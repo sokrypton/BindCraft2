@@ -426,6 +426,9 @@ struct DesignStep {
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     dstook("trunk stack");
     t1d.alloc(N, s);  dstook("tpl1d");
+    // Zero recycles is what design runs, and then the two normed buffers
+    // hold zeros forever -- 277 MB of them at N=736.  See recycle.cuh.
+    rec.prev_zero = (p.recycles == 0);
     rec.alloc(N, s);  dstook("recycle");
     // BEFORE alloc().  do_atoms decides whether the last fold iteration
     // ALLOCATES the atom builder's output at all -- ffi.cu's sm_get sets it
