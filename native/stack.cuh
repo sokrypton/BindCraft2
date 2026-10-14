@@ -614,12 +614,65 @@ struct Stack {
   // takes it from `pair.dimensions()[0]` and Python from `pair.shape[0]`.
   // Anything else here -- a length the caller passes, a padded figure one
   // side computes -- would be a save-set the two disagree about.
+  // HOW MANY BLOCKS THE SAVE SET SKIPS, chosen from the CARD'S BUDGET rather
+  // than from a length threshold tuned on one card.
+  //
+  // The old rule was `k = 4 above N=512`, with the 512 scaled per device by
+  // native.py's _scaled().  That moves WHEN the stride turns on but not HOW
+  // FAR it goes, so a bigger card running a proportionally longer sequence
+  // still got k = 4 -- and complex 1087 on a 40 GB A100 needed k = 6, which
+  // had to be set by hand.
+  //
+  // The quantity that actually matters is the save set AS A FRACTION OF THE
+  // BUDGET: slots(k) * N^2 * CZ * 2, where slots(k) = ceil(depth/k) + k - 1.
+  // Picking the smallest k that fits a fraction of the budget is both
+  // per-card and per-length, which is what the length threshold was a proxy
+  // for.
+  //
+  // THE BUDGET IS PASSED IN, NOT READ HERE, and that is load-bearing.
+  // native.py's _save_slots DUPLICATES this function -- XLA allocates the
+  // buffer from the shape Python declares and this code slices it -- and the
+  // two must agree EXACTLY: if Python says fewer slots than this slices, the
+  // backward reads past the end of somebody else's buffer, which is not a
+  // compile error and not a crash, just a wrong gradient.  Both sides
+  // reading cudaMemGetInfo would observe different free memory at different
+  // moments and could disagree.  Python reads the device budget once and
+  // exports it as NB_BUDGET_BYTES, so both compute from the same number.
+  // MIRRORS native.py's _stride_k EXACTLY -- see the note there, and the
+  // one at the export of NB_BUDGET_BYTES.  Only a SATURATED base escalates:
+  // below the length threshold nothing changes, and at k = 4 the stride
+  // tightens only if the save-set at k = 4 does not fit a ninth of the
+  // budget.  k > 4 costs about 4% a step, so it is not paid where k = 4 fits.
+  static int slotsAt(int depth_, int k) {
+    return k <= 1 ? depth_ : (depth_ + k - 1) / k + k - 1;
+  }
+  static int strideForBudget(int depth_, int base, size_t slot, size_t budget) {
+    if (base < 4) return base;
+    if (!budget || !slot) return base;
+    const size_t cap = budget / 9;
+    if ((size_t)slotsAt(depth_, 4) * slot <= cap) return std::min(4, depth_);
+    for (int k = 5; k <= 8 && k <= depth_; ++k)
+      if ((size_t)slotsAt(depth_, k) * slot <= cap) return k;
+    int best = 1;
+    for (int k = 2; k <= 8 && k <= depth_; ++k)
+      if (slotsAt(depth_, k) < slotsAt(depth_, best)) best = k;
+    return best;
+  }
+
   int strideK() const {
     static const char* e = getenv("NB_STRIDE");
     static const char* t = getenv("NB_STRIDE_N");
+    static const char* b = getenv("NB_BUDGET_BYTES");
     int k;
-    if (e) k = atoi(e);
-    else k = N > (t ? atoi(t) : 512) ? 4 : 1;
+    if (e) {
+      k = atoi(e);                          // an explicit override still wins
+    } else if (b) {
+      const int base = N > (t ? atoi(t) : 512) ? 4 : 1;
+      const size_t slot = (size_t)N * N * block::CZ * 2;
+      k = strideForBudget(depth, base, slot, (size_t)atoll(b));
+    } else {
+      k = N > (t ? atoi(t) : 512) ? 4 : 1;  // no budget exported: as before
+    }
     if (k < 1) k = 1;
     if (k > depth) k = depth;
     return k;

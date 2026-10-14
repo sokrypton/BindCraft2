@@ -630,6 +630,17 @@ def _register():
     # SAME DISCIPLINE FOR THE STRIDE: strideK() caches it in a function-local
     # static, so it has to be in the environment before the library loads.
     os.environ.setdefault('NB_STRIDE_N', str(_stride_threshold()))
+    # THE CARD'S BUDGET, EXPORTED ONCE, because the stride policy is now
+    # chosen from it and BOTH sides have to reach the same answer.
+    # _save_slots here and Stack::saveSlots there must agree exactly -- XLA
+    # allocates the save-set from the shape declared here and the C++ slices
+    # it, so a disagreement is a backward reading past the end of someone
+    # else's buffer, with no error anywhere.  If each side read the device
+    # independently they would see different free memory at different
+    # moments; reading it once and passing the NUMBER removes that.
+    _budget = _device_budget()
+    if _budget:
+        os.environ.setdefault('NB_BUDGET_BYTES', str(_budget))
     # SAY IT OUT LOUD.  The stride is a trade of time for memory and it is
     # read in two places (here and stack.cuh); a silent one is exactly the
     # kind of setting that gets blamed on something else.
@@ -1084,14 +1095,58 @@ def _make_extra_runner(weights_dir, depth=4, dropout=False):
     return run
 
 
+_PAIR_CHANNEL = 128        # block::CZ, the Evoformer's pair width
+
+
 def _stride_k(depth: int, n: int) -> int:
-    """How many blocks the save-set skips.  Mirrors Stack::strideK."""
+    """How many blocks the save-set skips.  MIRRORS Stack::strideK, and the
+    mirroring is the whole point -- see the note at the export of
+    NB_BUDGET_BYTES, and the one above Stack::strideForBudget.
+
+    The rule used to be `k = 4 above N = 512`, with the 512 scaled per card.
+    That moves WHEN the stride turns on but not HOW FAR it goes, so a bigger
+    card running a proportionally longer sequence still got k = 4: complex
+    1087 on a 40 GB A100 needed k = 6 and it had to be set by hand.  What
+    matters is the save-set as a FRACTION OF THE BUDGET, which is per-card
+    and per-length at once.
+    """
     env = os.environ.get('NB_STRIDE')
     if env:
-        k = int(env)
-    else:
+        return max(1, min(int(env), depth))
+    budget = int(os.environ.get('NB_BUDGET_BYTES') or 0)
+    if not budget:
         k = 4 if n > int(os.environ.get('NB_STRIDE_N') or 512) else 1
-    return max(1, min(k, depth))
+        return max(1, min(k, depth))
+    # THE BUDGET RULE ONLY ESCALATES A SATURATED BASE, and that restraint is
+    # what makes it safe.  Applied freely it moves lengths that work today:
+    # as a plain "smallest k that fits a fraction of the budget" it put
+    # N = 512 on a 24 GB card at k = 2 where the shipped rule says 1, and
+    # k > 4 costs about 4% a step (complex 987 on an A100: 20.6 s at k = 4,
+    # 21.4 at k = 6; complex 687 on an A10: 21.3 against 22.1).  Paying that
+    # everywhere to help the top end would be a poor trade.
+    #
+    # So: below the threshold nothing changes at all, and at k = 4 the
+    # stride only tightens if the save-set at k = 4 does not fit.
+    base = 4 if n > int(os.environ.get('NB_STRIDE_N') or 512) else 1
+    if base < 4:
+        return max(1, min(base, depth))
+    slot = n * n * _PAIR_CHANNEL * 2        # bytes one save slot holds
+    # CALIBRATED, NOT DERIVED, against the measured points: k = 4 must stay
+    # at N = 608 and 768 on a 24 GB card and at N = 992 on a 40 GB one (all
+    # of which run today), while N = 1088 on 40 GB needs k = 6 -- at k = 4 it
+    # dies asking XLA for 6.23 GiB, at k = 6 it runs in 28.4 s.  budget/9 is
+    # the band that gives all four.  A card that disagrees revisits this.
+    cap = budget // 9
+    def slots_at(k):
+        return depth if k <= 1 else (depth + k - 1) // k + k - 1
+    if slots_at(4) * slot <= cap:
+        return min(4, depth)
+    for k in range(5, min(8, depth) + 1):
+        if slots_at(k) * slot <= cap:
+            return k
+    # Nothing fits: fewest slots, smallest k on a tie (6, 7 and 8 all give 13
+    # at depth 48, and 6 recomputes least).
+    return min(range(1, min(8, depth) + 1), key=lambda k: (slots_at(k), k))
 
 
 def _save_slots(depth: int, n: int) -> int:
