@@ -189,9 +189,10 @@ def set_alloc_floor(n: int) -> None:
 
 
 def one_object() -> bool:
-    """NB_ONE_OBJECT: one DesignStep for every state, run at each state's
-    own length, instead of one per 32-bucket."""
-    return bool(os.environ.get('NB_ONE_OBJECT'))
+    """One DesignStep for every state, run at each state's own length,
+    instead of one per 32-bucket.  ON by default; NB_ONE_OBJECT=0 opts
+    out."""
+    return os.environ.get('NB_ONE_OBJECT', '1') not in ('0', '')
 
 
 def _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs):
@@ -202,7 +203,27 @@ def _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs):
     """
     if os.environ.get('NB_NO_PREALLOC'):
         return
-    nmax = max(int(nmax), _ALLOC_FLOOR)
+    # WARM EVERY LENGTH THIS DESIGN WILL RUN, not just the biggest.
+    #
+    # With one object, a state shorter than the allocation re-derives into
+    # the buffers already held -- except where a shorter length needs a
+    # BIGGER buffer than the long one did, which the chunk policies make
+    # real: the pair transition runs unchunked below its threshold and its
+    # hidden activation goes from 63 MB to 105.  Asked for on the first
+    # call, that is a mid-step cudaMalloc with XLA holding the card, and
+    # complex 687 died at `transition.cuh:422` with it.
+    #
+    # The floor builds the buffers; the second call re-derives to this
+    # state's own length, both at TRACE time, so every allocation either
+    # length will ever want is made while the card is still empty.
+    nmax = int(nmax)
+    floor = max(nmax, _ALLOC_FLOOR)
+    lengths = [floor] if nmax == floor else [floor, nmax]
+    for n in lengths:
+        _prealloc_one(n, recycles, msa_rows, dropout, weight_dirs)
+
+
+def _prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
     key = (nmax, int(recycles), int(msa_rows), int(dropout),
            tuple(sorted(weight_dirs.items())))
     if key in _PREALLOCED:

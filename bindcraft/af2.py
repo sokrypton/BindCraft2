@@ -207,9 +207,11 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
 def _native_one_object() -> bool:
-    """NB_ONE_OBJECT: one native DesignStep for every state, run at each
-    state's own length.  See design_step.cuh's setN."""
-    return bool(os.environ.get('NB_ONE_OBJECT'))
+    """One native DesignStep for every state, run at each state's own
+    length.  ON by default; NB_ONE_OBJECT=0 opts out and restores the
+    per-bucket objects and the BC2_NATIVE_STEP_SHARE_N threshold.  See
+    design_step.cuh's setN."""
+    return os.environ.get('NB_ONE_OBJECT', '1') not in ('0', '')
 
 
 def _native_step_off() -> bool:
