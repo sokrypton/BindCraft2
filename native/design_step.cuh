@@ -446,7 +446,10 @@ struct DesignStep {
     //
     // `extra.b` is the donor because the trunk already aliases it -- one set
     // of pair scratch serves all three stacks.
-    if (envOnDef("NB_TPL_SHARE", false)) {
+    // ON BY DEFAULT since 2026-10-14.  |grad| at complex 487, 547, 587 and
+    // 607 is unchanged bit for bit, and the ceiling goes 687 -> 747.
+    // NB_TPL_SHARE=0 gives the template stack its own scratch back.
+    if (envOnDef("NB_TPL_SHARE", true)) {
       tpl.adoptScratch(extra.b);
       dstook("tplembed share");
     }
