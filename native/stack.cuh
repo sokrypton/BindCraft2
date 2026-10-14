@@ -267,6 +267,27 @@ struct Stack {
     // block cannot run without, and regrant() -- which exists for exactly
     // this, and runs on the first save forward once XLA has stopped growing
     // -- hands out the tiers from what is genuinely spare.
+    // A RE-DERIVE AT A NEW LENGTH INVALIDATES THE GRANT.
+    //
+    // `tstride[t]` is recomputed from the new length by the code above;
+    // `tdepth[t]` is the number of depths the PREVIOUS length's budget paid
+    // for, and `tbase[t]` is an arena carved at the previous length's stride.
+    // Keeping the second two while replacing the first is the one
+    // combination that is not merely slow: use() hands every module slot an
+    // address computed from the new stride inside an arena laid out for the
+    // old one, and the depth count is the old one's too.  It reads as an
+    // illegal access two kernels later.
+    //
+    // So the tiers are dropped here and regrant() hands them out again for
+    // the length the stack now runs at.  The arena is not freed -- the pool
+    // gives the same bytes back when the grant asks, because a shorter
+    // length's stride is smaller.  The cost is that the short state runs
+    // untiered until the next save forward completes a grant.
+    if (nbrealloc::active()) {
+      for (int t = 0; t < KEEP_NTIER; ++t) tdepth[t] = 0;
+      regranted = false;
+      save_fwds = 0;
+    }
     const bool no_keep = envOn("NO_FLASH_KEEP") || defer_keep;
     // NO_FLASH_KEEP keeps its old meaning -- drop EVERYTHING -- because it is
     // what the scaling sweep and the L=384 fallback measurement used, and a
