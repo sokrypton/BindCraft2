@@ -1042,6 +1042,71 @@ struct TriMul {
   // setWeights() once a depth, snapshots these slots, and re-points them per
   // block -- which is why the split between the two groups above is load-bearing
   // rather than tidiness.
+  // THE SCRATCH, in a fixed order, with the size each one was allocated at.
+  //
+  // This file is included TWICE -- tmul at C=I=128 for the Evoformer and the
+  // extra stack, tmul64 at 64 for the template pair stack -- so the two
+  // instantiations have the SAME member list in the SAME order, and every
+  // entry in the wide one is at least as large as the narrow one's.  That is
+  // what lets the template run out of the Evoformer's bytes: not an
+  // allocator deciding which buffers look safe to lend, but this list,
+  // element by element, with the size checked at the point of adoption.
+  //
+  // WEIGHTS ARE NOT HERE.  weightSlots() is the other list and the two must
+  // stay disjoint: a weight is live for the whole process, scratch is live
+  // for one module's call.
+  std::vector<std::pair<void**, size_t>> scratchBuffers() {
+    const size_t mc = (size_t)M * C, mi = (size_t)M * I, mp = (size_t)M * PRE;
+    const size_t rc = tmRows * C, ri = tmRows * I;
+    return {
+      {(void**)&x, rc * 2}, {(void**)&a, mi * 2}, {(void**)&bb, mi * 2},
+      {(void**)&t, mi * 2}, {(void**)&cn, ri * 2}, {(void**)&o, mc * 2},
+      {(void**)&gl, mi * sizeof(gate_t)}, {(void**)&gr, mi * sizeof(gate_t)},
+      {(void**)&t2, mc * sizeof(gt2_t)},
+      {(void**)&dpre, split_cdx ? mp * 2 : 0},
+      {(void**)&da, mi * 2}, {(void**)&db, mi * 2}, {(void**)&dt, mi * 2},
+      {(void**)&dcn, transpose_dcn ? ri * 2 : 0}, {(void**)&dcnT, ri * 2},
+      {(void**)&dO, rc * 2}, {(void**)&dt2pre, mc * 2}, {(void**)&dx, rc * 2},
+      {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
+      {(void**)&cmu, (size_t)M * 4}, {(void**)&crstd, (size_t)M * 4},
+      {(void**)&out, need_out ? mc * 2 : 0},
+    };
+  }
+
+  // Take the donor's bytes for every buffer in that list.  The donor is the
+  // WIDE instantiation and this may be the narrow one, so the check is
+  // `theirs >= mine` rather than equality -- and it aborts rather than
+  // truncating, because a buffer that is too small by one element is a wrong
+  // gradient that every shape check and every finiteness check passes.
+  template <class Donor>
+  void adoptScratchFrom(Donor& donor, const char* who) {
+    auto mine = scratchBuffers();
+    auto theirs = donor.scratchBuffers();
+    if (mine.size() != theirs.size()) {
+      fprintf(stderr, "%s: scratch lists differ in length, %zu vs %zu -- the "
+              "two instantiations of trimul_body.cuh have diverged\n",
+              who, mine.size(), theirs.size());
+      exit(1);
+    }
+    for (size_t i = 0; i < mine.size(); ++i) {
+      if (!mine[i].second) continue;          // this build does not use it
+      // THE DONOR MAY NOT HAVE IT AT ALL, and that is not an error: the
+      // Evoformer fuses the output gate into its residual add and so sets
+      // need_out = false, while the template pair block reads `out`.  A
+      // buffer the donor does not own is simply kept, and the saving is the
+      // rest.  A donor buffer that exists but is TOO SMALL is a different
+      // thing entirely and still aborts.
+      if (!theirs[i].second) continue;
+      if (theirs[i].second < mine[i].second) {
+        fprintf(stderr, "%s: scratch[%zu] donor has %zu bytes, needs %zu\n",
+                who, i, theirs[i].second, mine[i].second);
+        exit(1);
+      }
+      if (*mine[i].first) CU(cudaFree(*mine[i].first));
+      *mine[i].first = *theirs[i].first;
+    }
+  }
+
   std::vector<void**> weightSlots() {
     return {(void**)&ln_scale, (void**)&ln_offset, (void**)&cn_scale, (void**)&cn_offset, (void**)&wcat, (void**)&wcatT, (void**)&wcatG, (void**)&wcatD, (void**)&bcat, (void**)&wo, (void**)&woT, (void**)&bo};
   }

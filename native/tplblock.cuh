@@ -84,6 +84,56 @@ struct TplBlock {
     setStream(st);
   }
 
+  // RUN OUT OF THE EVOFORMER'S BYTES.
+  //
+  // The template stack is first in the forward and last in the backward and
+  // never runs beside the Evoformer; four conditions were measured before
+  // this was written (NB_TPL_SCRIBBLE / NB_EVO_SCRIBBLE / NB_TPL_DIRTY /
+  // NB_EVO_DIRTY), covering both "the contents need not survive" and "the
+  // scratch is written before it is read".
+  //
+  // Templated on the donor so this header does not have to include
+  // block.cuh, which includes this one's neighbours.  The donor's tri-muls
+  // are the WIDE instantiation of the same source file, so the member lists
+  // correspond element by element and every one of its buffers is at least
+  // as large -- adoptScratchFrom checks that and aborts if it ever stops
+  // being true.
+  // THE BLOCK'S OWN CHAIN BUFFERS, as well as its modules'.
+  //
+  // p2b..p6b, dp and ddrop are this block's residual chain at CZ = 64; the
+  // Evoformer block holds the same chain at 128, so each of its is exactly
+  // twice the size.  `ddrop` is the one asymmetry: this block allocates it
+  // unconditionally and block.cuh only under use_dropout, so when the donor
+  // has none we keep ours -- the same rule trimul's `out` needed.
+  template <class EvoBlock>
+  void adoptChainFrom(EvoBlock& b) {
+    const size_t np = (size_t)N * N * CZ * 2;
+    if (b.chainBytes() < np) {
+      fprintf(stderr, "tplblock: donor chain link is %zu bytes, needs %zu\n",
+              b.chainBytes(), np);
+      exit(1);
+    }
+    struct Pair { __nv_bfloat16** mine; __nv_bfloat16** theirs; };
+    const Pair ps[] = {{&p2b, &b.p2b}, {&p3b, &b.p3b}, {&p4b, &b.p4b},
+                       {&p5b, &b.p5b}, {&p6b, &b.p6b}, {&dp, &b.dp},
+                       {&ddrop, &b.ddrop}};
+    for (const Pair& q : ps) {
+      if (!*q.theirs) continue;          // the donor does not have this one
+      if (*q.mine) CU(cudaFree(*q.mine));
+      *q.mine = *q.theirs;
+    }
+  }
+
+  template <class EvoBlock>
+  void adoptScratch(EvoBlock& b) {
+    adoptChainFrom(b);
+    tmo.adoptScratchFrom(b.tmo, "tplblock.tmo");
+    tmi.adoptScratchFrom(b.tmi, "tplblock.tmi");
+    tas.adoptScratchFrom(b.tas, "tplblock.tas");
+    tae.adoptScratchFrom(b.tae, "tplblock.tae");
+    ptr.adoptScratchFrom(b.ptr, "tplblock.ptr");
+  }
+
   void setStream(cudaStream_t s) {
     st = s;
     ptr.st = s; tmo.st = s; tmi.st = s; tas.st = s; tae.st = s;
@@ -97,6 +147,8 @@ struct TplBlock {
   // weightSlots(), minus the MSA modules a template block does not have.
   // TplStack uses it to run ONE block at every depth, swapping the pointers
   // instead of holding a block (and a module scratch set) per depth.
+  size_t chainBytes() const { return (size_t)N * N * CZ * 2; }
+
   std::vector<void**> weightSlots() {
     std::vector<void**> v;
     auto app = [&](std::vector<void**> w) { v.insert(v.end(), w.begin(), w.end()); };

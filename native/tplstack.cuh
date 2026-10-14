@@ -81,6 +81,9 @@ struct TplStack {
     for (size_t k = 0; k < slots.size(); ++k) *slots[k] = wsets[b][k];
   }
 
+  template <class EvoBlock>
+  void adoptScratch(EvoBlock& b) { blk.adoptScratch(b); }
+
   void setStream(cudaStream_t s) {
     st = s;
     blk.setStream(s);

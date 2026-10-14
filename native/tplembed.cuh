@@ -42,6 +42,9 @@ struct TplEmbed {
   cublasHandle_t cub = nullptr;
   tplstack::TplStack stack;
 
+  template <class EvoBlock>
+  void adoptScratch(EvoBlock& b) { stack.adoptScratch(b); }
+
   float *lnS = nullptr, *lnO = nullptr;     // query_embedding_norm
   float *w8 = nullptr, *b8 = nullptr;       // template_pair_embedding_8
   float *oS = nullptr, *oO = nullptr;       // output_layer_norm

@@ -426,6 +426,48 @@ struct Trans {
     CU(cudaMalloc(&rstd, (size_t)M * 4));
   }
 
+  // THE SCRATCH, and a DIFFERENT CONTRACT from trimul's and triattn's.
+  //
+  // Those two are one source included at two widths, so "the donor's buffer
+  // is at least as large" holds by construction and a violation means the
+  // instantiations have diverged -- they abort.  This module is one type
+  // parameterised at runtime, and its chunk policy is asymmetric: h_chunked
+  // requires C == 128, so the Evoformer chunks its hidden activation and the
+  // template, at C = 64, does not.  The template's `h` is therefore BIGGER
+  // than the donor's, legitimately.  So here a buffer that does not fit is
+  // KEPT rather than fatal, and DS_MEM reports what was kept.
+  std::vector<std::pair<void**, size_t>> scratchBuffers() {
+    const size_t mc = (size_t)M * C, mi = (size_t)M * I;
+    const size_t cc = trRows * C, ci = trRows * I;
+    return {
+      {(void**)&xn, cc * 2},
+      {(void**)&h, (h_chunked ? trRows * I : mi) * 2},
+      {(void**)&out, mc * 2},
+      {(void**)&dy, cc * 2}, {(void**)&dr, ci * 2}, {(void**)&dxn, cc * 2},
+      {(void**)&hbit, is_pair ? mi / 8 : 0},
+      {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
+    };
+  }
+
+  void adoptScratchFrom(Trans& donor, const char* who) {
+    auto mine = scratchBuffers();
+    auto theirs = donor.scratchBuffers();
+    size_t took = 0, kept = 0;
+    for (size_t i = 0; i < mine.size() && i < theirs.size(); ++i) {
+      if (!mine[i].second) continue;
+      if (!theirs[i].second || theirs[i].second < mine[i].second) {
+        kept += mine[i].second;
+        continue;
+      }
+      if (*mine[i].first) CU(cudaFree(*mine[i].first));
+      *mine[i].first = *theirs[i].first;
+      took += mine[i].second;
+    }
+    if (getenv("DS_MEM"))
+      fprintf(stderr, "  %s: took %.1f MB, kept %.1f MB (donor too small)\n",
+              who, took / 1e6, kept / 1e6);
+  }
+
   void setWeights(Oracle& o, const std::string& P_) {
     // haiku names submodules created inside __call__ under "~"
     std::string P = P_;

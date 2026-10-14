@@ -808,6 +808,66 @@ struct TriAttn {
   // never has to issue them again.  This is a property of the problem -- fixed
   // sequence length, frozen weights -- not of the kernels.
 
+  // THE SCRATCH, in a fixed order, with the size each was allocated at.
+  // See the long note on scratchBuffers() in trimul_body.cuh: this file is
+  // also included twice -- tattn at C=128/D=32, tattn64 at C=64/D=16 -- so
+  // the two member lists correspond element by element.  Several entries are
+  // the SAME size at both widths rather than larger, because H = 4 either
+  // way; adoptScratchFrom asks for >=, not >.
+  //
+  // Entries that are null on this build report 0 and are skipped: dQf is
+  // deliberately dead, dnbbI is behind NE_NONDET_NBB, and the orientation
+  // buffers exist only on the `ending` instance.
+  std::vector<std::pair<void**, size_t>> scratchBuffers() {
+    const size_t mc = (size_t)M * C, mt = (size_t)M * TOT;
+    const size_t chunkRows = (size_t)(TA_SWAP ? N : taChunkRows(N));
+    const size_t mcChunk = (size_t)taRows * N * C;
+    return {
+      {(void**)&ag, chunkRows * N * C * 2}, {(void**)&out, mc * 2},
+      {(void**)&dcomb, chunkRows * N * TOT * 2}, {(void**)&dx, mc * 2},
+      {(void**)&dag, chunkRows * N * C * 2},
+      {(void**)&xh, mcChunk * sizeof(half)},
+      {(void**)&nbbMH, (size_t)M * H * sizeof(half)},
+      {(void**)&qkvgH, (size_t)(qkvg_chunked ? taRows : N) * N * 4 * C * sizeof(half)},
+      {(void**)&biasH, (size_t)H * M * sizeof(half)},
+      {(void**)&outH, mcChunk * sizeof(half)},
+      {(void**)&avH, mc * sizeof(half)},
+      {(void**)&lseF, (size_t)N * H * N * sizeof(float)},
+      {(void**)&davH, chunkRows * N * C * sizeof(half)},
+      {(void**)&dKf, (size_t)taRows * N * C * 4},
+      {(void**)&dVf, (size_t)taRows * N * C * 4},
+      {(void**)&lseD, (size_t)N * H * N * 4},
+      {(void**)&dnbbF, (size_t)H * M * 4},
+      {(void**)&dnbbI, dnbbI ? (size_t)H * M * 8 : 0},
+      {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
+      {(void**)&pairT, ending ? mc * 2 : 0},
+      {(void**)&outT, ending ? mc * 2 : 0},
+      {(void**)&maskT, ending ? (size_t)M * 4 : 0},
+    };
+  }
+
+  template <class Donor>
+  void adoptScratchFrom(Donor& donor, const char* who) {
+    auto mine = scratchBuffers();
+    auto theirs = donor.scratchBuffers();
+    if (mine.size() != theirs.size()) {
+      fprintf(stderr, "%s: scratch lists differ in length, %zu vs %zu -- the "
+              "two instantiations of triattn_body.cuh have diverged\n",
+              who, mine.size(), theirs.size());
+      exit(1);
+    }
+    for (size_t i = 0; i < mine.size(); ++i) {
+      if (!mine[i].second || !theirs[i].second) continue;
+      if (theirs[i].second < mine[i].second) {
+        fprintf(stderr, "%s: scratch[%zu] donor has %zu bytes, needs %zu\n",
+                who, i, theirs[i].second, mine[i].second);
+        exit(1);
+      }
+      if (*mine[i].first) CU(cudaFree(*mine[i].first));
+      *mine[i].first = *theirs[i].first;
+    }
+  }
+
   void allocOrientation() {
     if (!ending) return;
     size_t mc = (size_t)M * C;
