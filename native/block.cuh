@@ -300,6 +300,10 @@ struct Block {
   }
 
   // Every module's weight pointers, in a fixed order.
+  // One link of the residual chain, in bytes -- what a narrower block has to
+  // fit inside to borrow it.  See tplblock::adoptChainFrom.
+  size_t chainBytes() const { return (size_t)N * N * CZ * 2; }
+
   std::vector<void**> weightSlots() {
     std::vector<void**> v;
     if (pair_only) v.push_back((void**)&opm_k);

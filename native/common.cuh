@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -182,6 +183,89 @@ struct Slot { void* p; size_t n; };
 // drift.  tplembed uses that to prove its scratch is throwaway.
 inline std::vector<Slot>& ledger() { static std::vector<Slot> v; return v; }
 
+// DONATION.  The template stack holds a second complete set of pair scratch
+// -- 6.2 GB at N=736 -- and never runs beside the Evoformer: it is first in
+// the forward and last in the backward.  Four conditions were measured
+// before this existed (NB_TPL_SCRIBBLE / NB_EVO_SCRIBBLE / NB_TPL_DIRTY /
+// NB_EVO_DIRTY in design_step.cuh): neither stack's scratch has to survive
+// the other's use of the bytes, and neither reads its scratch before
+// writing it.  So the template can run out of the Evoformer's allocations.
+//
+// A bump pointer per donor buffer, 256-byte aligned as cudaMalloc is, so
+// the ranges handed out are disjoint and every one is as aligned as the
+// buffer it came from.  Anything that does not fit falls through to a real
+// cudaMalloc: the worst case is exactly the behaviour before this.
+struct Donor { char* base; size_t size, used; };
+inline std::vector<Donor>& donors() { static std::vector<Donor> d; return d; }
+inline bool& donating() { static bool b = false; return b; }
+// Donated pointers are INTERIOR pointers into somebody else's allocation,
+// and cudaFree cannot take one.  TriMul::adoptBackwardScratch frees its own
+// scratch before aliasing the other instance's, so the template stack hits
+// this the moment it is donated to -- it surfaced as cuBLAS NOT_SUPPORTED
+// two calls later rather than as a failed free.
+inline std::set<void*>& donated() { static std::set<void*> s; return s; }
+
+// NOT EVERY BUFFER IN THE DONOR'S RANGE MAY BE LENT.  The scribble proofs
+// show that no stack's scratch has to SURVIVE the other's use of the bytes,
+// which is the right question for an activation and the wrong one for a
+// WORKSPACE: cuBLASLt's is written and read inside a single GEMM, so an
+// operand placed on top of it is corrupted within the call, and scribbling
+// between calls never notices.  lt.cuh marks it, and anything else that is
+// live for the duration of a kernel rather than between kernels belongs
+// here too.
+inline std::set<void*>& neverLend() { static std::set<void*> s; return s; }
+inline void neverDonate(void* p) { neverLend().insert(p); }
+
+inline void donorOpen(size_t first, size_t last) {
+  donors().clear();
+  // ONLY THE BIG N^2 SCRATCH IS LENT.  The small buffers in a stack's range
+  // are the ones most likely to be written ONCE at alloc and relied on
+  // afterwards -- seeds, masks, scalars, the memsets scattered through
+  // block.cuh -- and lending one of those puts the template's garbage
+  // somewhere nothing ever rewrites.  That is invisible to the scribble
+  // proofs, which only ever ran between kernels.  The 6 GB this exists for
+  // is all in the N^2 buffers, so the threshold costs nothing.
+  const size_t floor_bytes =
+      getenv("NB_DONOR_MIN") ? (size_t)atoll(getenv("NB_DONOR_MIN")) : (8u << 20);
+  for (size_t i = first; i < last && i < ledger().size(); ++i) {
+    if (neverLend().count(ledger()[i].p)) continue;
+    if (ledger()[i].n < floor_bytes) continue;
+    donors().push_back(Donor{(char*)ledger()[i].p, ledger()[i].n, 0});
+  }
+  // NB_DONOR_LIMIT=k lends only the first k, which bisects a corruption to
+  // one donor buffer instead of reasoning about which of thirty it is.
+  if (const char* lim = getenv("NB_DONOR_LIMIT")) {
+    const size_t k = (size_t)atoll(lim);
+    if (donors().size() > k) donors().resize(k);
+  }
+  if (getenv("NB_DONOR_LIST"))
+    for (size_t i = 0; i < donors().size(); ++i)
+      fprintf(stderr, "  donor[%2zu] %p %7.1f MB\n", i,
+              (void*)donors()[i].base, donors()[i].size / 1e6);
+  donating() = true;
+}
+inline void donorClose(size_t* served, size_t* bytes) {
+  donating() = false;
+  if (!served) return;
+  for (const Donor& d : donors()) *bytes += d.used;
+}
+
+// Best fit, so a small request does not eat the one buffer a big one needs.
+inline void* donate(size_t n) {
+  const size_t ALIGN = 256;
+  Donor* best = nullptr;
+  for (Donor& d : donors()) {
+    const size_t off = (d.used + ALIGN - 1) & ~(ALIGN - 1);
+    if (off + n > d.size) continue;
+    if (!best || (d.size - off) < (best->size - ((best->used + ALIGN - 1) & ~(ALIGN - 1))))
+      best = &d;
+  }
+  if (!best) return nullptr;
+  const size_t off = (best->used + ALIGN - 1) & ~(ALIGN - 1);
+  best->used = off + n;
+  return best->base + off;
+}
+
 inline cudaError_t mallocReusing(void** p, size_t n) {
   static std::map<void**, Slot> pool;
   auto it = pool.find(p);
@@ -199,6 +283,15 @@ inline cudaError_t mallocReusing(void** p, size_t n) {
   if (active() && it != pool.end() && getenv("NB_REALLOC_LOUD"))
     fprintf(stderr, "nbrealloc: GREW %p: %zu -> %zu bytes\n",
             (void*)p, it->second.n, n);
+  if (donating()) {
+    if (void* d = donate(n)) {
+      *p = d;
+      donated().insert(d);
+      pool[p] = Slot{d, n};
+      ledger().push_back(Slot{d, n});
+      return cudaSuccess;
+    }
+  }
   cudaError_t e = ::cudaMalloc(p, n);
   if (e == cudaSuccess) { pool[p] = Slot{*p, n}; ledger().push_back(Slot{*p, n}); }
   return e;
@@ -249,6 +342,7 @@ inline cublasStatus_t cublasCreateOnce(cublasHandle_t* h) {
 // NEW is created on a reuse pass, so nothing on it needs releasing.
 inline cudaError_t freeUnlessReusing(void* p) {
   if (active()) return cudaSuccess;
+  if (donated().count(p)) return cudaSuccess;   // not ours to free
   return ::cudaFree(p);
 }
 

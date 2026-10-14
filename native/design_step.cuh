@@ -434,6 +434,22 @@ struct DesignStep {
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     dstook("trunk stack");
     evo_ledger_last = nbrealloc::ledger().size();
+
+    // THE TEMPLATE PAIR STACK RUNS OUT OF THE EVOFORMER'S SCRATCH.
+    //
+    // 6.2 GB at N=736 of pair-module scratch that was live for the whole
+    // step and used in a fraction of it.  The donation is declared buffer by
+    // buffer in trimul_body.cuh's scratchBuffers(), not decided by an
+    // allocator: the two instantiations of that file have the same member
+    // list and the wide one's entries are never smaller, and adoptScratchFrom
+    // checks each pair and aborts rather than truncating.
+    //
+    // `extra.b` is the donor because the trunk already aliases it -- one set
+    // of pair scratch serves all three stacks.
+    if (envOnDef("NB_TPL_SHARE", false)) {
+      tpl.adoptScratch(extra.b);
+      dstook("tplembed share");
+    }
     t1d.alloc(N, s);  dstook("tpl1d");
     // Zero recycles is what design runs, and then the two normed buffers
     // hold zeros forever -- 277 MB of them at N=736.  See recycle.cuh.

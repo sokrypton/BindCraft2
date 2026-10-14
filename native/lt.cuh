@@ -79,7 +79,12 @@ struct Lt {
     inited = true;
     CUBLT(cublasLtCreate(&h));
     static void* shared = nullptr;
-    if (!shared) CU(cudaMalloc(&shared, ws_bytes));
+    if (!shared) {
+      CU(cudaMalloc(&shared, ws_bytes));
+      // Never lend this out: it is live INSIDE a GEMM, not between GEMMs.
+      // See nbrealloc::neverLend.
+      nbrealloc::neverDonate(shared);
+    }
     ws = shared;
   }
 
