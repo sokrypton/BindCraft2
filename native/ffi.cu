@@ -37,6 +37,7 @@
 #include "confidence.cuh"
 #include "kabsch.cuh"
 #include "design_step.cuh"
+#include "prod_losses.cuh"
 #include "structmod.cuh"
 #include "embed.cuh"
 #include "heads.cuh"
@@ -1373,6 +1374,29 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
 // that the policy is a budget calculation rather than one threshold, the
 // two are far easier to drift apart -- so there is a way to ask this side
 // directly and diff it against the other.
+// THE PRODUCTION LOSSES, exposed so loss_gate.py can diff them against the
+// registered python function each one claims to be -- value AND gradient,
+// because a value-only check passed binder_pae reading the wrong state.
+extern "C" int native_loss_plddt_probe(const float* plddt, const float* mask,
+                                       int n, float dL,
+                                       float* out_value, float* out_dplddt) {
+  float *dp = nullptr, *dm = nullptr, *dout = nullptr, *ddp = nullptr;
+  CU(::cudaMalloc(&dp, (size_t)n * 4));
+  CU(::cudaMalloc(&dm, (size_t)n * 4));
+  CU(::cudaMalloc(&dout, 2 * 4));
+  CU(::cudaMalloc(&ddp, (size_t)n * 4));
+  CU(cudaMemcpy(dp, plddt, (size_t)n * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dm, mask, (size_t)n * 4, cudaMemcpyHostToDevice));
+  prodloss::plddtLossK<<<1, 256>>>(dp, dm, n, dout);
+  float host[2] = {0, 0};
+  CU(cudaMemcpy(host, dout, 2 * 4, cudaMemcpyDeviceToHost));
+  prodloss::plddtLossBwdK<<<(n + 255) / 256, 256>>>(dm, host[1], dL, n, ddp);
+  CU(cudaMemcpy(out_dplddt, ddp, (size_t)n * 4, cudaMemcpyDeviceToHost));
+  *out_value = host[0];
+  CU(::cudaFree(dp)); CU(::cudaFree(dm)); CU(::cudaFree(dout)); CU(::cudaFree(ddp));
+  return 0;
+}
+
 extern "C" int native_save_slots_probe(int depth, int n) {
   stack::Stack s;
   s.N = n;
