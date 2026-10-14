@@ -232,6 +232,13 @@ _TPE_FLAT = {
         'query_embedding_norm',
     f'{_TPE}/single_template_embedding/template_pair_embedding_8':
         'template_pair_embedding_8',
+    # 0..7 ARE THE CONSTANT EIGHT, and the native step does not use them --
+    # it receives their SUM as act_const, computed once per target.  They are
+    # dumped anyway because the C++ driver has to compute that sum itself to
+    # be self-contained, and a weight the port cannot see is a feature it
+    # cannot reproduce.  See CPP_PORT.md.
+    **{f'{_TPE}/single_template_embedding/template_pair_embedding_{i}':
+       f'template_pair_embedding_{i}' for i in range(8)},
     f'{_TPE}/single_template_embedding/output_layer_norm':
         'output_layer_norm',
     f'{_TPE}/output_linear': 'output_linear',
