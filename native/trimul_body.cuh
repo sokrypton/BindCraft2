@@ -1110,6 +1110,11 @@ struct TriMul {
   }
   size_t tmRows = 0;   // positions a chunk; M when unchunked
 
+  // Set before alloc(): does this caller read `out`, or does it fuse the
+  // output gate into its own residual add?  block.cuh fuses, tplblock.cuh
+  // does not.  See the comment at the allocation.
+  bool need_out = true;
+
   void alloc(int N_, bool out_) {
     N = N_; M = N * N; outgoing = out_;
     lt.init();
@@ -1142,9 +1147,21 @@ struct TriMul {
     B(&o, mc);
     // `out` is written only by outGateK, which runs only when the CALLER does
     // not fuse the output gate into its residual add -- and block.cuh fuses by
-    // default.  Allocated on first use instead: 16.8 MB an instance, 33.6 a
-    // block, for a buffer the default path never touches.
-    out = nullptr;
+    // default, so the Evoformer never wants it.  tplblock.cuh does: 52.4 MB an
+    // instance at N=640, 105 for its tmo+tmi pair.
+    //
+    // It used to be allocated on first use, to keep those megabytes off the
+    // path that never touches them.  That lost the 617-640 band: by the time
+    // the first forward runs, prealloc has handed the rest of the card to
+    // XLA (14.93 GB taken, 3.19 left, XLA takes it) and a 105 MB cudaMalloc
+    // in the middle of a step has nowhere to go -- `trimul_body.cuh:1407 cuda:
+    // out of memory`, which is an ORDERING failure, not a size one.  Asking
+    // at alloc() time, where there is room, is all it takes.
+    //
+    // `need_out` is the caller's promise about which it is.  The lazy branch
+    // in forward() stays as the fallback for a caller that promised wrong
+    // (NO_FUSE_OUTGATE flips block.cuh's answer after alloc is long gone).
+    if (need_out) B(&out, mc); else out = nullptr;
     CU(cudaMalloc(&t2, mc * sizeof(gt2_t)));
     // `dpre` exists only for the split path: combineDxK contracts each group
     // out of shared and never materialises it.

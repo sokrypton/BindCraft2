@@ -232,6 +232,12 @@ struct Block {
       tas = donor->tas; tae = donor->tae; ptr = donor->ptr;
       took("adopted pair modules");
     } else {
+    // An Evoformer block applies the output gate inside its own residual add
+    // (`fuseGate` below), so trimul's gated `out` is dead weight here -- 105 MB
+    // at N=640 for the pair.  NO_FUSE_OUTGATE turns that off, and then it is
+    // not; the decision has to be made HERE because the buffer is allocated at
+    // alloc() time now, not on first use.  See trimul_body.cuh.
+    tmo.need_out = tmi.need_out = envOn("NO_FUSE_OUTGATE");
     tmo.alloc(N, true);                                     took("trimul_out");
     tmi.alloc(N, false);                                    took("trimul_in");
     tas.alloc(N, false); tas.allocOrientation();            took("triattn_start");

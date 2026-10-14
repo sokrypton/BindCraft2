@@ -494,12 +494,21 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                     #   complex  per-state      shared
                     #      597   14.1 s         --
                     #      607   14.2 s         --
-                    #      617   OOM (trimul)   --
-                    #      627   OOM (trimul)   29.3 s
+                    #      617   OOM (xla)      --
+                    #      627   OOM (xla)      29.3 s
                     #      647   --             33.8 s
                     #      667   --             34.0 s
-                    #      687   --             OOM (stack.cuh:540)
+                    #      687   --             37.7 s
                     #
+                    # The two OOM sites that used to name a kernel file
+                    # (trimul_body.cuh:1407 at 617/627, stack.cuh:540 at
+                    # 687) were lazy cudaMallocs inside the step; they are
+                    # allocated at alloc() time now.  That bought 687, which
+                    # is why the shared column has a number there.  It did
+                    # NOT buy 617-640 per-state: those bytes came back out
+                    # of XLA's pool and the same length still does not fit.
+                    # Per-state is a SIZE wall above padded 608, so the
+                    # threshold below is unchanged.
                     # THE COMPARISON IS AGAINST THE PADDED LENGTH, which
                     # is what makes the right answer 608 and not 607.
                     # `_biggest` is _pad_to(...), so complex 607 arrives
