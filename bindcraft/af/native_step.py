@@ -255,7 +255,10 @@ def _predict_prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
     it is asked for with XLA already holding the card.  Same failure, same
     fix, as the design step's prealloc above.
     """
-    _prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs)
+    # THROUGH _prealloc, not _prealloc_one: that is what applies the
+    # ALLOC FLOOR, and the floor is what stops a predict sizing the one
+    # shared object on whichever state it happened to reach first.
+    _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs)
     from . import native as _bcn
     _bcn._register()
     import ctypes

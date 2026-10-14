@@ -223,21 +223,38 @@ def _native_step_off() -> bool:
 def _native_predict_on() -> bool:
     """Run predict() on the fused native step, with no backward behind it.
 
-    OPT-IN (BC2_NATIVE_PREDICT=1), and that is a different bar from the
-    gradient path's, deliberately.  The predict call is proven EXACT against
-    the design step's own forward -- all eight outputs, max|d| 0, at 64 and
-    at 608 (ds_predict_gate.py) -- so there is no question about the
-    kernels.  What is not proven is this SEAM: bc2's predict path aligns
-    outside its compiled function and the native step aligns inside
-    (kabsch.cuh), and predict() feeds the *_final filters, where a quiet
-    change of alignment convention would move an accept/reject rather than
-    raise anything.
+    ON by default wherever the fused design step is; BC2_NATIVE_PREDICT=0
+    opts out.  Three measurements put it there, on an A10, hIL2R_beta_gamma
+    with a binder, model_1_multimer_v3, 0 recycles:
 
-    What it buys is memory, not time: a design step's four carry buffers are
-    XLA's largest allocation (12.88 GB against 0.27 at complex 607), and the
-    predict call asks for none of them.
+      * EXACT against the design step's own forward -- both handlers, the
+        same inputs, all eight outputs at max|d| 0 at N=64 and N=608
+        (ds_predict_gate.py).  So the kernels are not in question.
+      * 2.4-2.7x faster than the JAX predict it replaces (complex 487:
+        1454 ms against 3522; complex 607: 2120 against 5685), and 4x on
+        the first call, 7.7 s against 25.9.  predict() feeds the *_final
+        filters and the MPNN stage's reprediction, which are many forwards
+        and no backward, so this is the price of half a campaign.
+      * the same STRUCTURE wherever the model has an opinion.  Against the
+        JAX path on a real 427-residue complex the 386 residues at pLDDT
+        >= 70 agree to 0.013-0.017 A; the whole of the 0.148 A mean is the
+        40 residues below pLDDT 50, which are the random binder the model
+        has no opinion about (predict_seam_gate.py).  That is the check
+        that mattered, because the two paths differ in WHERE they align --
+        the native step aligns inside (kabsch.cuh) and bc2's predict path
+        outside -- and a wrong convention would show in the coordinates and
+        in no metric.
+
+    WHAT IT COSTS, and it is one case only.  The DesignStep this calls is
+    still sized for a BACKWARD, so a process that only predicts holds ~9.6
+    GB more than the JAX path would (complex 607: 10.16 GB free against
+    19.76).  In a campaign that is free, because the design step has
+    already built that object and a predict at the same length SHARES it --
+    same DsKey, one allocation.  A predict-only process is the case to set
+    BC2_NATIVE_PREDICT=0 for, until the allocation itself learns to skip
+    what only a backward reads.
     """
-    return os.environ.get('BC2_NATIVE_PREDICT', '') not in ('', '0')
+    return os.environ.get('BC2_NATIVE_PREDICT', '1') not in ('', '0')
 
 
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
@@ -383,6 +400,30 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
 
     def predict(self, protein_states: ProteinStates, model: str | None=None, softmax_weight: float=1.0, one_hot_weight: float=1.0, temperature: float=0.01, logit_scale: float=2.0) -> StructurePredictions:
         model = self._resolve_model_name(model)
+        # DECLARE THE BIGGEST LENGTH BEFORE ANYTHING BUILDS, exactly as the
+        # gradient path does.  With one DesignStep per process (NB_ONE_OBJECT)
+        # the object is sized by whatever allocates FIRST and setN only ever
+        # runs it shorter -- so a predict over several states, or a predict
+        # before a design, would otherwise size it on whichever state came
+        # first in dict order and kill the process on the next longer one:
+        # `design_step: setN(544) past the allocation's 512`, exit(1).
+        # States iterate in dict order, which says nothing about length.
+        if self.native_installed and not _native_step_off() and _native_predict_on():
+            from .af.native_step import pad_to_tile as _pad_to, set_alloc_floor
+            # AND THE FLOOR IS THE DESIGN PATH'S LENGTH, not this one's.
+            # The two pad differently: sequence_gradients pads each DESIGN
+            # CHAIN to its own bucket (a 100-mer binder becomes 128) while
+            # predict pads the TOTAL, so the same complex is 544 there and
+            # 512 here.  With one object per process the FIRST allocation
+            # wins and setN only runs shorter -- so a predict before a
+            # design sized it at 512 and the design died, not with an
+            # out-of-memory but with `setN(544) past the allocation's 512`,
+            # exit(1).  Allocating at the design's length and running at
+            # this one costs the gap and nothing else.
+            set_alloc_floor(_pad_to(max(
+                sum(len(c) for c in padded.values()) for padded in
+                pad_design_chains(protein_states, self.length_bucket_size,
+                                  self.target_pad_length).values())))
         return {name: self._predict_complex(protein_complex, model, softmax_weight, one_hot_weight, temperature, logit_scale) for name, protein_complex in protein_states.items()}
 
     def _predict_complex(self, protein_complex: dict[str, Protein], model: str, softmax_weight: float, one_hot_weight: float, temperature: float, logit_scale: float) -> StructurePrediction:
@@ -453,7 +494,15 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                              'tpl': _bcn.tplembed_weights_from_params(self.model_parameters[model]),
                              'post': _bcn.post_weights_from_params(self.model_parameters[model]),
                              'emb': _bcn.embed_weights_from_params(self.model_parameters[model])},
-                dropout=False)
+                # THE ATTRIBUTE IS "CAN IT DROP", not "does it drop now",
+                # and it is part of the DsKey.  Passing False here because a
+                # prediction is a measurement would build a SECOND
+                # DesignStep beside the design one -- a second set of N^2
+                # buffers, which is the whole allocation -- and the claim
+                # that a campaign's predict is free would be false.  It
+                # takes self.dropout, exactly as the gradient path does, and
+                # seed[1] = 0 above is what actually keeps the masks away.
+                dropout=bool(self.dropout))
             positions, mask = _out.atoms, _out.atom_mask
             metrics = {'plddt': _out.plddt, 'pae': _out.pae, 'ptm': _out.ptm, 'iptm': _out.iptm, 'iptm_per_residue': _out.iptm_per_residue, 'experimentally_resolved_ca': _out.experimentally_resolved_ca, 'distogram': _out.distogram}
         else:
