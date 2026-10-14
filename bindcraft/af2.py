@@ -220,6 +220,26 @@ def _native_step_off() -> bool:
     return 'step' in _bcn.disabled_pieces()
 
 
+def _native_predict_on() -> bool:
+    """Run predict() on the fused native step, with no backward behind it.
+
+    OPT-IN (BC2_NATIVE_PREDICT=1), and that is a different bar from the
+    gradient path's, deliberately.  The predict call is proven EXACT against
+    the design step's own forward -- all eight outputs, max|d| 0, at 64 and
+    at 608 (ds_predict_gate.py) -- so there is no question about the
+    kernels.  What is not proven is this SEAM: bc2's predict path aligns
+    outside its compiled function and the native step aligns inside
+    (kabsch.cuh), and predict() feeds the *_final filters, where a quiet
+    change of alignment convention would move an accept/reject rather than
+    raise anything.
+
+    What it buys is memory, not time: a design step's four carry buffers are
+    XLA's largest allocation (12.88 GB against 0.27 at complex 607), and the
+    predict call asks for none of them.
+    """
+    return os.environ.get('BC2_NATIVE_PREDICT', '') not in ('', '0')
+
+
 class AlphaFoldDesignModel(DifferentiableProteinPredictor):
     def __init__(self, presets: str | tuple[str, ...]='model_1_ptm', data_dir: str | None=None, key: Array | None=None, max_cache_size: int=8, models: tuple[str, ...] | None=None, num_recycle: int=1, cyclic_offset_mode: str='direction', subbatch_size: int | None | str='auto', length_bucket_size: int=DEFAULT_LENGTH_BUCKET, attention_backend: str='auto', use_cueq: bool=False, backend: str='auto', evoformer_backend: str | None=None, dropout: bool=True, multi_chain_binders: tuple[tuple[str, ...], ...]=(), target_pad_length: int=0, target_flexibility: float=0.0, bigbang_initialization: bool=False, amino_acid_bias: dict[str, float] | None=None):
         self.cyclic_offset_mode = cyclic_offset_mode
@@ -391,10 +411,61 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             entity_id = jnp.pad(entity_id, [0, padding_length], constant_values=len(chain_names))
             interface_asym_id = jnp.pad(interface_asym_id, [0, padding_length], constant_values=len(chain_names))
             seq_mask = jnp.pad(seq_mask, [0, padding_length])
-        positions, mask, metrics = self._compiled_complex_prediction(model, padded_residue_count)(self.model_parameters[model], self.key, sequence, atoms, atom_mask, residue_index, asym_id, entity_id, interface_asym_id, seq_mask, flags, jnp.asarray(self.dropout), jnp.asarray(softmax_weight), jnp.asarray(one_hot_weight), jnp.asarray(temperature), jnp.asarray(logit_scale))
+        native_predict = self.native_installed and not _native_step_off() and _native_predict_on()
+        if native_predict:
+            # THE WHOLE PREDICTION AS ONE CALL, with no backward behind it.
+            # Same handler family as the gradient path's, same DsKey, so a
+            # predict and a design at the same length share one DesignStep
+            # and one allocation -- and this one hands XLA none of the four
+            # carry buffers, which are its largest.
+            from .af.native_step import pad_to_tile as _pad_to, predict_step as _predict
+            from .af import native as _bcn
+            _n = padded_residue_count
+            _nmax = _pad_to(_n)
+            _dn = _nmax - _n
+            _pad_id = len(chain_names)
+            _p1 = lambda a, v=0: jnp.pad(a, [0, _dn], constant_values=v) if _dn else a
+            _p2 = lambda a, v=0: (jnp.pad(a, [[0, _dn]] + [[0, 0]] * (a.ndim - 1), constant_values=v) if _dn else a)
+            # act_const is harvested OUTSIDE the trace, exactly as
+            # sequence_gradients does it -- and from the same aatype, which
+            # is prepare_design_sequence_features' argmax and not the raw
+            # sequence's: the softmax, bias and temperature move it at some
+            # template positions.
+            _seqf, _ = prepare_design_sequence_features(_p2(sequence), _p1(flags), jnp.asarray(softmax_weight), jnp.asarray(one_hot_weight), jnp.asarray(temperature), jnp.asarray(logit_scale), self.amino_acid_bias)
+            # the MASK stays bool here: target_template_features ANDs it, and
+            # a float32 mask is a TypeError from inside jnp, not from here
+            _tf = target_template_features(_seqf.argmax(-1).astype(jnp.int32), _p2(jnp.asarray(atoms, jnp.float32)), _p2(atom_mask), _p1(flags), _p1(residue_index), self.target_flexibility)
+            _tb = {k: _tf[k][0] for k in ('template_aatype', 'template_all_atom_positions', 'template_all_atom_mask')}
+            _asym = _p1(asym_id, _pad_id)
+            _mc = _asym[:, None] == _asym[None, :]
+            _ac = jnp.asarray(_bcn.template_act_const(self.model_parameters[model], _tb, _mc, (_nmax, _nmax, 128), jnp.bfloat16), jnp.float32)
+            _out = _predict(
+                _p2(sequence), _p2(jnp.asarray(atoms, jnp.float32)),
+                _p2(jnp.asarray(atom_mask, jnp.float32)), _p1(flags),
+                _p1(residue_index), _asym, _p1(entity_id, _pad_id),
+                _p1(interface_asym_id, _pad_id), _p1(seq_mask), _ac,
+                jnp.asarray([_n], jnp.int32), jnp.stack([jax.random.bits(self.key, (), jnp.uint32), jnp.zeros((), jnp.uint32)]),
+                softmax_weight=jnp.asarray(softmax_weight), one_hot_weight=jnp.asarray(one_hot_weight),
+                temperature=jnp.asarray(temperature), logit_scale=jnp.asarray(logit_scale),
+                recycles=self.num_recycle, msa_rows=1,
+                weight_dirs={'trunk': _bcn.weights_from_params(self.model_parameters[model], depth=48),
+                             'extra': _bcn.weights_from_params(self.model_parameters[model], depth=4, prefix=_bcn._EXTRA),
+                             'tpl': _bcn.tplembed_weights_from_params(self.model_parameters[model]),
+                             'post': _bcn.post_weights_from_params(self.model_parameters[model]),
+                             'emb': _bcn.embed_weights_from_params(self.model_parameters[model])},
+                dropout=False)
+            positions, mask = _out.atoms, _out.atom_mask
+            metrics = {'plddt': _out.plddt, 'pae': _out.pae, 'ptm': _out.ptm, 'iptm': _out.iptm, 'iptm_per_residue': _out.iptm_per_residue, 'experimentally_resolved_ca': _out.experimentally_resolved_ca, 'distogram': _out.distogram}
+        else:
+            positions, mask, metrics = self._compiled_complex_prediction(model, padded_residue_count)(self.model_parameters[model], self.key, sequence, atoms, atom_mask, residue_index, asym_id, entity_id, interface_asym_id, seq_mask, flags, jnp.asarray(self.dropout), jnp.asarray(softmax_weight), jnp.asarray(one_hot_weight), jnp.asarray(temperature), jnp.asarray(logit_scale))
         positions, mask = positions[:residue_count], mask[:residue_count]
         metrics = {name: trim_prediction_padding(value, residue_count) for name, value in metrics.items()}
-        positions = align_prediction_to_target_template(positions, mask, atoms[:residue_count], atom_mask[:residue_count], flags[:residue_count])
+        # THE NATIVE STEP HAS ALREADY ALIGNED (kabsch.cuh), which is why the
+        # gradient path does not call this either.  Running it twice would
+        # not be wrong -- aligning aligned coordinates to the same target is
+        # the identity -- but it would be a second Kabsch on every filter.
+        if not native_predict:
+            positions = align_prediction_to_target_template(positions, mask, atoms[:residue_count], atom_mask[:residue_count], flags[:residue_count])
         predicted_chain_arrays = split_residue_arrays_by_chain(chain_names, chain_lengths, atoms=positions, atom_mask=mask)
         predicted_complex = {name: protein_complex[name].replace(**{field: value[:true_length] for field, value in predicted_chain_arrays[name].items()}) for name, true_length in zip(chain_names, true_lengths)}
         if chain_lengths != true_lengths:

@@ -546,6 +546,14 @@ struct DesignStep {
   // stop_gradient'd upstream, so they need no save set -- which is where
   // most of the memory would otherwise go.
   void forward(const Inputs& in, const Outputs& out, bool want_save) {
+    // `want_save` USED TO BE A LIE.  It was threaded down to runOnce, which
+    // ends `(void)save;` -- what a block actually saves is decided by the
+    // BUFFERS it is pointed at and by save_full, neither of which this
+    // touched.  So forward(..., false) saved everything, and a benchmark
+    // comparing the two arms compared one arm with itself: 176 ms against
+    // 175 at complex 175, read at the time as "the save writes are free".
+    // They are not free; they were never skipped.
+    if (!want_save) { predict(in, out); return; }
     // the recycled state starts at ZERO, and zero is not neutral -- see the
     // note at the top of recycle.cuh
     rec.zeroPrev();
@@ -586,6 +594,44 @@ struct DesignStep {
     trunk.setSaveBuffers(psave, msave);
     trunk.pout = pout;
     trunk.mout = mout;
+    // UNDO A PREDICT.  predictBuffers() below leaves the trunk pointed at
+    // one slot with save_full off; a design call on the same object has to
+    // put the history back or its backward walks up a trail of one block.
+    trunk.save_full = true;
+  }
+
+  // PREDICT ONLY: A FORWARD WITH NOTHING BEHIND IT.
+  //
+  // The gradient-free half of bc2 -- the semi-greedy `mutate` stage, MPNN
+  // reprediction, the *_final filters -- runs forwards and never a
+  // backward, and a forward is a third of a design step (176 ms against
+  // 589 at complex 175).  What it must NOT do is answer a different
+  // question: the narrowing to bf16 at the head of every block IS the
+  // approximation the design step's forward makes, so a predict that fed
+  // f32 straight through would be a different model.  The narrowing stays;
+  // only the HISTORY goes -- 48 kept inputs collapse to one slot the blocks
+  // overwrite in turn, which is the `single` mode the staged path's
+  // recycle forwards have always used.
+  //
+  // What that buys is MEMORY, and therefore length, not time.  The design
+  // step's save set is XLA's biggest buffer -- slots * N^2 * 128 bf16, and
+  // a predict call hands XLA none of it.  The keep tiers go too: they exist
+  // for a backward that is not coming, so regrant() is not called here.
+  void predictBuffers() {
+    trunk.allocOneSave(nmax_alloc);
+    trunk.setSaveBuffers(trunk.p1save, trunk.m1save, /*single*/true);
+    trunk.useOwnOut(nmax_alloc);
+    trunk.save_full = false;
+    // `extra` is four blocks deep and owns its save set from alloc(); there
+    // is nothing of it to save.
+  }
+
+  void predict(const Inputs& in, const Outputs& out) {
+    predictBuffers();
+    skip_trunk = false;
+    rec.zeroPrev();
+    for (int r = 0; r < plan.recycles; ++r) runOnce(in, out, /*save=*/false);
+    runOnce(in, out, /*save=*/false);
   }
 
   // THE SECOND KEEP GRANT, FOR THE FUSED STEP.

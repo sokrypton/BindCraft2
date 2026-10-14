@@ -1610,6 +1610,119 @@ extern "C" int native_design_step_prealloc(int nmax, int recycles,
 }
 
 
+// THE PREDICT-ONLY STEP.  Same operands as the fused design step, same
+// eight outputs, and NO carry: the save set and pout/mout that the design
+// forward hands to its backward are not produced, because there is no
+// backward to hand them to.
+//
+// This is a MEMORY feature, not a speed one, and the distinction cost a
+// wrong claim.  A forward is ~1/3 of a design step (176 ms against 589 at
+// complex 175), but that third is what the BACKWARD costs -- the saving
+// here is the four carry buffers XLA no longer allocates, the biggest of
+// which is slots * N^2 * 128 bf16, plus the keep tiers, which exist for a
+// backward that is not coming (no regrant() below).
+//
+// The NUMBERS must not move: predictBuffers() keeps the bf16 narrowing at
+// the head of every block, which is the approximation the design forward
+// makes, and only collapses the 48 kept inputs into one reused slot.
+// ds_predict_gate.py is what holds that: the eight outputs of this handler
+// against the eight of NativeDesignStep on identical inputs.
+// ...AND THE PREDICT PATH'S OWN BUFFERS, at trace time for the same reason
+// everything else here is: the one reused save slot and the trunk's own
+// pout/mout are a ~285 MB cudaMalloc at complex 608, and asked for on the
+// first CALL it is asked for with XLA already holding the card.
+extern "C" int native_design_step_predict_prealloc(
+    int nmax, int recycles, int msa_rows, int dropout, const char* trunk_dir,
+    const char* extra_dir, const char* tpl_dir, const char* post_dir,
+    const char* emb_dir) {
+  DsKey k{nmax, recycles, msa_rows, dropout, std::string(trunk_dir),
+          std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
+          std::string(emb_dir)};
+  auto* m = ds_get(k, inputfeat::Tables{}, tpl1d::Tables{}, /*stream*/nullptr,
+                   /*defer_keep*/true);
+  m->predictBuffers();
+  return 0;
+}
+
+ffi::Error DesignStepPredictImpl(
+    cudaStream_t st,
+    ffi::Buffer<ffi::F32> sequence, ffi::Buffer<ffi::F32> atoms,
+    ffi::Buffer<ffi::F32> atom_mask, ffi::Buffer<ffi::U8> flags,
+    ffi::Buffer<ffi::S32> residue_index, ffi::Buffer<ffi::S32> asym_id,
+    ffi::Buffer<ffi::S32> entity_id, ffi::Buffer<ffi::S32> interface_asym,
+    ffi::Buffer<ffi::F32> seq_mask, ffi::Buffer<ffi::F32> act_const,
+    ffi::Buffer<ffi::S32> n, ffi::Buffer<ffi::U32> seed,
+    ffi::Buffer<ffi::F32> t14m, ffi::Buffer<ffi::F32> t37m,
+    ffi::Buffer<ffi::S32> t1437, ffi::Buffer<ffi::S32> t3714,
+    ffi::Buffer<ffi::S32> chi_idx, ffi::Buffer<ffi::F32> chi_mask,
+    ffi::Buffer<ffi::F32> scalars,
+    int64_t recycles, int64_t msa_rows, int64_t dropout,
+    std::string_view trunk_dir, std::string_view extra_dir,
+    std::string_view tpl_dir, std::string_view post_dir,
+    std::string_view emb_dir,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_atoms,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_plddt,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_pae,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_ptm,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_iptm,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_iptm_pr,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_expres,
+    ffi::Result<ffi::Buffer<ffi::F32>> out_dgram) {
+  const int NMAX = (int)sequence.dimensions()[0];
+  inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
+                      t1437.typed_data(), t3714.typed_data()};
+  tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout,
+          std::string(trunk_dir),
+          std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
+          std::string(emb_dir)};
+  auto* m = ds_get(k, t, t1, st);
+  m->st = st;
+
+  design_step::Inputs in{};
+  in.sequence = sequence.typed_data();
+  in.atoms = atoms.typed_data();
+  in.atom_mask = atom_mask.typed_data();
+  in.flags = flags.typed_data();
+  in.residue_index = residue_index.typed_data();
+  in.asym_id = asym_id.typed_data();
+  in.entity_id = entity_id.typed_data();
+  in.interface_asym = interface_asym.typed_data();
+  in.seq_mask = seq_mask.typed_data();
+  in.act_const = act_const.typed_data();
+  in.n = n.typed_data();
+  in.seed = seed.typed_data();
+  in.scalars = scalars.typed_data();
+
+  design_step::Outputs out{};
+  out.atoms = out_atoms->typed_data();
+  out.plddt = out_plddt->typed_data();
+  out.pae = out_pae->typed_data();
+  out.ptm = out_ptm->typed_data();
+  out.iptm = out_iptm->typed_data();
+  out.iptm_per_residue = out_iptm_pr->typed_data();
+  out.expres_ca = out_expres->typed_data();
+  out.distogram = out_dgram->typed_data();
+
+  const bool tm = envOn("NB_DS_TIME");
+  cudaEvent_t f0, f1;
+  if (tm) {
+    CU(cudaEventCreate(&f0)); CU(cudaEventCreate(&f1));
+    CU(cudaEventRecord(f0, st));
+  }
+  m->forward(in, out, /*want_save*/false);
+  if (tm) {
+    float a = 0;
+    CU(cudaEventRecord(f1, st));
+    CU(cudaEventSynchronize(f1));
+    CU(cudaEventElapsedTime(&a, f0, f1));
+    printf("NB_DS_TIME N=%d predict %7.2f ms\n", NMAX, a);
+    fflush(stdout);
+    CU(cudaEventDestroy(f0)); CU(cudaEventDestroy(f1));
+  }
+  return ffi::Error::Success();
+}
+
 ffi::Error DesignStepImpl(
     cudaStream_t st,
     ffi::Buffer<ffi::F32> sequence, ffi::Buffer<ffi::F32> atoms,
@@ -1857,6 +1970,32 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("post_dir")
         .Attr<std::string_view>("emb_dir")
         .Ret<ffi::Buffer<ffi::F32>>());
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    NativeDesignStepPredict, DesignStepPredictImpl,
+    ffi::Ffi::Bind().Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::U8>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::U32>>()
+        .Arg<ffi::Buffer<ffi::F32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::S32>>()
+        .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
+        .Arg<ffi::Buffer<ffi::F32>>()      // the four design scalars [4]
+        .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
+        .Attr<int64_t>("dropout")
+        .Attr<std::string_view>("trunk_dir")
+        .Attr<std::string_view>("extra_dir")
+        .Attr<std::string_view>("tpl_dir")
+        .Attr<std::string_view>("post_dir")
+        .Attr<std::string_view>("emb_dir")
+        // EIGHT results, not twelve: no carry.
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
+        .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     NativeDesignStep, DesignStepImpl,

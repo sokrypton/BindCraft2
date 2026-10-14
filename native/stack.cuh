@@ -710,13 +710,33 @@ struct Stack {
   }
 
   // one block's worth, for the `single` mode above
+  //
+  // SIZED BY THE ALLOCATION'S LENGTH, not by the current one.  `N` is what
+  // setN last re-derived to, and a design that predicts a 224-residue
+  // binder_alone before a 608-residue complex would otherwise size this
+  // slot at 224 and then let the complex's blocks write 95 MB into a 12 MB
+  // buffer -- no error, somebody else's memory.  `nalloc` defaults to N for
+  // the staged path, which has no setN and is always at its own length.
   __nv_bfloat16* p1save = nullptr;
   float* m1save = nullptr;
-  void allocOneSave() {
+  void allocOneSave(int nalloc = 0) {
     if (p1save) return;
-    size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
+    const int NA = nalloc > N ? nalloc : N;
+    size_t np = (size_t)NA * NA * block::CZ, nm = (size_t)S * NA * block::CM;
     CU(cudaMalloc(&p1save, np * 2));
     CU(cudaMalloc(&m1save, nm * 4));
+  }
+
+  // ...and the same for the outputs, for the same reason: in the fused path
+  // pout/mout are XLA'S buffers, handed over per call by setTrunkCarry, and
+  // a predict call that does not hand over new ones would write through the
+  // pointers the last DESIGN call left.
+  void useOwnOut(int nalloc) {
+    const int NA = nalloc > N ? nalloc : N;
+    size_t np = (size_t)NA * NA * block::CZ, nm = (size_t)S * NA * block::CM;
+    if (!pown) CU(cudaMalloc(&pown, np * 4));
+    if (!mown) CU(cudaMalloc(&mown, nm * 4));
+    pout = pown; mout = mown;
   }
 
 

@@ -247,6 +247,33 @@ def _prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
        str(d['emb']).encode())
 
 
+def _predict_prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
+    """The predict path's own buffers, at trace time.
+
+    predictBuffers() allocates one reused save slot and the trunk's own
+    pout/mout -- ~285 MB at complex 608 -- and asked for on the first CALL
+    it is asked for with XLA already holding the card.  Same failure, same
+    fix, as the design step's prealloc above.
+    """
+    _prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs)
+    from . import native as _bcn
+    _bcn._register()
+    import ctypes
+    fn = getattr(_bcn._LIBH, 'native_design_step_predict_prealloc', None)
+    if fn is None:
+        print('native: this libnative_evoformer.so has no '
+              'native_design_step_predict_prealloc; the predict buffers '
+              'will be built in call order', file=sys.stderr)
+        return
+    fn.restype = ctypes.c_int
+    fn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_char_p] * 5
+    d = weight_dirs
+    fn(int(nmax), int(recycles), int(msa_rows), int(dropout),
+       str(d['trunk']).encode(), str(d['extra']).encode(),
+       str(d['tpl']).encode(), str(d['post']).encode(),
+       str(d['emb']).encode())
+
+
 TILE = 32
 
 
@@ -305,6 +332,71 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     # atom_mask comes from the inputs, not the call: it is
     # restype_atom37_mask[aatype] * seq_mask, carries no gradient, and the
     # step already masks the positions with it
+    aatype = jnp.argmax(sequence, -1)
+    mask37 = (jnp.asarray(RC.restype_atom37_mask, F32)[aatype]
+              * seq_mask[:, None])
+    return DesignStepOutputs(
+        atoms=pos.astype(jnp.float16), atom_mask=mask37 > 0,
+        plddt=plddt, pae=pae, ptm=ptm, iptm=iptm, iptm_per_residue=iptm_pr,
+        experimentally_resolved_ca=expres, distogram=dgram)
+
+
+# ---------------------------------------------------------------------------
+# THE PREDICT-ONLY CALL
+#
+# bc2's six stages are not six of a kind.  screen / refine / anneal / harden
+# take a gradient; `mutate` (semi-greedy), the MPNN stage's reprediction and
+# the dozens of *_final filters only ever PREDICT.  A forward is about a
+# third of a design step -- 176 ms against 589 at complex 175 -- and the
+# other two thirds are the backward, so this is the price of that half of
+# the pipeline.
+#
+# What it actually buys is MEMORY, and that is worth being exact about
+# because the first reading of the benchmark was wrong.  `forward(save)` and
+# `forward(no save)` timed the same because `want_save` was not wired to
+# anything -- see the note on DesignStep::forward.  Now that it is, the
+# difference is not the save WRITES (small) but the four carry buffers XLA
+# does not allocate: psave alone is slots * NMAX^2 * 128 in bf16, which is
+# the single biggest buffer in a design step.  So a predict runs at lengths
+# a design step cannot.
+#
+# No custom_vjp, deliberately.  This call has no backward, and giving it one
+# that raised would make a mis-wired caller fail at trace time with a
+# confusing message; without one, JAX says the obvious thing -- there is no
+# rule for this primitive -- and the caller is meant to be inside a
+# stop_gradient or outside a trace anyway.
+
+
+def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
+                 entity_id, interface_asym_id, seq_mask, act_const, length,
+                 seed, *, softmax_weight, one_hot_weight, temperature,
+                 logit_scale, recycles, msa_rows, weight_dirs, dropout=False
+                 ) -> DesignStepOutputs:
+    """One call, sequence to the same nine arrays -- with no gradient.
+
+    The operand contract is the design step's, exactly: the two handlers
+    share a Bind list and a DsKey, so a predict and a design at the same
+    length share ONE DesignStep and one allocation.  `dropout` defaults
+    False here and True there, because a prediction is a measurement.
+    """
+    nmax = pad_to_tile(sequence.shape[0])
+    _predict_prealloc_one(nmax, recycles, msa_rows, int(bool(dropout)),
+                          weight_dirs)
+    sequence = jnp.asarray(sequence, F32)
+    cfg = (recycles, msa_rows, int(bool(dropout)),
+           tuple(sorted(weight_dirs.items())))
+    scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
+                         jnp.asarray(one_hot_weight, F32),
+                         jnp.asarray(temperature, F32),
+                         jnp.asarray(logit_scale, F32)])
+    args = (sequence, atoms, atom_mask, flags, residue_index, asym_id,
+            entity_id, interface_asym_id, seq_mask, act_const, length, seed)
+    # the first EIGHT of _out_shapes: the last four are the carry, and not
+    # producing them is the whole point
+    out = _call('native_design_step_predict',
+                _out_shapes(sequence.shape[0], msa_rows)[:8],
+                args + _tables() + (scalars,), cfg)
+    pos, plddt, pae, ptm, iptm, iptm_pr, expres, dgram = out
     aatype = jnp.argmax(sequence, -1)
     mask37 = (jnp.asarray(RC.restype_atom37_mask, F32)[aatype]
               * seq_mask[:, None])

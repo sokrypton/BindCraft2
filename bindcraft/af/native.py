@@ -677,7 +677,14 @@ def _register():
                            # with "No FFI handler registered", which is a
                            # poor way to find out.
                            ('native_design_step', 'NativeDesignStep'),
-                           ('native_design_step_bwd', 'NativeDesignStepBwd')):
+                           ('native_design_step_bwd', 'NativeDesignStepBwd'),
+                           # the same step with NO backward behind it: eight
+                           # outputs, no carry.  The gradient-free half of a
+                           # campaign -- mutate, MPNN reprediction, the
+                           # *_final filters -- never asks for the save set,
+                           # and XLA not allocating it is the point.
+                           ('native_design_step_predict',
+                            'NativeDesignStepPredict')):
         jax.ffi.register_ffi_target(
             target, jax.ffi.pycapsule(getattr(lib, symbol)), platform='CUDA')
     _registered = True
