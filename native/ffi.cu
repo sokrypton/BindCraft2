@@ -1363,6 +1363,23 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
 // in.  It is not a bigger footprint -- it is losing the same allocation
 // race, and it loses it harder because ONE call allocates everything where
 // the staged path spreads it over several the prealloc already covers.
+// THE TWO SAVE-SLOT POLICIES, EXPOSED SO THEY CAN BE COMPARED.
+//
+// native.py's _save_slots duplicates Stack::saveSlots, and the file says
+// what a disagreement costs: XLA allocates the save-set from the shape
+// Python declares and this code slices it, so if Python says fewer slots
+// than this slices, the backward reads past the end of somebody else's
+// buffer.  Not a compile error, not a crash, just a wrong gradient.  Now
+// that the policy is a budget calculation rather than one threshold, the
+// two are far easier to drift apart -- so there is a way to ask this side
+// directly and diff it against the other.
+extern "C" int native_save_slots_probe(int depth, int n) {
+  stack::Stack s;
+  s.N = n;
+  s.depth = depth;
+  return s.saveSlots();
+}
+
 extern "C" int native_design_step_prealloc(int nmax, int recycles,
                                            int msa_rows, int dropout,
                                            const char* trunk_dir,
