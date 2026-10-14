@@ -71,7 +71,12 @@ struct Lt {
   // on one stream (Block::alloc ends with setStream): two matmuls on DIFFERENT
   // streams must not share a workspace, so if a module is ever given a stream
   // of its own again, this has to go back to one allocation an Lt.
+  bool inited = false;
   void init() {
+    // Idempotent: re-alloc at a smaller N calls alloc() again, and a second
+    // cublasLtCreate would leak a handle a pass.  See nbrealloc in common.cuh.
+    if (inited) return;
+    inited = true;
     CUBLT(cublasLtCreate(&h));
     static void* shared = nullptr;
     if (!shared) CU(cudaMalloc(&shared, ws_bytes));

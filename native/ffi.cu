@@ -1270,6 +1270,30 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
 // allocation, 22.54 GB of 23.68 is already in use", and the step then dies
 // with 0.77 GB to work in.  That is the SAME allocation race
 // native_stack_prealloc fixed for the staged path, not a larger footprint.
+// ONE OBJECT FOR EVERY LENGTH, instead of one per 32-bucket.
+//
+// The states of a design step are not the same length -- a binder alone is
+// 220 where its complex is 607 -- and bc2 pads each to its own bucket, so
+// each arrives here with a different NMAX and gets its own DesignStep.  The
+// second one is 4.34 GB beside the first's 15.67, and that is precisely what
+// puts complex 617 out of memory: XLA then asks for 2.15 GB with 2.33 free.
+// Padding every state up to the biggest instead fits, and makes the short
+// state run at the long state's length: 25.8 s against 14.2.
+//
+// DesignStep::setN re-derives the object at a shorter length against the
+// buffers it already has, so neither is necessary.  With NB_ONE_OBJECT the
+// key drops `nmax` and the longest allocation serves every state.
+//
+// OFF BY DEFAULT while it earns its keep.  The failure it has to be trusted
+// not to make is silent: a stride that kept the long length while the rest
+// moved reads real numbers from the wrong place.  The gate is |grad| against
+// the per-state path at the same length, which must be bit-identical --
+// identical kernels on identical shapes, differing only in base address.
+static bool oneObject() {
+  static bool on = envOn("NB_ONE_OBJECT");
+  return on;
+}
+
 struct DsKey {
   int nmax, recycles, msa_rows;
   // CAN this step drop, not does it drop now: it decides whether the two
@@ -1278,14 +1302,15 @@ struct DsKey {
   int dropout;
   std::string trunk, extra, tpl, post, emb;
   bool operator<(const DsKey& o) const {
-    return std::tie(nmax, recycles, msa_rows, dropout, trunk, extra, tpl,
+    // `nmax` is deliberately absent under NB_ONE_OBJECT -- see oneObject().
+    const int a = oneObject() ? 0 : nmax, b = oneObject() ? 0 : o.nmax;
+    return std::tie(a, recycles, msa_rows, dropout, trunk, extra, tpl,
                     post, emb)
-         < std::tie(o.nmax, o.recycles, o.msa_rows, o.dropout, o.trunk,
-                    o.extra, o.tpl, o.post, o.emb);
+         < std::tie(b, o.recycles, o.msa_rows, o.dropout, o.trunk, o.extra,
+                    o.tpl, o.post, o.emb);
   }
 };
 static std::map<DsKey, design_step::DesignStep*> g_ds;
-
 design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
                                 tpl1d::Tables t1, cudaStream_t st,
                                 bool defer_keep = false) {
@@ -1302,6 +1327,9 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
     // used block 0's.
     it->second->tables = t;
     it->second->t1d_tab = t1;
+    // The length this CALL is for.  A no-op unless the object is already at
+    // it, which is the common case within one state.
+    if (oneObject()) it->second->setN(k.nmax);
     return it->second;
   }
   auto* m = new design_step::DesignStep();

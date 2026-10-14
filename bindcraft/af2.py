@@ -206,6 +206,12 @@ def resolve_subbatch_size(residue_count: int, subbatch_size: int | None | str='a
         return subbatch_size
     return LARGE_COMPLEX_SUBBATCH_SIZE if residue_count > SUBBATCH_RESIDUE_THRESHOLD else None
 
+def _native_one_object() -> bool:
+    """NB_ONE_OBJECT: one native DesignStep for every state, run at each
+    state's own length.  See design_step.cuh's setN."""
+    return bool(os.environ.get('NB_ONE_OBJECT'))
+
+
 def _native_step_off() -> bool:
     """BC2_NATIVE_DISABLE=step: run the staged native path, not the fused one."""
     from .af import native as _bcn
@@ -523,7 +529,26 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                         'BC2_NATIVE_STEP_SHARE_N', '608'))
                     _biggest = _pad_to(max(sum(cl) for _, _, cl
                                            in complex_shapes))
-                    _nmax = _biggest if _biggest > _share_n else _pad_to(_n)
+                    # NB_ONE_OBJECT: pad every state to its OWN bucket and
+                    # let the native side run one allocation at whatever
+                    # length each state is.  That is per-state padding (the
+                    # fast arm) with the shared arm's single allocation, so
+                    # the threshold above does not apply -- but the object is
+                    # sized by the first alloc, so the biggest has to be
+                    # declared before anything traces.
+                    if os.environ.get('NB_ONE_OBJECT') == 'big':
+                        # DEBUG: one object, every state padded up to it, so
+                        # setN is always a no-op.  Isolates the ds_get change
+                        # from the re-derive.
+                        from .af.native_step import set_alloc_floor
+                        set_alloc_floor(_biggest)
+                        _nmax = _biggest
+                    elif _native_one_object():
+                        from .af.native_step import set_alloc_floor
+                        set_alloc_floor(_biggest)
+                        _nmax = _pad_to(_n)
+                    else:
+                        _nmax = _biggest if _biggest > _share_n else _pad_to(_n)
                     _dn = _nmax - _n
                     _pad_id = len(chain_names)
 
