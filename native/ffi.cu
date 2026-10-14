@@ -1310,14 +1310,28 @@ struct DsKey {
   // Evoformer stacks reserve their mask scratches, which happens inside
   // alloc.  Whether a mask is drawn is seed[1], per call.
   int dropout;
+  // NO BACKWARD, EVER -- see Plan::lean.  In the key because calling
+  // backward() on a lean object dereferences a null, so a design must never
+  // be handed one.  `nmax` is dropped under NB_ONE_OBJECT and this is not:
+  // sharing a lean object with a design is the failure it prevents.
+  //
+  // AFTER `dropout`, and the order is not cosmetic: every site builds this
+  // with an aggregate initialiser, so a member inserted ABOVE one that is
+  // already being passed silently swaps the two.  It did -- `lean` arrived
+  // as the dropout flag and dropout as `lean` -- and nothing failed: the
+  // key was still consistent with itself, the prealloc still printed LEAN
+  // because that print reads its own argument, and the only symptom was a
+  // lean allocation that was not lean.  Appending is what makes a new
+  // field's absence a compile error at every site instead.
+  int lean = 0;
   std::string trunk, extra, tpl, post, emb;
   bool operator<(const DsKey& o) const {
     // `nmax` is deliberately absent under NB_ONE_OBJECT -- see oneObject().
     const int a = oneObject() ? 0 : nmax, b = oneObject() ? 0 : o.nmax;
-    return std::tie(a, recycles, msa_rows, dropout, trunk, extra, tpl,
+    return std::tie(a, recycles, msa_rows, dropout, lean, trunk, extra, tpl,
                     post, emb)
-         < std::tie(b, o.recycles, o.msa_rows, o.dropout, o.trunk, o.extra,
-                    o.tpl, o.post, o.emb);
+         < std::tie(b, o.recycles, o.msa_rows, o.dropout, o.lean, o.trunk,
+                    o.extra, o.tpl, o.post, o.emb);
   }
 };
 static std::map<DsKey, design_step::DesignStep*> g_ds;
@@ -1348,6 +1362,7 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   p.trunk_depth = 48; p.extra_depth = 4; p.tpl_depth = 2; p.sm_depth = 8;
   p.defer_keep = defer_keep;
   p.dropout = k.dropout != 0;
+  p.lean = k.lean != 0;
   m->alloc(p, st);
   auto W = [&](const std::string& d) -> Oracle& {
     Oracle*& w = g_weights[d];
@@ -1592,7 +1607,7 @@ extern "C" int native_design_step_prealloc(int nmax, int recycles,
   // different fixes, and at complex 987 on an A100 that number is 29.3 s
   // with nothing to say which part to look at.
   const auto t_pre0 = std::chrono::steady_clock::now();
-  DsKey k{nmax, recycles, msa_rows, dropout, std::string(trunk_dir),
+  DsKey k{nmax, recycles, msa_rows, dropout, /*lean*/0, std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
   ds_get(k, inputfeat::Tables{}, tpl1d::Tables{}, /*stream*/nullptr,
@@ -1632,15 +1647,30 @@ extern "C" int native_design_step_prealloc(int nmax, int recycles,
 // pout/mout are a ~285 MB cudaMalloc at complex 608, and asked for on the
 // first CALL it is asked for with XLA already holding the card.
 extern "C" int native_design_step_predict_prealloc(
-    int nmax, int recycles, int msa_rows, int dropout, const char* trunk_dir,
+    int nmax, int recycles, int msa_rows, int dropout, int lean,
+    const char* trunk_dir,
     const char* extra_dir, const char* tpl_dir, const char* post_dir,
     const char* emb_dir) {
-  DsKey k{nmax, recycles, msa_rows, dropout, std::string(trunk_dir),
+  // SAY WHAT IT COST.  The design prealloc reports and this did not, so
+  // under NB_PREDICT_LEAN -- the one path that does not go through the
+  // design prealloc at all -- nothing printed and the footprint the flag
+  // exists to change was invisible.  Measuring it was how the first lean
+  // number came back as "saves 0.13 GB", which was the reporting, not the
+  // allocation.
+  size_t fb0 = 0, tb = 0;
+  if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
+  DsKey k{nmax, recycles, msa_rows, dropout, lean, std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
   auto* m = ds_get(k, inputfeat::Tables{}, tpl1d::Tables{}, /*stream*/nullptr,
                    /*defer_keep*/true);
   m->predictBuffers();
+  size_t fb1 = 0;
+  cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr,
+          "native: prealloc predict%s NMAX=%d took %.2f GB "
+          "(%.2f of %.2f GB free after)\n", lean ? " LEAN" : "", nmax,
+          (double)(fb0 - fb1) / 1e9, fb1 / 1e9, tb / 1e9);
   return 0;
 }
 
@@ -1656,7 +1686,7 @@ ffi::Error DesignStepPredictImpl(
     ffi::Buffer<ffi::S32> t1437, ffi::Buffer<ffi::S32> t3714,
     ffi::Buffer<ffi::S32> chi_idx, ffi::Buffer<ffi::F32> chi_mask,
     ffi::Buffer<ffi::F32> scalars,
-    int64_t recycles, int64_t msa_rows, int64_t dropout,
+    int64_t recycles, int64_t msa_rows, int64_t dropout, int64_t lean,
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
     std::string_view emb_dir,
@@ -1672,7 +1702,7 @@ ffi::Error DesignStepPredictImpl(
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
                       t1437.typed_data(), t3714.typed_data()};
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
-  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout,
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout, /*lean*/lean,
           std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
@@ -1756,7 +1786,7 @@ ffi::Error DesignStepImpl(
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
                       t1437.typed_data(), t3714.typed_data()};
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
-  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout,
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout, /*lean*/0,
           std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
@@ -1866,7 +1896,7 @@ ffi::Error DesignStepBwdImpl(
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
                       t1437.typed_data(), t3714.typed_data()};
   tpl1d::Tables t1{chi_idx.typed_data(), chi_mask.typed_data()};
-  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout,
+  DsKey k{NMAX, (int)recycles, (int)msa_rows, (int)dropout, /*lean*/0,
           std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
@@ -1985,7 +2015,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<ffi::Buffer<ffi::S32>>().Arg<ffi::Buffer<ffi::F32>>()
         .Arg<ffi::Buffer<ffi::F32>>()      // the four design scalars [4]
         .Attr<int64_t>("recycles").Attr<int64_t>("msa_rows")
-        .Attr<int64_t>("dropout")
+        .Attr<int64_t>("dropout").Attr<int64_t>("lean")
         .Attr<std::string_view>("trunk_dir")
         .Attr<std::string_view>("extra_dir")
         .Attr<std::string_view>("tpl_dir")

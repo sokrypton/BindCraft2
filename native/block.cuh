@@ -208,7 +208,10 @@ struct Block {
     auto took = [&](const char* who) {
       if (!mem) return;
       size_t f, t; CU(cudaMemGetInfo(&f, &t));
-      fprintf(stderr, "  %-14s %7.1f MB\n", who, (fb0 - f) / 1e6);
+      // signed -- "shared d-scratch (negative = freed)" means it, and
+      // size_t subtraction turned a 757 MB saving into 18446744072952.5 MB
+      fprintf(stderr, "  %-14s %7.1f MB\n", who,
+              ((double)f - (double)fb0) / -1e6);
       fb0 = f;
     };
     took("block");

@@ -115,11 +115,11 @@ def _step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     return out
 
 
-def _call(name, result, args, cfg):
+def _call(name, result, args, cfg, **extra):
     recycles, msa_rows, dropout, dirs = cfg
     d = dict(dirs)
     return jax.ffi.ffi_call(name, result)(
-        *args,
+        *args, **extra,
         recycles=np.int64(recycles), msa_rows=np.int64(msa_rows),
         # CAN this step drop, not does it drop now.  The attribute decides
         # whether the two Evoformer stacks reserve their mask scratches,
@@ -247,6 +247,23 @@ def _prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
        str(d['emb']).encode())
 
 
+def lean() -> bool:
+    """Allocate the predict object with NO backward buffers at all.
+
+    OFF by default, and the default is about SHARING rather than about
+    risk.  A lean object cannot serve a design -- `lean` is in the DsKey
+    because backward() on one dereferences a null -- so in a campaign,
+    where a predict and a design at the same length share one allocation,
+    turning this on would build a SECOND object beside the design's and
+    spend memory rather than save it.
+
+    It is for the predict-ONLY process: filters, scoring, reprediction with
+    no design in the same interpreter.  There the design-shaped allocation
+    is pure waste, and NB_PREDICT_LEAN=1 drops it.
+    """
+    return os.environ.get('NB_PREDICT_LEAN', '') not in ('', '0')
+
+
 def _predict_prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
     """The predict path's own buffers, at trace time.
 
@@ -254,11 +271,16 @@ def _predict_prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
     pout/mout -- ~285 MB at complex 608 -- and asked for on the first CALL
     it is asked for with XLA already holding the card.  Same failure, same
     fix, as the design step's prealloc above.
+
+    NOT THROUGH _prealloc WHEN LEAN.  _prealloc builds the design-shaped
+    object, and under NB_PREDICT_LEAN that is a different DsKey -- so
+    calling it would build the fat object AND the lean one and spend twice
+    what either costs.  The floor still applies, for the same reason it
+    does there: the first allocation sizes the object and setN only ever
+    runs it shorter.
     """
-    # THROUGH _prealloc, not _prealloc_one: that is what applies the
-    # ALLOC FLOOR, and the floor is what stops a predict sizing the one
-    # shared object on whichever state it happened to reach first.
-    _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs)
+    if not lean():
+        _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs)
     from . import native as _bcn
     _bcn._register()
     import ctypes
@@ -269,12 +291,14 @@ def _predict_prealloc_one(nmax, recycles, msa_rows, dropout, weight_dirs):
               'will be built in call order', file=sys.stderr)
         return
     fn.restype = ctypes.c_int
-    fn.argtypes = [ctypes.c_int] * 4 + [ctypes.c_char_p] * 5
+    fn.argtypes = [ctypes.c_int] * 5 + [ctypes.c_char_p] * 5
     d = weight_dirs
-    fn(int(nmax), int(recycles), int(msa_rows), int(dropout),
-       str(d['trunk']).encode(), str(d['extra']).encode(),
-       str(d['tpl']).encode(), str(d['post']).encode(),
-       str(d['emb']).encode())
+    floor = max(int(nmax), _ALLOC_FLOOR)
+    for n in ([floor] if int(nmax) == floor else [floor, int(nmax)]):
+        fn(n, int(recycles), int(msa_rows), int(dropout), int(lean()),
+           str(d['trunk']).encode(), str(d['extra']).encode(),
+           str(d['tpl']).encode(), str(d['post']).encode(),
+           str(d['emb']).encode())
 
 
 TILE = 32
@@ -398,7 +422,8 @@ def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     # producing them is the whole point
     out = _call('native_design_step_predict',
                 _out_shapes(sequence.shape[0], msa_rows)[:8],
-                args + _tables() + (scalars,), cfg)
+                args + _tables() + (scalars,), cfg,
+                lean=np.int64(lean()))
     pos, plddt, pae, ptm, iptm, iptm_pr, expres, dgram = out
     aatype = jnp.argmax(sequence, -1)
     mask37 = (jnp.asarray(RC.restype_atom37_mask, F32)[aatype]

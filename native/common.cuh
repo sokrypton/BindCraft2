@@ -80,6 +80,39 @@ inline bool envOn(const char* name) {
 // because nbChunkOn is.
 namespace nbrealloc { inline int& allocN() { static int n = 0; return n; } }
 
+// NO BACKWARD BEHIND THIS ONE.
+//
+// A predict-only object never runs a backward, so every buffer that exists
+// only to hold a cotangent is allocated and never read.  At complex 607 the
+// step is 11.13 GB where the JAX predict it replaces runs in about 4, and
+// the difference is almost all of this.
+//
+// It is a GLOBAL rather than a parameter because the alternative is a `lean`
+// argument through twenty-odd alloc() signatures, most of which forward it
+// untouched.  It is set around DesignStep::alloc and read only there --
+// nothing consults it at run time, so there is no state to get out of step
+// with a call.
+//
+// THE DANGER IS NOT THE MEMORY, IT IS THE SHARING.  This code lends buffers
+// between phases on purpose (block.cuh's "shared d-scratch", tplblock's
+// adopted scratch), so a d-named buffer is not automatically backward-only
+// and nulling one a forward quietly uses is a segfault at best and a wrong
+// number at worst.  Every buffer dropped under this flag has to be checked
+// against the forward, and ds_predict_gate.py -- which compares this arm's
+// eight outputs with the design forward's at max|d| 0 -- is what says so.
+//
+// A lean object must never serve a design, so `lean` is part of the DsKey.
+namespace nblean {
+inline bool& building() { static bool v = false; return v; }
+// `true` when this allocation will never back-propagate.
+inline bool on() { return building(); }
+struct Scope {
+  bool was;
+  explicit Scope(bool v) : was(building()) { building() = v; }
+  ~Scope() { building() = was; }
+};
+}  // namespace nblean
+
 inline bool nbChunkOnAt(size_t n);   // defined just below nbChunkOn
 
 inline bool nbChunkOn(size_t n) {

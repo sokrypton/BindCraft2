@@ -139,6 +139,14 @@ struct Plan {
   // to be in the cache key.  The template and structure-module blocks
   // allocate theirs unconditionally, so they need nothing here.
   bool dropout = false;
+  // NO BACKWARD, EVER.  A lean object skips every buffer only a backward
+  // reads (see nblean in common.cuh), which at complex 607 is most of the
+  // gap between this step and the JAX predict it replaces.  It is in the
+  // DsKey for the same reason `dropout` is -- it is decided before alloc
+  // and cannot be changed after -- and unlike `dropout` it is not merely a
+  // size difference: calling backward() on a lean object dereferences a
+  // null, so the key is what keeps a design off one.
+  bool lean = false;
 };
 
 // ffi.cu keeps its own bf16ToF32OutK next to the custom calls; a header
@@ -374,6 +382,11 @@ struct DesignStep {
   size_t evo_ledger_first = 0, evo_ledger_last = 0;
 
   void alloc(const Plan& p, cudaStream_t s) {
+    // EVERY MODULE'S alloc RUNS INSIDE THIS.  The flag is read at
+    // allocation time and nowhere else, so its whole life is this call --
+    // which is what makes a global acceptable here rather than a `lean`
+    // argument through twenty-odd signatures that would only forward it.
+    nblean::Scope lean_scope(p.lean);
     if (!nmax_alloc) nmax_alloc = p.nmax;
     // DS_MEM itemises the STEP's allocation the way BLK_MEM itemises a
     // block's.  BLK_MEM covers the Evoformer modules and nothing else, which
@@ -385,7 +398,12 @@ struct DesignStep {
     auto dstook = [&](const char* who) {
       if (!ds_mem) return;
       size_t f, t; CU(cudaMemGetInfo(&f, &t));
-      fprintf(stderr, "  ds %-16s %8.1f MB\n", who, (ds_fb - f) / 1e6);
+      // SIGNED.  These deltas go NEGATIVE -- the template stack borrows the
+      // Evoformer's scratch and hands buffers back -- and size_t subtraction
+      // printed that as 18446744071165.7 MB, which reads as a leak and is a
+      // saving.  `ds tplembed share` is the line that is always negative.
+      fprintf(stderr, "  ds %-16s %8.1f MB\n", who,
+              ((double)f - (double)ds_fb) / -1e6);
       ds_fb = f;
     };
     plan = p; st = s;

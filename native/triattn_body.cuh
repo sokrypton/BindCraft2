@@ -740,6 +740,13 @@ struct TriAttn {
     // one row chunk -- see flashRows and forward().  70 MB an instance at
     // N=522.  `out` is the module's output and stays whole.
     B(&ag, (size_t)(TA_SWAP ? N_ : taChunkRows(N_)) * N_ * C); B(&out, mc);
+    // NOTHING BELOW IS ALLOCATED WHEN NOTHING WILL BACK-PROPAGATE.  The
+    // set is adoptBackwardScratch()'s, which is this module's own
+    // statement of what only a backward reads, plus lseD (the backward's
+    // logsumexp derivative; lseF is the FORWARD's and stays) and dQf,
+    // which is already dead.  No forward kernel names any of them.
+    const bool lean = nblean::on();
+    if (!lean) {
     B(&dcomb, (size_t)(TA_SWAP ? N_ : taChunkRows(N_)) * N_ * TOT); B(&dx, mc);   // dx stays whole: the
     // nbb term has to land in it before lnBwd, and that term needs every chunk
     // dag is chunk-sized: the output GEMM writes it and dGateK reads it, both
@@ -747,6 +754,9 @@ struct TriAttn {
     // nbbScatterK consume them only once dnbb is complete, and dnbb sums over
     // EVERY row -- so they stay full.
     B(&dag, (size_t)(TA_SWAP ? N_ : taChunkRows(N_)) * N_ * C);
+    } else {
+      dcomb = dx = dag = nullptr;
+    }
     // TA_ROWS: the module's scratch is sized by a ROW CHUNK, not by N.
     // Triangle attention is independent per row, so rows [r0, r0+rows) can be
     // run on their own; `xh` and `outH` are written and read inside the
@@ -781,7 +791,10 @@ struct TriAttn {
     CU(cudaMalloc(&avH, mc * sizeof(half)));
     CU(cudaMalloc(&lseF, (size_t)N * H * N * sizeof(float)));
     // davH likewise: dGateK writes it, the flash backward reads it, one chunk.
-    CU(cudaMalloc(&davH, (size_t)(TA_SWAP ? N_ : taChunkRows(N_)) * N_ * C * sizeof(half)));
+    if (!lean)
+      CU(cudaMalloc(&davH, (size_t)(TA_SWAP ? N_ : taChunkRows(N_)) * N_ * C * sizeof(half)));
+    else
+      davH = nullptr;
     // dQf IS DEAD AND WAS STILL ALLOCATED.  flashBwdK writes dQ through the
     // LAST of its three destinations -- `if (dQb) ... else if (dcomb) ... else
     // dQ[...]` -- and every call here passes dcomb as dQb, so the `dQ`
@@ -793,11 +806,15 @@ struct TriAttn {
     // dKf/dVf/dcomb are chunk-sized too.  They are per-row, and with the
     // column-split GEMM below the scatter that consumes them runs INSIDE the
     // chunk, so nothing waits for dnbb.  ~413 MB a module at N=448.
+    if (!lean) {
     CU(cudaMalloc(&dKf, (size_t)taRows * N * C * 4));
     CU(cudaMalloc(&dVf, (size_t)taRows * N * C * 4));
     CU(cudaMalloc(&lseD, (size_t)N * H * N * 4));
     CU(cudaMalloc(&dnbbF, (size_t)H * M * 4));
     if (!envOn("NE_NONDET_NBB")) CU(cudaMalloc(&dnbbI, (size_t)H * M * 8));
+    } else {
+      dKf = dVf = lseD = dnbbF = nullptr; dnbbI = nullptr;
+    }
     CU(cudaMalloc(&mu, M * 4)); CU(cudaMalloc(&rstd, M * 4));
 
   }

@@ -1228,6 +1228,14 @@ struct TriMul {
     // (NO_FUSE_OUTGATE flips block.cuh's answer after alloc is long gone).
     if (need_out) B(&out, mc); else out = nullptr;
     CU(cudaMalloc(&t2, mc * sizeof(gt2_t)));
+    // THE COTANGENTS, and NOT when nothing will back-propagate.  This is
+    // exactly the set adoptBackwardScratch() lends between the two
+    // instances, which is the list of what only a backward reads -- the
+    // forward names none of them.  ~450 MB of a tri-mul's 971 at N=608.
+    if (nblean::on()) {
+      dpre = nullptr; da = db = dt = nullptr; dcn = dcnT = nullptr;
+      dO = dt2pre = dx = nullptr;
+    } else {
     // `dpre` exists only for the split path: combineDxK contracts each group
     // out of shared and never materialises it.
     if (split_cdx) B(&dpre, mp); else dpre = nullptr;
@@ -1239,6 +1247,7 @@ struct TriMul {
     // dO and dx are chunk-local; dt2pre crosses from the first loop to the
     // second and cannot shrink
     B(&dO, rc); B(&dt2pre, mc); B(&dx, rc);
+    }
     CU(cudaMalloc(&mu, M * 4)); CU(cudaMalloc(&rstd, M * 4));
     CU(cudaMalloc(&cmu, M * 4)); CU(cudaMalloc(&crstd, M * 4));
 
