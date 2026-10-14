@@ -331,7 +331,48 @@ struct DesignStep {
   int32_t *a14_37 = nullptr, *a37_14 = nullptr;
   inputfeat::Tables tables{};
 
+  // RUN THIS OBJECT AT A SHORTER LENGTH.
+  //
+  // A step runs several STATES and they are not the same length -- a binder
+  // alone is 220 where its complex is 607.  Giving each its own DesignStep
+  // costs a second allocation (4.34 GB at N=256 beside 15.67 at N=640, which
+  // is exactly what puts complex 617 per-state out of memory); padding them
+  // all up to the biggest and sharing one costs the short state the long
+  // state's runtime, 25.8 s against 14.2.
+  //
+  // Neither is needed.  alloc() already derives every N-dependent stride,
+  // extent, chunk policy and carved offset in all 23 modules -- that is its
+  // whole job -- and at a smaller n every buffer it would ask for is smaller
+  // than the one it has.  So run it again, with nbrealloc handing each
+  // pointer member back the buffer it already owns.  The object comes out
+  // CONSISTENTLY at n: pair_all, the save sets and the stacks all stride by
+  // n together, which is what keeps the step-level code (already written
+  // against in.n) and the stacks (which run at nmax and mask) in agreement.
+  //
+  // Not free, and not for free: see the keep tiers below.
+  void setN(int n) {
+    if (n == plan.nmax) return;
+    if (n > nmax_alloc) {
+      fprintf(stderr, "design_step: setN(%d) past the allocation's %d\n",
+              n, nmax_alloc);
+      exit(1);
+    }
+    Plan p = plan;
+    p.nmax = n;
+    // The chunk policies follow the ALLOCATION's length from here on, so a
+    // shorter step cannot ask for a bigger buffer than it has.  Set once and
+    // left set: it is what every later re-derive must agree with.
+    nbrealloc::allocN() = nmax_alloc;
+    nbrealloc::Scope reuse;
+    alloc(p, st);
+  }
+
+  // The length alloc() was FIRST called with -- the size of the buffers,
+  // which setN never grows.
+  int nmax_alloc = 0;
+
   void alloc(const Plan& p, cudaStream_t s) {
+    if (!nmax_alloc) nmax_alloc = p.nmax;
     plan = p; st = s;
     const int N = p.nmax;
     emb.alloc(N, p.msa_rows, s);

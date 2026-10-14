@@ -173,6 +173,26 @@ _step.defvjp(_step_fwd, _step_bwd)
 
 _PREALLOCED: set = set()
 
+# THE BIGGEST LENGTH THIS DESIGN WILL RUN, when one DesignStep is to serve
+# every state (NB_ONE_OBJECT).  The native side sizes its buffers on the
+# FIRST alloc and setN only ever runs them shorter, so if the 220-residue
+# state traces before the 607-residue one the object is built at 224 and the
+# long state has nowhere to go.  States trace in sorted-name order, which
+# says nothing about length, so the floor has to be stated rather than hoped
+# for.  af2.py sets it from `_biggest` before tracing.
+_ALLOC_FLOOR = 0
+
+
+def set_alloc_floor(n: int) -> None:
+    global _ALLOC_FLOOR
+    _ALLOC_FLOOR = max(_ALLOC_FLOOR, int(n))
+
+
+def one_object() -> bool:
+    """NB_ONE_OBJECT: one DesignStep for every state, run at each state's
+    own length, instead of one per 32-bucket."""
+    return bool(os.environ.get('NB_ONE_OBJECT'))
+
 
 def _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs):
     """Build the fused step now, while the card is still empty.
@@ -182,6 +202,7 @@ def _prealloc(nmax, recycles, msa_rows, dropout, weight_dirs):
     """
     if os.environ.get('NB_NO_PREALLOC'):
         return
+    nmax = max(int(nmax), _ALLOC_FLOOR)
     key = (nmax, int(recycles), int(msa_rows), int(dropout),
            tuple(sorted(weight_dirs.items())))
     if key in _PREALLOCED:

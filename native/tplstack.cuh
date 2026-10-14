@@ -57,7 +57,14 @@ struct TplStack {
     N = N_; depth = depth_; st = s;
     blk.alloc(N, st);
     slots = blk.weightSlots();
-    wsets.assign(depth, std::vector<void*>(slots.size(), nullptr));
+    // NOT UNCONDITIONALLY.  These are the per-depth WEIGHT pointers, which
+    // have nothing to do with N, and alloc() runs a second time when the
+    // step is re-derived at a shorter length (see nbrealloc in common.cuh).
+    // Wiping them there left `use(b)` writing nulls into every slot, and the
+    // next matmul went in with B=(nil).
+    if (wsets.size() != (size_t)depth ||
+        (!wsets.empty() && wsets[0].size() != slots.size()))
+      wsets.assign(depth, std::vector<void*>(slots.size(), nullptr));
     // p1store[b] is block b's INPUT.  The chain cannot feed a block from its
     // own p6b now that there is one block: forward() only POINTS p1b at what
     // it is given, so input and output would alias.  stack.cuh solves it the

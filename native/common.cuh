@@ -74,7 +74,27 @@ inline bool envOn(const char* name) {
 // NB_CHUNK_N moves the threshold (0 disables chunking entirely); each
 // module's own knob -- TM_ROWS, TA_ROWS, TR_ROWS -- still overrides the chunk
 // SIZE outright, at any length.
+// The length the buffers were SIZED for.  Zero until a step is re-derived at
+// a shorter one; see nbrealloc below, which is declared after this only
+// because nbChunkOn is.
+namespace nbrealloc { inline int& allocN() { static int n = 0; return n; } }
+
 inline bool nbChunkOn(size_t n) {
+  // CHUNK AS THE ALLOCATION DID, not as this length would on its own.
+  //
+  // Every chunk policy here turns itself OFF below a threshold, so a SHORTER
+  // length asks for MORE scratch: unchunked at n=224 trimul wants all 50176
+  // rows where chunked at N=608 it wanted 22528.  Re-deriving a step at a
+  // shorter length then has to allocate a bigger buffer -- which spends the
+  // memory the whole exercise was meant to save, and MOVES buffers that
+  // another module aliased in the first pass (adoptBackwardScratch), which
+  // is how this surfaced: cuBLASLt failing with execution and internal
+  // errors on operands that were all non-null.
+  //
+  // Chunking is a loop, not a correctness condition.  Running the short
+  // length in the long length's chunks is the same arithmetic in more
+  // iterations, and keeps every buffer inside what it already has.
+  if (nbrealloc::allocN()) n = (size_t)nbrealloc::allocN();
   static const char* e = getenv("NB_CHUNK_N");
   static const size_t thresh = e ? (size_t)atoll(e) : 480;
   return thresh > 0 && n > thresh;
@@ -99,6 +119,118 @@ inline bool nbChunkOn(size_t n) {
       exit(1);                                                                 \
     }                                                                          \
   } while (0)
+
+// =====================================================================
+// RUNNING A SMALLER N ON A BIGGER ALLOCATION.
+//
+// A design step runs several STATES -- for a binder, the complex (say 607)
+// and the binder alone (220).  Each state's length gets its own DesignStep,
+// and the second one is not free: 4.34 GB at N=256 beside 15.67 at N=640,
+// which is exactly what puts complex 617 per-state out of memory (XLA then
+// asks for 2.15 GB with 2.33 free and misses).  The alternative on offer was
+// to pad every state up to the biggest and share one object -- which fits,
+// and makes the 220-residue state execute as a 608-residue one: 25.8 s
+// against 14.2.
+//
+// Neither is necessary.  An allocation sized for N=640 is big enough to run
+// a step at n=256; nothing about the memory requires the padding.  What
+// stands in the way is only that N is baked in at alloc() time, in 23
+// modules, as strides, grid extents, chunk policies and carved offsets.
+//
+// So: call alloc() AGAIN with the smaller n.  It already derives every one
+// of those correctly -- that is its job -- and the buffers it would ask for
+// are smaller than the ones it has.  `active()` makes the second pass hand
+// each pointer member back the buffer it already owns instead of allocating.
+//
+// KEYED ON THE ADDRESS OF THE POINTER MEMBER, not on call order.  `&x->psave`
+// is stable for the life of the module instance, so the mapping is
+// self-describing: a branch that allocated last time and not this time
+// simply is not asked, and one asked for the first time allocates honestly.
+// Call-order keying would have silently crossed two members the first time
+// an `if (use_dropout)` differed between passes.
+//
+// A SMALLER REQUEST IS SERVED, A BIGGER ONE IS NOT.  n <= the recorded size
+// reuses; anything larger allocates fresh and re-records, so this cannot
+// hand back a buffer that is too small -- the one failure that would be
+// silent rather than loud.
+namespace nbrealloc {
+
+inline bool& active() { static bool a = false; return a; }
+
+struct Slot { void* p; size_t n; };
+
+inline cudaError_t mallocReusing(void** p, size_t n) {
+  static std::map<void**, Slot> pool;
+  auto it = pool.find(p);
+  if (active() && it != pool.end() && n <= it->second.n) {
+    *p = it->second.p;
+    return cudaSuccess;
+  }
+  // GREW.  A shorter length does NOT imply smaller buffers: the chunk
+  // policies turn themselves OFF below their threshold, so an unchunked
+  // n=224 asks for more rows of scratch than a chunked N=608.  Allocating
+  // fresh is correct, but it MOVES the buffer, and anything that aliased the
+  // old address in the first pass (TriMul::adoptBackwardScratch and its
+  // triattn twin hand one instance's scratch to another) is now pointing at
+  // the smaller one.  NB_REALLOC_LOUD names them.
+  if (active() && it != pool.end() && getenv("NB_REALLOC_LOUD"))
+    fprintf(stderr, "nbrealloc: GREW %p: %zu -> %zu bytes\n",
+            (void*)p, it->second.n, n);
+  cudaError_t e = ::cudaMalloc(p, n);
+  if (e == cudaSuccess) pool[p] = Slot{*p, n};
+  return e;
+}
+
+// Streams and cuBLAS handles are NOT sized by N, so a second alloc() must
+// reuse them rather than make another -- a module that creates a stream per
+// pass would run its kernels unordered against residual adds that are still
+// on the first one.  Keyed the same way, and on the member's ADDRESS rather
+// than its value, because not every module initialises these to null and
+// reading an uninitialised handle to decide is how that becomes a crash in
+// cuBLAS instead of a bug here.
+inline cudaError_t streamCreateOnce(cudaStream_t* s) {
+  static std::map<void*, cudaStream_t> made;
+  auto it = made.find((void*)s);
+  if (active() && it != made.end()) { *s = it->second; return cudaSuccess; }
+  cudaError_t e = ::cudaStreamCreate(s);
+  if (e == cudaSuccess) made[(void*)s] = *s;
+  return e;
+}
+
+inline cublasStatus_t cublasCreateOnce(cublasHandle_t* h) {
+  static std::map<void*, cublasHandle_t> made;
+  auto it = made.find((void*)h);
+  if (active() && it != made.end()) { *h = it->second; return CUBLAS_STATUS_SUCCESS; }
+  cublasStatus_t e = ::cublasCreate(h);
+  if (e == CUBLAS_STATUS_SUCCESS) made[(void*)h] = *h;
+  return e;
+}
+
+// AND NOTHING IS FREED WHILE RE-DERIVING.  alloc() is not purely allocating:
+// TriMul::adoptBackwardScratch and its triattn twin hand their own backward
+// scratch back and alias the other instance's, and the keep-tier grant frees
+// a tier before resizing it.  On a second pass every one of those pointers is
+// either already freed or belongs to somebody else -- freeing it is a double
+// free that surfaces as `cuda: invalid argument` three lines later.  Nothing
+// NEW is created on a reuse pass, so nothing on it needs releasing.
+inline cudaError_t freeUnlessReusing(void* p) {
+  if (active()) return cudaSuccess;
+  return ::cudaFree(p);
+}
+
+// RAII so an abort inside alloc() cannot leave the whole process reusing.
+struct Scope {
+  bool prev;
+  Scope() : prev(active()) { active() = true; }
+  ~Scope() { active() = prev; }
+};
+
+}  // namespace nbrealloc
+
+#define cudaMalloc(p, n) nbrealloc::mallocReusing((void**)(p), (n))
+#define cudaStreamCreate(s) nbrealloc::streamCreateOnce(s)
+#define cublasCreate(h) nbrealloc::cublasCreateOnce(h)
+#define cudaFree(p) nbrealloc::freeUnlessReusing(p)
 
 struct Tensor {
   std::vector<int> shape;
