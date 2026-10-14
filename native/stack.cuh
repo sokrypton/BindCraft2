@@ -96,6 +96,11 @@ struct Stack {
   std::vector<void*> forig;          // what alloc() gave the module, to restore
   char* tbase[KEEP_NTIER] = {};
   size_t tstride[KEEP_NTIER] = {};   // bytes a depth, for one tier
+  // BYTES ACTUALLY HELD in each tier's arena.  The stride changes when the
+  // step is re-derived at another length; the arena does not, and knowing
+  // its size is what lets the new stride be fitted into it instead of
+  // allocating a second one.
+  size_t tbytes[KEEP_NTIER] = {};
   int tdepth[KEEP_NTIER] = {};       // depths actually granted
   bool have(int tier, int i) const { return i < tdepth[tier]; }
   bool full(int tier) const { return tdepth[tier] >= depth; }
@@ -284,9 +289,31 @@ struct Stack {
     // length's stride is smaller.  The cost is that the short state runs
     // untiered until the next save forward completes a grant.
     if (nbrealloc::active()) {
-      for (int t = 0; t < KEEP_NTIER; ++t) tdepth[t] = 0;
-      regranted = false;
-      save_fwds = 0;
+      // RE-FIT THE ARENA, do not throw the grant away.
+      //
+      // The first version of this set tdepth to 0, regranted to false and
+      // save_fwds to 0, so that regrant() would hand the tiers out again at
+      // the new length.  Both of those were wrong, and the first one
+      // silently:
+      //
+      //   * `save_fwds = 0` on every re-derive, and with ONE object serving
+      //     two states there is a re-derive on every call, so the counter
+      //     never reached regrant_after and regrant() returned early for the
+      //     life of the process.  Zero keep tiers, permanently -- this
+      //     morning's "a deferred grant that nobody completes" bug, put back
+      //     by the one-object work and worth the 15% measured at complex 215.
+      //     A flat per-call curve is what it looks like from outside:
+      //     19378 / 14250 / 14292 ... with no warm-up step at all.
+      //
+      //   * dropping tdepth without freeing tbase would have made the NEXT
+      //     grant cudaMalloc a second arena and leak the first, once a call
+      //     ever got that far.
+      //
+      // The arena is already the right bytes; only the stride moved.  So
+      // keep it and recompute how many depths now fit.
+      for (int t = 0; t < KEEP_NTIER; ++t)
+        tdepth[t] = (tbase[t] && tstride[t])
+                      ? (int)std::min((size_t)depth, tbytes[t] / tstride[t]) : 0;
     }
     const bool no_keep = envOn("NO_FLASH_KEEP") || defer_keep;
     // NO_FLASH_KEEP keeps its old meaning -- drop EVERYTHING -- because it is
@@ -316,6 +343,7 @@ struct Stack {
         tbase[t] = nullptr; n /= 2;           // the estimate was wrong; halve
       }
       tdepth[t] = tbase[t] ? n : 0;
+      tbytes[t] = (size_t)tdepth[t] * tstride[t];
       budget -= (size_t)tdepth[t] * tstride[t];
     }
     // A TIER GRANTED IN FULL MAKES THE MODULE'S OWN BUFFER DEAD.  use() points
