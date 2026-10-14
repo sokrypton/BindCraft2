@@ -1397,6 +1397,133 @@ extern "C" int native_loss_plddt_probe(const float* plddt, const float* mask,
   return 0;
 }
 
+// binder_helicity: _masked_mean(distogram_pair_loss(dg, bins < 6.0, BINARY),
+// helical_pair_mask).  The masks are passed IN rather than rebuilt here --
+// the gate is for the numerics, which is where a port goes wrong, not for
+// python's mask construction, which the driver will call separately.
+extern "C" int native_loss_helicity_probe(const float* dg, const char* pairmask,
+                                          int n, int B, float cutoff, float dL,
+                                          float* out_value, float* out_ddg) {
+  const size_t np = (size_t)n * n, nb = np * (size_t)B;
+  float *ddg_, *dpl, *dout, *dddg; char *dsel, *dpm;
+  CU(::cudaMalloc(&ddg_, nb * 4)); CU(::cudaMalloc(&dpl, np * 4));
+  CU(::cudaMalloc(&dout, 2 * 4)); CU(::cudaMalloc(&dddg, nb * 4));
+  CU(::cudaMalloc(&dsel, (size_t)B)); CU(::cudaMalloc(&dpm, np));
+  CU(cudaMemcpy(ddg_, dg, nb * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dpm, pairmask, np, cudaMemcpyHostToDevice));
+  prodloss::binSelectK<<<(B + 63) / 64, 64>>>(B, cutoff, dsel);
+  prodloss::pairLossK<<<(int)((np + 255) / 256), 256>>>(ddg_, dsel, n, n, B, 1, dpl);
+  prodloss::maskedMean2dK<<<1, 256>>>(dpl, dpm, np, dout);
+  float host[2] = {0, 0};
+  CU(cudaMemcpy(host, dout, 2 * 4, cudaMemcpyDeviceToHost));
+  float* dpl_g; CU(::cudaMalloc(&dpl_g, np * 4));
+  prodloss::maskedMean2dBwdK<<<(int)((np + 255) / 256), 256>>>(dpm, host[1], dL, np, dpl_g);
+  prodloss::pairLossBwdK<<<(int)((np + 255) / 256), 256>>>(ddg_, dsel, dpl_g, n, n, B, 1, dddg);
+  CU(cudaMemcpy(out_ddg, dddg, nb * 4, cudaMemcpyDeviceToHost));
+  *out_value = host[0];
+  for (void* q : {(void*)ddg_, (void*)dpl, (void*)dout, (void*)dddg,
+                  (void*)dsel, (void*)dpm, (void*)dpl_g}) CU(::cudaFree(q));
+  return 0;
+}
+
+// distogram_contact_loss: pair_loss (NON-binary branch) -> best_contact_mean
+// along pairs with contacts_per_residue -> best_contact_mean along residues
+// with contact_residue_count.  binder_contacts and interface_contacts are
+// both this with different masks and constants, which is the point of
+// building the primitive rather than the loss.
+//
+// `crc < 0` means float('inf') -- every masked residue counts.
+extern "C" int native_loss_contacts_probe(const float* dg, const char* pairmask,
+                                          const char* rowmask, int n, int B,
+                                          float cutoff, int cpr, int crc,
+                                          float dL, float* out_value,
+                                          float* out_ddg) {
+  const size_t np = (size_t)n * n, nb = np * (size_t)B;
+  float *ddg_, *dpl, *drow, *dcnt1, *dcnt2, *dout, *dddg, *dpl_g, *drow_g;
+  char *dsel, *dpm, *drm, *dsel1, *dsel2;
+  CU(::cudaMalloc(&ddg_, nb * 4));   CU(::cudaMalloc(&dpl, np * 4));
+  CU(::cudaMalloc(&drow, (size_t)n * 4));
+  CU(::cudaMalloc(&dcnt1, (size_t)n * 4)); CU(::cudaMalloc(&dcnt2, 4));
+  CU(::cudaMalloc(&dout, 4));        CU(::cudaMalloc(&dddg, nb * 4));
+  CU(::cudaMalloc(&dpl_g, np * 4));  CU(::cudaMalloc(&drow_g, (size_t)n * 4));
+  CU(::cudaMalloc(&dsel, (size_t)B));
+  CU(::cudaMalloc(&dpm, np));        CU(::cudaMalloc(&drm, (size_t)n));
+  CU(::cudaMalloc(&dsel1, np));      CU(::cudaMalloc(&dsel2, (size_t)n));
+  CU(cudaMemcpy(ddg_, dg, nb * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dpm, pairmask, np, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(drm, rowmask, (size_t)n, cudaMemcpyHostToDevice));
+  const int kc = cpr < 0 ? n : cpr, kr = crc < 0 ? n : crc;
+
+  prodloss::binSelectK<<<(B + 63) / 64, 64>>>(B, cutoff, dsel);
+  prodloss::pairLossK<<<(int)((np + 255) / 256), 256>>>(ddg_, dsel, n, n, B, 0, dpl);
+  prodloss::bestContactMeanK<<<n, 1>>>(dpl, dpm, n, n, kc, drow, dsel1, dcnt1);
+  prodloss::bestContactMeanK<<<1, 1>>>(drow, drm, 1, n, kr, dout, dsel2, dcnt2);
+  CU(cudaMemcpy(out_value, dout, 4, cudaMemcpyDeviceToHost));
+
+  float dLh = dL;
+  float* dLd; CU(::cudaMalloc(&dLd, 4));
+  CU(cudaMemcpy(dLd, &dLh, 4, cudaMemcpyHostToDevice));
+  prodloss::bestContactMeanBwdK<<<(n + 255) / 256, 256>>>(dsel2, dcnt2, dLd, 1, n, drow_g);
+  prodloss::bestContactMeanBwdK<<<(int)((np + 255) / 256), 256>>>(dsel1, dcnt1, drow_g, n, n, dpl_g);
+  prodloss::pairLossBwdK<<<(int)((np + 255) / 256), 256>>>(ddg_, dsel, dpl_g, n, n, B, 0, dddg);
+  CU(cudaMemcpy(out_ddg, dddg, nb * 4, cudaMemcpyDeviceToHost));
+
+  for (void* q : {(void*)ddg_, (void*)dpl, (void*)drow, (void*)dcnt1, (void*)dcnt2,
+                  (void*)dout, (void*)dddg, (void*)dpl_g, (void*)drow_g, (void*)dsel,
+                  (void*)dpm, (void*)drm, (void*)dsel1, (void*)dsel2, (void*)dLd})
+    CU(::cudaFree(q));
+  return 0;
+}
+
+// chain_pair_pae_loss, which is both binder_pae and interface_pae.  `w` is
+// the outer product of the two chain-group weight vectors, built by the
+// caller: rows x cols need not be square (interface_pae is binder x target).
+extern "C" int native_loss_pae_probe(const float* pae, const float* w,
+                                     int rows, int cols, float dL,
+                                     float* out_value, float* out_dpae) {
+  const size_t n = (size_t)rows * cols;
+  float *dp, *dw, *dout, *dd;
+  CU(::cudaMalloc(&dp, n * 4)); CU(::cudaMalloc(&dw, n * 4));
+  CU(::cudaMalloc(&dout, 2 * 4)); CU(::cudaMalloc(&dd, n * 4));
+  CU(cudaMemcpy(dp, pae, n * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dw, w, n * 4, cudaMemcpyHostToDevice));
+  const float scale = 1.f / 31.f;
+  prodloss::weightedMaskedMeanK<<<1, 256>>>(dp, dw, scale, n, dout);
+  float host[2] = {0, 0};
+  CU(cudaMemcpy(host, dout, 2 * 4, cudaMemcpyDeviceToHost));
+  prodloss::weightedMaskedMeanBwdK<<<(int)((n + 255) / 256), 256>>>(
+      dw, host[1], dL, scale, n, dd);
+  CU(cudaMemcpy(out_dpae, dd, n * 4, cudaMemcpyDeviceToHost));
+  *out_value = host[0];
+  for (void* q : {(void*)dp, (void*)dw, (void*)dout, (void*)dd}) CU(::cudaFree(q));
+  return 0;
+}
+
+// compactness (radius_of_gyration_loss).  `gr` is 2.38 * n_real^0.365 and
+// `count` the designed-chain weight sum, both computed by the caller.
+extern "C" int native_loss_compactness_probe(const float* xyz, const float* m,
+                                             int n, float gr, float count,
+                                             float dL, float* out_value,
+                                             float* out_dxyz) {
+  float *dx, *dm, *dfw, *dsum, *dd;
+  CU(::cudaMalloc(&dx, (size_t)n * 12)); CU(::cudaMalloc(&dm, (size_t)n * 4));
+  CU(::cudaMalloc(&dfw, 8 * 4)); CU(::cudaMalloc(&dsum, 3 * 4));
+  CU(::cudaMalloc(&dd, (size_t)n * 12));
+  CU(cudaMemset(dd, 0, (size_t)n * 12));
+  CU(cudaMemcpy(dx, xyz, (size_t)n * 12, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dm, m, (size_t)n * 4, cudaMemcpyHostToDevice));
+  prodloss::radiusK<<<1, 256>>>(dx, dm, n, gr, dfw);
+  float fw[8];
+  CU(cudaMemcpy(fw, dfw, 8 * 4, cudaMemcpyDeviceToHost));
+  prodloss::radiusSumK<<<1, 256>>>(dx, dm, dfw, n, dsum);
+  prodloss::radiusBwdK<<<(n + 255) / 256, 256>>>(dx, dm, dfw, n, dL / count, dsum, dd);
+  CU(cudaMemcpy(out_dxyz, dd, (size_t)n * 12, cudaMemcpyDeviceToHost));
+  *out_value = fw[0] / count;
+  for (void* q : {(void*)dx, (void*)dm, (void*)dfw, (void*)dsum, (void*)dd})
+    CU(::cudaFree(q));
+  return 0;
+}
+
 extern "C" int native_save_slots_probe(int depth, int n) {
   stack::Stack s;
   s.N = n;
