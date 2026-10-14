@@ -175,6 +175,13 @@ inline bool& active() { static bool a = false; return a; }
 
 struct Slot { void* p; size_t n; };
 
+// Every buffer this process has handed out, in allocation order.  It exists
+// for the reuse keying above, and it doubles as an INVENTORY: a caller can
+// snapshot it around one module's alloc() and learn exactly which buffers
+// are that module's, without enumerating them by hand in a header that will
+// drift.  tplembed uses that to prove its scratch is throwaway.
+inline std::vector<Slot>& ledger() { static std::vector<Slot> v; return v; }
+
 inline cudaError_t mallocReusing(void** p, size_t n) {
   static std::map<void**, Slot> pool;
   auto it = pool.find(p);
@@ -193,8 +200,19 @@ inline cudaError_t mallocReusing(void** p, size_t n) {
     fprintf(stderr, "nbrealloc: GREW %p: %zu -> %zu bytes\n",
             (void*)p, it->second.n, n);
   cudaError_t e = ::cudaMalloc(p, n);
-  if (e == cudaSuccess) pool[p] = Slot{*p, n};
+  if (e == cudaSuccess) { pool[p] = Slot{*p, n}; ledger().push_back(Slot{*p, n}); }
   return e;
+}
+
+// SCRIBBLE, for proving a lifetime rather than arguing one.  Fill a range of
+// the ledger with a pattern that is not a plausible activation: if a later
+// stage's output is bit-identical with these buffers scribbled over, their
+// contents provably did not need to survive, and the bytes can be shared
+// with something else.  If it is not identical, the sharing is unsound and
+// one cheap run said so.
+inline void scribble(size_t first, size_t last, cudaStream_t st) {
+  for (size_t i = first; i < last && i < ledger().size(); ++i)
+    CU(cudaMemsetAsync(ledger()[i].p, 0x5A, ledger()[i].n, st));
 }
 
 // Streams and cuBLAS handles are NOT sized by N, so a second alloc() must

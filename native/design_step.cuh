@@ -370,6 +370,8 @@ struct DesignStep {
   // The length alloc() was FIRST called with -- the size of the buffers,
   // which setN never grows.
   int nmax_alloc = 0;
+  size_t tpl_ledger_first = 0, tpl_ledger_last = 0;
+  size_t evo_ledger_first = 0, evo_ledger_last = 0;
 
   void alloc(const Plan& p, cudaStream_t s) {
     if (!nmax_alloc) nmax_alloc = p.nmax;
@@ -389,7 +391,12 @@ struct DesignStep {
     plan = p; st = s;
     const int N = p.nmax;
     emb.alloc(N, p.msa_rows, s);  dstook("embed");
+    // The template stack's buffers, by ledger position, so NB_TPL_SCRIBBLE
+    // can prove its scratch is throwaway without enumerating 60-odd members
+    // in a list that would drift.  See nbrealloc::scribble.
+    tpl_ledger_first = nbrealloc::ledger().size();
     tpl.alloc(N, p.tpl_depth, s);  dstook("tplembed");
+    tpl_ledger_last = nbrealloc::ledger().size();
     // THE EXTRA-MSA STACK IS NOT A SMALL TRUNK.  It uses
     // msa_column_GLOBAL_attention, and its outer-product-mean comes first.
     // Allocating it like the trunk aborts in the Oracle looking for
@@ -409,6 +416,7 @@ struct DesignStep {
     trunk.b.use_dropout = p.dropout;
     extra.defer_keep = p.defer_keep;
     trunk.defer_keep = p.defer_keep;
+    evo_ledger_first = nbrealloc::ledger().size();
     extra.alloc(N, 1, p.extra_depth, s);  dstook("extra stack");     // pair-only: one msa row
     // THE SAME ORDERING FAILURE THE TRIMUL `out` BUFFER HAD, one stack up.
     //
@@ -425,6 +433,7 @@ struct DesignStep {
     extra.useOwnOut();  dstook("extra out");
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     dstook("trunk stack");
+    evo_ledger_last = nbrealloc::ledger().size();
     t1d.alloc(N, s);  dstook("tpl1d");
     // Zero recycles is what design runs, and then the two normed buffers
     // hold zeros forever -- 277 MB of them at N=736.  See recycle.cuh.
@@ -703,6 +712,13 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   //    an input it never saw -- green forward, quietly wrong gradient,
   //    which is the shape of the bug that broke a campaign once already.
   tpl.forward(emb.pair, in.act_const, pair_mask, tpl_out, /*save*/nullptr);
+  // NB_TPL_SCRIBBLE: destroy the template stack's scratch the instant its
+  // forward returns.  tpl.backward REPLAYS from its query (see the note
+  // above), so nothing downstream should be able to tell -- and if the
+  // gradient is bit-identical with these bytes filled with 0x5A, they are
+  // free to be shared with the Evoformer's, which is 6.2 GB at N=736.
+  if (envOn("NB_TPL_SCRIBBLE"))
+    nbrealloc::scribble(tpl_ledger_first, tpl_ledger_last, st);
   const int gacc = (int)((nn_cz + 255) / 256);
   roundBf16K<<<gacc, 256, 0, st>>>(tpl_out, nn_cz);
   CU(cudaMemcpyAsync(pair_all, emb.pair, nn_cz * 4,
@@ -925,6 +941,12 @@ inline void DesignStep::backward(const Inputs& in, const Cotangents& ct,
 
   // 6. the template embedding, whose contribution was ADDED to the pair, so
   //    the same cotangent reaches both it and the embedder
+  // NB_EVO_SCRIBBLE: the other half of the lifetime proof.  If the template
+  // stack is to run out of the Evoformer's bytes, then tpl.backward -- the
+  // LAST thing in the step that touches them -- destroys the extra and
+  // trunk stacks' scratch.  Nothing after this point may depend on it.
+  if (envOn("NB_EVO_SCRIBBLE"))
+    nbrealloc::scribble(evo_ledger_first, evo_ledger_last, st);
   tpl.backward(d_pair, emb.pair, in.act_const, pair_mask,
                tpl_save, d_tpl_query);
   foldit::accK<<<(int)((nn_cz + 255) / 256), 256, 0, st>>>(
