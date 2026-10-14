@@ -38,6 +38,7 @@
 #include "kabsch.cuh"
 #include "design_step.cuh"
 #include "prod_losses.cuh"
+#include "act_const.cuh"
 #include "structmod.cuh"
 #include "embed.cuh"
 #include "heads.cuh"
@@ -1521,6 +1522,51 @@ extern "C" int native_loss_compactness_probe(const float* xyz, const float* m,
   *out_value = fw[0] / count;
   for (void* q : {(void*)dx, (void*)dm, (void*)dfw, (void*)dsum, (void*)dd})
     CU(::cudaFree(q));
+  return 0;
+}
+
+// act_const, gated against bc2's own __const_only__ harvest.  The weights
+// are loaded BY NAME from the template dump so the eight Linears cannot be
+// bound to each other -- the failure bc2's docstring warns about.
+extern "C" int native_act_const_probe(const char* tpl_dir,
+                                      const float* pb, const float* pbm,
+                                      const float* atoms, const float* amask,
+                                      const int32_t* aatype, const int32_t* asym,
+                                      int n, int nmax, float* out) {
+  Oracle o(tpl_dir);
+  auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };
+  const float* W[8];
+  std::vector<float> bsum(actconst::CH, 0.f);
+  for (int i = 0; i < 8; ++i) {
+    const std::string base = "param/template_pair_embedding_" + std::to_string(i);
+    W[i] = dev(base + "/weights");
+    Tensor& bt = o[base + "/bias"];
+    for (int c = 0; c < actconst::CH; ++c) bsum[c] += bt.host[c];
+  }
+  float *dpb, *dpbm, *datoms, *damask, *dB, *dout;
+  int32_t *daa, *dasym;
+  const size_t nn = (size_t)nmax * nmax * actconst::CH;
+  CU(::cudaMalloc(&dpb, (size_t)n * 3 * 4));   CU(::cudaMalloc(&dpbm, (size_t)n * 4));
+  CU(::cudaMalloc(&datoms, (size_t)n * 37 * 3 * 4));
+  CU(::cudaMalloc(&damask, (size_t)n * 37 * 4));
+  CU(::cudaMalloc(&daa, (size_t)n * 4));       CU(::cudaMalloc(&dasym, (size_t)n * 4));
+  CU(::cudaMalloc(&dB, actconst::CH * 4));     CU(::cudaMalloc(&dout, nn * 4));
+  CU(cudaMemset(dout, 0, nn * 4));
+  CU(cudaMemcpy(dpb, pb, (size_t)n * 3 * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dpbm, pbm, (size_t)n * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(datoms, atoms, (size_t)n * 37 * 3 * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(damask, amask, (size_t)n * 37 * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(daa, aatype, (size_t)n * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dasym, asym, (size_t)n * 4, cudaMemcpyHostToDevice));
+  CU(cudaMemcpy(dB, bsum.data(), actconst::CH * 4, cudaMemcpyHostToDevice));
+  dim3 g(n, n);
+  actconst::actConstK<<<g, actconst::CH>>>(dpb, dpbm, datoms, damask, daa, dasym,
+                                           n, nmax, W[0], W[1], W[2], W[3],
+                                           W[4], W[5], W[6], W[7], dB, dout);
+  CU(cudaDeviceSynchronize());
+  CU(cudaMemcpy(out, dout, nn * 4, cudaMemcpyDeviceToHost));
+  for (void* q : {(void*)dpb,(void*)dpbm,(void*)datoms,(void*)damask,
+                  (void*)daa,(void*)dasym,(void*)dB,(void*)dout}) CU(::cudaFree(q));
   return 0;
 }
 
