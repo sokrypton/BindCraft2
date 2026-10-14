@@ -55,7 +55,6 @@ struct TplEmbed {
   float *act = nullptr, *emb = nullptr, *pre = nullptr;
   float *dact = nullptr, *dqn = nullptr;
   __nv_bfloat16 *actb = nullptr, *dactb = nullptr;
-  float* outScratch = nullptr;              // the replay's discarded output
 
   size_t pairElems() const { return (size_t)N * N * CT; }
   size_t queryElems() const { return (size_t)N * N * CQ; }
@@ -74,7 +73,6 @@ struct TplEmbed {
     CU(cudaMalloc(&rs, (size_t)N * N * 4));
     CU(cudaMalloc(&mu2, (size_t)N * N * 4));
     CU(cudaMalloc(&rs2, (size_t)N * N * 4));
-    CU(cudaMalloc(&outScratch, queryElems() * 4));
   }
 
   void setStream(cudaStream_t s) { st = s; CUB(cublasSetStream(cub, s));
@@ -161,7 +159,18 @@ struct TplEmbed {
     const size_t nq = queryElems(), np = pairElems();
     const int gp = (int)((np + 255) / 256);
     const int rows = (int)((size_t)N * N);
-    forward(query, act_const, pair_mask, outScratch, const_cast<__nv_bfloat16*>(save));
+    // THE REPLAY'S OUTPUT GOES INTO `dqn`, which is why there is no longer
+    // an `outScratch`.  The replay exists to rebuild emb/pre/mu/rs; its
+    // Linear output is discarded and was being given a buffer of its own --
+    // N*N*CQ*4, 277 MB at N=608 and 443 at 768.  `dqn` is exactly that
+    // shape and is not written until the gemmNT below, nine lines later, so
+    // the replay's bytes are overwritten before anything reads them.
+    //
+    // NOT `act` OR `pre`, which is the version of this that does not work:
+    // the comment above says the backward reads emb, pre, mu2, rs2, mu and
+    // rs, and that is a list of what it READS -- `act` is the DESTINATION of
+    // the lnBwd three lines down, so it is live here too.
+    forward(query, act_const, pair_mask, dqn, const_cast<__nv_bfloat16*>(save));
     gemmNT(rows, CT, CQ, dout, wo, dact);
     foldit::reluBwdK<<<gp, 256, 0, st>>>(dact, emb, np);
     foldit::lnBwdK<CT><<<(rows + 7) / 8, 256, 0, st>>>(dact, pre, oS, mu2, rs2,
