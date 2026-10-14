@@ -1372,6 +1372,12 @@ extern "C" int native_design_step_prealloc(int nmax, int recycles,
                                            const char* emb_dir) {
   size_t fb0 = 0, tb = 0;
   if (cudaMemGetInfo(&fb0, &tb) != cudaSuccess) return 1;
+  // HOW LONG, not just how much.  The harness reports ONE "compile" number
+  // and it is XLA's tracing and compilation PLUS this prealloc PLUS the
+  // weight conversion inside it.  Those are different problems with
+  // different fixes, and at complex 987 on an A100 that number is 29.3 s
+  // with nothing to say which part to look at.
+  const auto t_pre0 = std::chrono::steady_clock::now();
   DsKey k{nmax, recycles, msa_rows, dropout, std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
@@ -1379,6 +1385,9 @@ extern "C" int native_design_step_prealloc(int nmax, int recycles,
          /*defer_keep*/true);
   size_t fb1 = 0;
   cudaMemGetInfo(&fb1, &tb);
+  fprintf(stderr, "native: prealloc design_step NMAX=%d built in %.2f s\n",
+          nmax, std::chrono::duration<double>(
+              std::chrono::steady_clock::now() - t_pre0).count());
   fprintf(stderr,
           "native: prealloc design_step NMAX=%d took %.2f GB "
           "(%.2f of %.2f GB free after)\n",

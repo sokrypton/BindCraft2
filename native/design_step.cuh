@@ -509,8 +509,15 @@ struct DesignStep {
     CU(cudaMalloc(&d_pae_logits, nn * heads::NPAE * 4));
     CU(cudaMalloc(&d_expres_logits, n1 * heads::NER * 4));
     CU(cudaMalloc(&d_pair, nn * (size_t)embed::CZ * 4));
-    CU(cudaMalloc(&d_tpl_query, nn * (size_t)embed::CZ * 4));
     CU(cudaMalloc(&d_pair_sm, nn * (size_t)embed::CZ * 4));
+    // AND `d_tpl_query` IS THAT SAME BUFFER.  Both are "a module's pair
+    // cotangent, written to its own buffer and then added into d_pair"
+    // -- the structure module's at the top of the backward, the template
+    // embedder's at the bottom -- and the two are never live together:
+    // d_pair_sm is consumed into d_pair some forty lines before
+    // tpl.backward writes d_tpl_query, and neither is read again after its
+    // accumulate.  N*N*CZ*4 is 277 MB at N=608 and 443 at 768.
+    d_tpl_query = d_pair_sm;
     CU(cudaMalloc(&tpl_save, nn * (size_t)tplembed::CT * 2));
     CU(cudaMalloc(&d_rot, n1 * 9 * 4));
     CU(cudaMalloc(&d_trans, n1 * 3 * 4));
