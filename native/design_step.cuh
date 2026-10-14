@@ -373,10 +373,23 @@ struct DesignStep {
 
   void alloc(const Plan& p, cudaStream_t s) {
     if (!nmax_alloc) nmax_alloc = p.nmax;
+    // DS_MEM itemises the STEP's allocation the way BLK_MEM itemises a
+    // block's.  BLK_MEM covers the Evoformer modules and nothing else, which
+    // at N=736 is 8.9 GB of a 20.6 GB step -- the other 11.7 was being
+    // guessed at.  Same shape as block.cuh's took().
+    size_t ds_fb = 0, ds_tb = 0;
+    const bool ds_mem = getenv("DS_MEM") && !nbrealloc::active();
+    if (ds_mem) CU(cudaMemGetInfo(&ds_fb, &ds_tb));
+    auto dstook = [&](const char* who) {
+      if (!ds_mem) return;
+      size_t f, t; CU(cudaMemGetInfo(&f, &t));
+      fprintf(stderr, "  ds %-16s %8.1f MB\n", who, (ds_fb - f) / 1e6);
+      ds_fb = f;
+    };
     plan = p; st = s;
     const int N = p.nmax;
-    emb.alloc(N, p.msa_rows, s);
-    tpl.alloc(N, p.tpl_depth, s);
+    emb.alloc(N, p.msa_rows, s);  dstook("embed");
+    tpl.alloc(N, p.tpl_depth, s);  dstook("tplembed");
     // THE EXTRA-MSA STACK IS NOT A SMALL TRUNK.  It uses
     // msa_column_GLOBAL_attention, and its outer-product-mean comes first.
     // Allocating it like the trunk aborts in the Oracle looking for
@@ -396,7 +409,7 @@ struct DesignStep {
     trunk.b.use_dropout = p.dropout;
     extra.defer_keep = p.defer_keep;
     trunk.defer_keep = p.defer_keep;
-    extra.alloc(N, 1, p.extra_depth, s);     // pair-only: one msa row
+    extra.alloc(N, 1, p.extra_depth, s);  dstook("extra stack");     // pair-only: one msa row
     // THE SAME ORDERING FAILURE THE TRIMUL `out` BUFFER HAD, one stack up.
     //
     // Stack::alloc deliberately leaves the save set and pout/mout unallocated,
@@ -408,19 +421,20 @@ struct DesignStep {
     // the card to XLA (17.89 GB taken, 4.44 left, XLA takes it) and a ~0.5 GB
     // request mid-step has nowhere to go: `stack.cuh:540 cuda: out of memory`
     // at complex 687.  Same bytes, asked for where there is room.
-    extra.ensureSaveSet();
-    extra.useOwnOut();
+    extra.ensureSaveSet();  dstook("extra saveset");
+    extra.useOwnOut();  dstook("extra out");
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
-    t1d.alloc(N, s);
-    rec.alloc(N, s);
+    dstook("trunk stack");
+    t1d.alloc(N, s);  dstook("tpl1d");
+    rec.alloc(N, s);  dstook("recycle");
     // BEFORE alloc().  do_atoms decides whether the last fold iteration
     // ALLOCATES the atom builder's output at all -- ffi.cu's sm_get sets it
     // before alloc for exactly this reason.  Setting it in setWeights
     // instead leaves sm.outAtom() null, and the first thing that reads it
     // is an illegal access with no symbol anywhere near the cause.
     sm.do_atoms = true;              // bc2 reads final_atom_positions
-    sm.alloc(N, p.sm_depth, s);
-    hd.alloc(N, s);
+    sm.alloc(N, p.sm_depth, s);  dstook("structmod");
+    hd.alloc(N, s);  dstook("heads");
     // Every buffer is sized from NMAX.  None of them is sized from the
     // runtime length: that is what lets one allocation serve every length.
     const size_t n1 = (size_t)N, nn = (size_t)N * N;
@@ -479,6 +493,7 @@ struct DesignStep {
     CU(cudaMalloc(&out_iptm_per_residue, n1 * 4));
     CU(cudaMalloc(&scratch.atoms, n1 * ATOM * 3 * 4));
     CU(cudaMalloc(&scratch.plddt, n1 * 4));
+    dstook("step buffers");
     CU(cudaMalloc(&scratch.pae, nn * 4));
     CU(cudaMalloc(&scratch.ptm, 4));
     CU(cudaMalloc(&scratch.iptm, 4));
