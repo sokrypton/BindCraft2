@@ -356,6 +356,19 @@ struct DesignStep {
     extra.defer_keep = p.defer_keep;
     trunk.defer_keep = p.defer_keep;
     extra.alloc(N, 1, p.extra_depth, s);     // pair-only: one msa row
+    // THE SAME ORDERING FAILURE THE TRIMUL `out` BUFFER HAD, one stack up.
+    //
+    // Stack::alloc deliberately leaves the save set and pout/mout unallocated,
+    // because in the STAGED path XLA owns both and allocating them would be
+    // 3.62 GB thrown away (see stack.cuh).  The fused step hands the TRUNK
+    // XLA's buffers through setTrunkCarry -- but nothing ever hands them to
+    // `extra`, so its first forward fell into the lazy ensureSaveSet() /
+    // useOwnOut() inside forward_().  By then prealloc has given the rest of
+    // the card to XLA (17.89 GB taken, 4.44 left, XLA takes it) and a ~0.5 GB
+    // request mid-step has nowhere to go: `stack.cuh:540 cuda: out of memory`
+    // at complex 687.  Same bytes, asked for where there is room.
+    extra.ensureSaveSet();
+    extra.useOwnOut();
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     t1d.alloc(N, s);
     rec.alloc(N, s);
