@@ -91,12 +91,25 @@ __global__ void plddtLossBwdK(const float* __restrict__ m, float den,
 // distance 0 and is therefore selected by every positive cutoff -- which is
 // the opposite of the recycle distogram's convention, where d=0 sets NO bin,
 // and the two must not be confused.
-__global__ void binSelectK(int nbins, float cutoff, char* __restrict__ sel) {
+// `above` picks the bins AT OR BEYOND the cutoff instead of below it, which
+// is what non_contact_loss asks for: it scores the probability of being FAR
+// from the off-target, where every other distogram loss scores the
+// probability of being close.  Same bin centres, opposite comparison.
+__global__ void binSelectK(int nbins, float cutoff, char* __restrict__ sel,
+                           int above = 0) {
   const int b = blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= nbins) return;
   const float d = (b == 0) ? 0.f
                 : 2.3125f + (21.6875f - 2.3125f) * (float)(b - 1) / (float)(nbins - 2);
-  sel[b] = d < cutoff ? 1 : 0;
+  sel[b] = (above ? (d >= cutoff) : (d < cutoff)) ? 1 : 0;
+}
+
+// x = -x, in place.  non_contact_loss takes best_contact_mean of the
+// NEGATED pair loss -- the k LEAST-far partners of each off-target residue
+// -- and negates the result again.
+__global__ void negateK(float* __restrict__ x, size_t n) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = -x[i];
 }
 
 // pair_loss[r][c] from distogram[r][c][B].  One warp-free block a pair row is
@@ -397,6 +410,15 @@ __global__ void radiusSumK(const float* __restrict__ xyz, const float* __restric
     __syncthreads();
   }
   if (threadIdx.x == 0) { sumw[0]=sx[0]; sumw[1]=sy[0]; sumw[2]=sz[0]; }
+}
+
+// ACCUMULATE a second distogram cotangent.  Two losses read the same
+// distogram, and the second writing over the first is a term silently
+// dropped -- exactly the failure CPP_PORT.md says must never be silent.
+__global__ void accDgramK(float* __restrict__ dst, const float* __restrict__ src,
+                          size_t n) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] += src[i];
 }
 
 }  // namespace prodloss
