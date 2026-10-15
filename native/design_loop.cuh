@@ -193,10 +193,77 @@ inline Scalars stageScalars(int stage, int it, int iters) {
 // SCALE) it discards the one thing left in it, the relative magnitude
 // between positions, and takes a step about five times larger.  design.cu's
 // harness uses Adam; the product has to use what bc2 uses.
+// THE LOGITS LIVE IN FLOAT16 BETWEEN STEPS, which is bc2's and not a
+// choice this port gets to make.  `Protein.empty` builds the sequence as
+// float16 and `GradientSequenceOptimizer._update` ends with
+//
+//     .replace(sequence=updated_logits.astype(shared.sequence.dtype))
+//
+// so the arithmetic is f32 -- read, normalise, Adam, add -- and the RESULT
+// is quantised back to f16 every single step.  Keeping f32 across the
+// trajectory is a different optimiser: not a more accurate one, a different
+// one, and the port diverges from bc2 at step 1 rather than at the end.
+//
+// BC2_F32_LOGITS=1 keeps f32, for measuring what the quantisation is worth.
+inline float toF16(float v) {
+  return (float)__float2half(v);
+}
+inline void quantiseLogits(float* x, size_t n) {
+  if (getenv("BC2_F32_LOGITS")) return;
+  for (size_t i = 0; i < n; ++i) x[i] = toF16(x[i]);
+}
+
+// WHAT THE QUANTISATION IS WORTH, MEASURED WHERE IT HAPPENS.
+//
+// The obvious experiment -- run the trajectory with f16 and with f32 and
+// compare the sequences -- measures nothing: the control (the SAME arm
+// twice, same seed) already diverges completely, because the backward is
+// not bit-reproducible (repro_gate, ~9.1e-04 relative).  Any difference
+// between the arms is buried under that.
+//
+// So the quantity is measured at the step instead, where it is
+// deterministic: of the entries this update moved, how many land back on
+// the SAME f16 grid point -- i.e. how many updates the storage throws away.
+// BC2_LOGIT_QUANT=1 prints it per step.
+// Returns the count MOVED as well as the fraction lost, because 0/0 and
+// 0/N print the same otherwise -- and they mean opposite things.  Harden's
+// gradient is exactly zero (harden_gradient_gate), so its rows are 0/0:
+// "no updates to lose", which read identically to "no updates lost" in the
+// first version of this and would have hidden the end of anneal.
+inline float quantiseLogitsCounting(float* x, const float* before, size_t n,
+                                    size_t* moved_out) {
+  if (getenv("BC2_F32_LOGITS")) { *moved_out = 0; return 0.f; }
+  size_t moved = 0, lost = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const float q = toF16(x[i]);
+    if (x[i] != before[i]) {
+      ++moved;
+      if (q == toF16(before[i])) ++lost;
+    }
+    x[i] = q;
+  }
+  *moved_out = moved;
+  return moved ? (float)lost / (float)moved : 0.f;
+}
+
 struct Sgd {
   float lr = 0.1f;
+  std::vector<float> before;
   void step(float* x, const float* g, size_t n) {
+    const bool count = getenv("BC2_LOGIT_QUANT") != nullptr;
+    if (count) before.assign(x, x + n);
     for (size_t i = 0; i < n; ++i) x[i] -= lr * g[i];
+    if (count) {
+      size_t moved = 0;
+      const float lost = quantiseLogitsCounting(x, before.data(), n, &moved);
+      if (moved == 0)
+        printf("      logit quantisation: NOTHING MOVED (%zu entries)\n", n);
+      else
+        printf("      logit quantisation: %.1f%% of %zu moved entries round "
+               "back\n", 100.f * lost, moved);
+    } else {
+      quantiseLogits(x, n);
+    }
   }
 };
 
@@ -214,6 +281,9 @@ struct Adam {
       v[i] = b2 * v[i] + (1.f - b2) * g[i] * g[i];
       x[i] -= lr * (m[i] / c1) / (sqrtf(v[i] / c2) + eps);
     }
+    // the Adam MOMENTS stay f32 -- bc2's optimizer_state is built from the
+    // f32 view and never round-trips.  Only the logits are quantised.
+    quantiseLogits(x, n);
   }
 };
 
