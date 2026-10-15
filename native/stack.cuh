@@ -731,6 +731,14 @@ struct Stack {
   // pout/mout are XLA'S buffers, handed over per call by setTrunkCarry, and
   // a predict call that does not hand over new ones would write through the
   // pointers the last DESIGN call left.
+  // ...and back again.  `single` mode leaves every depth pointing at one
+  // buffer; a BACKWARD run against that walks a trail of one block.
+  void restoreSaveSet() {
+    if (!psave) return;                 // never had our own: nothing to undo
+    setSaveBuffers(psave, msave);
+    save_full = true;
+  }
+
   void useOwnOut(int nalloc) {
     const int NA = nalloc > N ? nalloc : N;
     size_t np = (size_t)NA * NA * block::CZ, nm = (size_t)S * NA * block::CM;

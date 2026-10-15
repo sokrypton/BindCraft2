@@ -571,6 +571,21 @@ struct DesignStep {
     // comparing the two arms compared one arm with itself: 176 ms against
     // 175 at complex 175, read at the time as "the save writes are free".
     // They are not free; they were never skipped.
+    // UNDO A PREDICT ON THIS OBJECT.  predict() binds the trunk to one
+    // reused save slot; a design forward that followed it kept that
+    // binding and its backward came back NaN -- which is what the C++
+    // driver's SECOND trajectory did, with a sane loss and |grad| nan on
+    // the very first step.
+    //
+    // The FFI path never saw it because DesignStepImpl calls
+    // setTrunkCarry before every forward, which rebinds and sets
+    // save_full; a caller that owns its stacks (the C++ driver) has
+    // nothing doing that for it.  So the undo lives HERE, where neither
+    // caller can forget it.
+    if (want_save && predict_bound) {
+      trunk.restoreSaveSet();
+      predict_bound = false;
+    }
     if (!want_save) { predict(in, out); return; }
     // the recycled state starts at ZERO, and zero is not neutral -- see the
     // note at the top of recycle.cuh
@@ -635,7 +650,12 @@ struct DesignStep {
   // step's save set is XLA's biggest buffer -- slots * N^2 * 128 bf16, and
   // a predict call hands XLA none of it.  The keep tiers go too: they exist
   // for a backward that is not coming, so regrant() is not called here.
+  // set while the trunk is bound to the single predict slot, so a design
+  // forward on the SAME object can put the history back.  See forward().
+  bool predict_bound = false;
+
   void predictBuffers() {
+    predict_bound = true;
     trunk.allocOneSave(nmax_alloc);
     trunk.setSaveBuffers(trunk.p1save, trunk.m1save, /*single*/true);
     trunk.useOwnOut(nmax_alloc);
