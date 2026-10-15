@@ -25,6 +25,23 @@
 
 namespace seqx {
 
+// CA in and out of the [N,37,3] atom layout, for the losses that work on
+// coordinates rather than on a metric head.
+__global__ void gatherCaK(const float* __restrict__ atoms,
+                          const float* __restrict__ seq_mask,
+                          int n, float* __restrict__ xyz, float* __restrict__ m) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  for (int k = 0; k < 3; ++k) xyz[3 * i + k] = atoms[((size_t)i * 37 + 1) * 3 + k];
+  m[i] = seq_mask[i];
+}
+__global__ void scatterCaK(const float* __restrict__ dxyz, int n,
+                           float* __restrict__ d_atoms) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  for (int k = 0; k < 3; ++k) d_atoms[((size_t)i * 37 + 1) * 3 + k] += dxyz[3 * i + k];
+}
+
 static const int NAA = 20;
 
 __global__ void softSeqK(const float* __restrict__ x, const float* __restrict__ bias,
@@ -104,12 +121,35 @@ __global__ void normSeqGradK(float* __restrict__ g, int N) {
     local += row;
     eff += row > 0.f;
   }
+  // REDUCE ACROSS THE WHOLE BLOCK, not across one warp.
+  //
+  // This used to stop at __shfl_xor_sync, which only sums the 32 lanes of
+  // ONE warp, and then thread 0 wrote ITS warp's partial as the block's
+  // total.  design.cu launches <<<1, 32>>> so it was right there and
+  // nowhere else: the C++ driver launched <<<1, 256>>> and got a scale
+  // computed from rows 0..31 alone.  With the gradient concentrated past
+  // row 31 -- which is what the anneal tail does, see the harden cliff --
+  // that sum is ~0, the 1e-7 floor takes over, and the normalised |grad|
+  // came back 1466 where it should be sqrt(designed residues) ~ 7.75.
+  //
+  // A kernel whose correctness depends on an undocumented launch width is
+  // the bug, not the launch.
+  __shared__ float wsum[32];
+  __shared__ float wcnt[32];
 #pragma unroll
   for (int o = 16; o; o >>= 1) {
     local += __shfl_xor_sync(0xffffffffu, local, o);
     eff += __shfl_xor_sync(0xffffffffu, eff, o);
   }
-  if (threadIdx.x == 0) { ssum = local; scount = (float)eff; }
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  const int warps = (blockDim.x + 31) >> 5;
+  if (lane == 0) { wsum[warp] = local; wcnt[warp] = (float)eff; }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float ts = 0.f, tc = 0.f;
+    for (int w = 0; w < warps; ++w) { ts += wsum[w]; tc += wcnt[w]; }
+    ssum = ts; scount = tc;
+  }
   __syncthreads();
   float scale = sqrtf(scount) / (sqrtf(ssum) + 1e-7f);
   for (int n = threadIdx.x; n < N; n += blockDim.x)
