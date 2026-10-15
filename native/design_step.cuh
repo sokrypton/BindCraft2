@@ -707,6 +707,28 @@ struct DesignStep {
 };
 
 // ---- one pass, sequence to the nine ------------------------------------
+// THE OUTPUT ATOM MASK, which was DECLARED AND NEVER WRITTEN.
+//
+// Outputs::atom_mask has been in the struct since the step was written and
+// nothing ever filled it: the JAX path builds its own in native_step.py
+// (`restype_atom37_mask[aatype] * seq_mask`) and never reads this one, so
+// an all-zero buffer travelled with every forward and no gate looked at it.
+// The C++ driver's filters DID read it, and got Interface_Residues 0 on a
+// complex whose chains are 1.65 A apart -- and Backbone_Clashes 0, which
+// PASSED.  A filter that passes because its input is empty is the worst
+// shape of wrong.
+//
+// Same definition as the JAX side, so the two cannot drift.
+__global__ void outAtomMaskK(const int32_t* __restrict__ aatype,
+                             const float* __restrict__ seq_mask,
+                             const float* __restrict__ atom37_mask,
+                             int N, bool* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N * 37) return;
+  const int r = i / 37, a = i % 37;
+  out[i] = atom37_mask[(size_t)aatype[r] * 37 + a] * seq_mask[r] > 0.f;
+}
+
 inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
                                 bool save) {
   const int N = plan.nmax;
@@ -873,6 +895,9 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   //    produce a worse structure with no error anywhere.
   emb.singleFromTrunk(trunk.mout, emb.single);
   idxToFloatK<<<g1, 128, 0, st>>>(aatype, aatype_f, N);
+  if (out.atom_mask)
+    outAtomMaskK<<<(N * 37 + 255) / 256, 256, 0, st>>>(
+        aatype, in.seq_mask, tables.atom37_mask, N, out.atom_mask);
   sm.forward(emb.single, trunk.pout, pair_mask, aatype_f);
   hd.forward(trunk.pout, sm.outAct());
   //    and the experimentally-resolved head is a SEPARATE call reading the
