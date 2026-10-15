@@ -246,6 +246,59 @@ __global__ void pairLossBwdK(const float* __restrict__ dg, const char* __restric
 }
 
 
+// ---- P(close): the softmax mass in the selected bins, NOT its log ------
+//
+// non_helical is binder_helicity's mask and cutoff with a different
+// aggregation: `(softmax(d) * (bins < cutoff)).sum(-1)` where helicity takes
+// -log of the same sum.  Minimising the probability pushes the i,i+3 pairs
+// APART; minimising its negative log pulls them together.  Same mask, same
+// cutoff, opposite structure -- which is why this is a separate kernel and
+// not a flag on the one above: a sign error here is a campaign that builds
+// the helix it was asked to avoid.
+__global__ void probCloseK(const float* __restrict__ dg,
+                           const char* __restrict__ sel,
+                           int rows, int cols, int B,
+                           float* __restrict__ out) {
+  const size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (p >= (size_t)rows * cols) return;
+  const float* d = dg + p * B;
+  float mx = -1e30f;
+  for (int b = 0; b < B; ++b) mx = fmaxf(mx, d[b]);
+  float z = 0.f, s = 0.f;
+  for (int b = 0; b < B; ++b) {
+    const float e = __expf(d[b] - mx);
+    z += e;
+    if (sel[b]) s += e;
+  }
+  out[p] = s / z;
+}
+
+// dS/dd_b = softmax_b * (sel_b - S)
+__global__ void probCloseBwdK(const float* __restrict__ dg,
+                              const char* __restrict__ sel,
+                              const float* __restrict__ dout,
+                              int rows, int cols, int B,
+                              float* __restrict__ ddg) {
+  const size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (p >= (size_t)rows * cols) return;
+  const float* d = dg + p * B;
+  float* o = ddg + p * B;
+  const float g = dout[p];
+  float mx = -1e30f;
+  for (int b = 0; b < B; ++b) mx = fmaxf(mx, d[b]);
+  float z = 0.f, s = 0.f;
+  for (int b = 0; b < B; ++b) {
+    const float e = __expf(d[b] - mx);
+    z += e;
+    if (sel[b]) s += e;
+  }
+  const float S = s / z;
+  for (int b = 0; b < B; ++b) {
+    const float sm = __expf(d[b] - mx) / z;
+    o[b] = g * sm * ((sel[b] ? 1.f : 0.f) - S);
+  }
+}
+
 // _masked_mean over a [rows][cols] array, and its backward.  Same definition
 // as the plddt one above: sum(where(m>0, v*m, 0)) / (sum(m) + 1e-8).
 __global__ void maskedMean2dK(const float* __restrict__ v, const char* __restrict__ m,

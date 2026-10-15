@@ -78,11 +78,16 @@ __global__ void covK(const float* __restrict__ pred,    // [NMAX, 37, 3]
 }
 
 // ---- 3x3 SVD by one-sided Jacobi, then the rotation -------------------
-__global__ void rotationK(const float* __restrict__ stats,  // [15]
-                          float* __restrict__ R) {          // [9]
-  if (threadIdx.x) return;
+//
+// __host__ __device__ so the HOST filters can align a binder with exactly
+// this solver rather than a second copy of it.  The determinant correction
+// and the descending sort below are the two places a transcription goes
+// wrong silently -- the sort cost 39 A once -- and one of those is one too
+// many to have twice.
+__host__ __device__ inline void rotationFromCov(const float* cov,  // [9]
+                                                float* R) {        // [9]
   float W[9], V[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-  for (int k = 0; k < 9; ++k) W[k] = stats[6 + k];
+  for (int k = 0; k < 9; ++k) W[k] = cov[k];
 
   for (int sweep = 0; sweep < 12; ++sweep) {
     for (int p = 0; p < 2; ++p)
@@ -154,6 +159,12 @@ __global__ void rotationK(const float* __restrict__ stats,  // [15]
         acc += V[i * 3 + k] * (k == 2 ? d : 1.f) * U[j * 3 + k];
       R[i * 3 + j] = acc;
     }
+}
+
+__global__ void rotationK(const float* __restrict__ stats,  // [15]
+                          float* __restrict__ R) {          // [9]
+  if (threadIdx.x) return;
+  rotationFromCov(stats + 6, R);
 }
 
 // ---- move every atom ---------------------------------------------------
