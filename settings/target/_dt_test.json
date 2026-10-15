@@ -1,0 +1,4 @@
+{"targets": [
+  {"name": "hPDL1", "target_path": "structures/hPDL1.pdb", "chains": "A", "hotspots": "54,56,66,115", "weight": 1.0},
+  {"name": "mPDL1_off", "target_path": "structures/mPDL1.pdb", "chains": "A", "hotspots": "", "weight": -1.0}
+]}
