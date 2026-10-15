@@ -54,6 +54,17 @@ struct Inputs {
   const float*   act_const;       // [NMAX, NMAX, 64] the hoisted template 8
   const int32_t* n;               // [] RUNTIME length, read on device
   const uint32_t* seed;           // [2] {seed, dropout_enabled}
+  // THE COMPOSITION BIAS, [A] OR NULL, and it belongs HERE rather than
+  // folded into `sequence`.  bc2 adds it to the SCALED logits and only
+  // inside the softmax -- `softmax(logits * logit_scale / temperature +
+  // bias)` -- while the linear path below softmax_weight reads the
+  // UNBIASED logits.  Adding it to the logits instead multiplies it by
+  // logit_scale/temperature, which is 200 at the hard end, and leaks it
+  // into the linear path: measured against bc2, max|d| 0.71 soft and 1.00
+  // hard, where 1.00 on a one-hot means a different amino acid.
+  //
+  // seqFeatK has taken a `bias` argument all along; nothing passed one.
+  const float*   aa_bias = nullptr;
   // THE FOUR DESIGN SCALARS, AS A DEVICE BUFFER [4].  They are arguments
   // to bc2's jitted step and a trajectory ramps them, so an attribute
   // would recompile the graph on every ramp step -- the same mistake as
@@ -782,7 +793,7 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   // 1. the designed sequence -> features AlphaFold reads, and the profile
   seqfeat::Scalars sc{};
   seqfeat::seqFeatK<<<g1, 128, 0, st>>>(
-      in.sequence, in.flags, /*bias*/nullptr, sc, seqfeat::OMITTED_HALF,
+      in.sequence, in.flags, in.aa_bias, sc, seqfeat::OMITTED_HALF,
       feat, prof, N, in.scalars);
 
   // 2. aatype, the residue_constants gathers, the template arrays
@@ -1124,8 +1135,12 @@ inline void DesignStep::backward(const Inputs& in, const Cotangents& ct,
 
   // 9. and the sequence features -> the designed logits
   seqfeat::Scalars sc{};
+  // THE BACKWARD NEEDS THE SAME BIAS.  It recomputes the softmax to get
+  // p, and a backward that recomputes it WITHOUT the bias differentiates
+  // a different function from the one the forward evaluated -- silently,
+  // because the shapes and the magnitudes are unchanged.
   seqfeat::seqFeatBwdK<<<g1, 128, 0, st>>>(
-      in.sequence, in.flags, /*bias*/nullptr, sc, seqfeat::OMITTED_HALF,
+      in.sequence, in.flags, in.aa_bias, sc, seqfeat::OMITTED_HALF,
       d_seqfeat, d_proffeat, d_sequence, N, in.scalars);
   dsDump("b_dseqfeat", d_seqfeat, (size_t)N * inputfeat::A * 4);
   dsDump("b_dsequence", d_sequence, (size_t)N * A * 4);
