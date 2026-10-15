@@ -42,6 +42,8 @@ struct DeviceState {
   int32_t *residue_index = nullptr, *asym_id = nullptr, *entity_id = nullptr;
   int32_t *interface_asym = nullptr, *n_dev = nullptr;
   uint32_t* seed = nullptr;
+  // the composition bias, [NAA], uploaded once -- see Inputs::aa_bias
+  float* aa_bias = nullptr;
   // outputs
   float *o_atoms = nullptr, *o_plddt = nullptr, *o_pae = nullptr;
   float *o_ptm = nullptr, *o_iptm = nullptr, *o_iptm_res = nullptr;
@@ -64,6 +66,7 @@ struct DeviceState {
     I(&residue_index, n1); I(&asym_id, n1); I(&entity_id, n1);
     I(&interface_asym, n1); I(&n_dev, 1);
     CU(::cudaMalloc(&seed, 2 * 4)); CU(cudaMemset(seed, 0, 2 * 4));
+    F(&aa_bias, dsin::NAA);
     F(&o_atoms, n1 * 37 * 3); F(&o_plddt, n1); F(&o_pae, nn); F(&o_ptm, 1);
     F(&o_iptm, 1); F(&o_iptm_res, n1); F(&o_expres, n1);
     F(&o_dgram, nn * design_step::DBINS);
@@ -96,7 +99,7 @@ struct DeviceState {
     in.flags = flags; in.residue_index = residue_index; in.asym_id = asym_id;
     in.entity_id = entity_id; in.interface_asym = interface_asym;
     in.seq_mask = seq_mask; in.act_const = act_const; in.n = n_dev;
-    in.seed = seed; in.scalars = scalars;
+    in.seed = seed; in.scalars = scalars; in.aa_bias = aa_bias;
     return in;
   }
   design_step::Outputs outputs() const {
@@ -132,7 +135,72 @@ inline void setScalars(DeviceState& d, float softmax_w, float one_hot_w,
   CU(cudaMemcpy(d.scalars, s, 4 * 4, cudaMemcpyHostToDevice));
 }
 
-// Adam, as design.cu's loop has it.
+// THE STAGE SCHEDULE, as bindcraft/trajectory.py sets it up.  The four
+// scalars ride in a device buffer precisely so these can move without
+// recompiling anything -- see the note in ds_gate.py.
+//
+//   screen  softmax 0.0 -> 0.9 linear,  one_hot 0, temperature 1
+//   refine  softmax 0.9 -> 1.0 linear,  one_hot 0, temperature 1
+//   anneal  softmax 1.0,                one_hot 0, temperature 1 -> 0.01 QUADRATIC
+//   harden  softmax 1.0,                one_hot 1, temperature 0.01
+//
+// A flat setting is not a neutral choice: the whole point of the ramp is
+// that a soft sequence explores and a hard one commits, and running the
+// hard end from the start is a different algorithm.
+enum Stage { SCREEN = 0, REFINE, ANNEAL, HARDEN, NSTAGES };
+
+// settings.py's DESIGN_STAGE_DEFAULT_ROUNDS.  A flat count per stage is not
+// the same schedule: screen is 50 rounds and harden is 5, so an equal split
+// spends ten times too long committing and a tenth as long exploring.
+inline int stageRounds(int stage) {
+  static const int r[] = {50, 25, 45, 5};
+  return r[stage];
+}
+inline const char* stageName(int s) {
+  static const char* n[] = {"screen", "refine", "anneal", "harden"};
+  return n[s];
+}
+struct Scalars { float softmax_w, one_hot_w, temperature, logit_scale; };
+
+inline Scalars stageScalars(int stage, int it, int iters) {
+  // (it + 1) / iters, NOT it / iters.  Both of bc2's schedules are written
+  // that way -- _linear_sequence_schedule and _quadratic_temperature_schedule
+  // -- so the LAST iteration lands exactly on the end value.  Using it/iters
+  // leaves every ramp short: screen finished at softmax 0.79 instead of 0.9
+  // and anneal at temperature 0.025 instead of 0.01, which is visible in the
+  // trace and easy to read past.
+  const float t = iters > 0 ? (float)(std::min(it, iters - 1) + 1) / (float)iters : 1.f;
+  Scalars s{1.f, 0.f, 1.f, 2.f};
+  switch (stage) {
+    case SCREEN: s.softmax_w = 0.0f + (0.9f - 0.0f) * t; break;
+    case REFINE: s.softmax_w = 0.9f + (1.0f - 0.9f) * t; break;
+    case ANNEAL: {
+      // quadratic, not linear: trajectory.py's _quadratic_temperature_schedule
+      const float u = 1.f - t;
+      s.temperature = 0.01f + (1.0f - 0.01f) * u * u;
+      break;
+    }
+    case HARDEN: s.one_hot_w = 1.f; s.temperature = 0.01f; break;
+  }
+  return s;
+}
+
+// SGD, WHICH IS WHAT bc2 USES.  sequence_optimization.py:67 --
+// `optax.sgd(learning_rate)` with learning_rate=0.1 -- not Adam.
+//
+// The difference is not cosmetic.  Adam rescales each element to about the
+// learning rate, so after norm_seq_grad (which already fixes the gradient's
+// SCALE) it discards the one thing left in it, the relative magnitude
+// between positions, and takes a step about five times larger.  design.cu's
+// harness uses Adam; the product has to use what bc2 uses.
+struct Sgd {
+  float lr = 0.1f;
+  void step(float* x, const float* g, size_t n) {
+    for (size_t i = 0; i < n; ++i) x[i] -= lr * g[i];
+  }
+};
+
+// Adam, as design.cu's harness has it, kept for comparison.
 struct Adam {
   std::vector<float> m, v;
   int t = 0;

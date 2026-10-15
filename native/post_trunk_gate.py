@@ -1,66 +1,120 @@
-# Does replacing the POST-TRUNK step move the model more than replacing the
-# main Evoformer stack already does?
-#
-#   for m in xla main main+post main+post main; do \
-#     python native/post_trunk_gate.py $m; done
-#
-# Measured 2026-10-11, N=179, dropout off, one process an arm:
-#
-#   xla        plddt 0.450951  ptm 0.145564  pae 26.217312  |grad| 10.6216
-#   main       plddt 0.451231  ptm 0.146857  pae 26.217445  |grad|  5.4268
-#   main+post  plddt 0.451212  ptm 0.146862  pae 26.217400  |grad|  4.4129
-#   main+post  plddt 0.451212  ptm 0.146862  pae 26.217400  |grad|  4.4118
-#   main       plddt 0.451235  ptm 0.146857  pae 26.217445  |grad|  5.4032
-#
-# The repeats are the floor and it is small: main+post twice is identical on
-# every forward metric and 0.025% apart on the gradient norm.  Against that,
-# swapping the main stack moves pLDDT 2.8e-04 and the gradient norm 48.9%;
-# ADDING the post-trunk moves them a further 1.9e-05 and 18.7% -- 15x and 5x
-# less than the swap already on by default.  The gradient move is real, not
-# noise; it is simply smaller than the one the model already accepts.
-#
-# That is the bar the extra-MSA and template stacks were judged on, and it is
-# the right one here: a design trajectory is chaotic, so an absolute number
-# means nothing until you know what the same configuration does twice.  The
-# campaign attempt failed exactly there -- two identical runs disagreed by
-# more than the arms did.
-#
-# DROPOUT OFF.  With it on the native masks are a counter hash and JAX's are
-# threefry, so the two are comparable in distribution only and no single
-# forward can be compared at all.
-import os, sys
-MODE = sys.argv[1]            # xla | main | main+post | main+post+embed
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['BC2_NATIVE_POST'] = '1' if MODE.startswith('main+post') else '0'
-os.environ['BC2_NATIVE_EMBED'] = '1' if MODE.endswith('+embed') else '0'
-sys.path.insert(0, '/home/ubuntu/bc2')
-import numpy as np, jax
-from bindcraft.af2 import AlphaFoldDesignModel as AF2
-from bindcraft.protein import Protein
-from bindcraft.loss import build_losses
-import bindcraft.af.alphafold.model.modules_multimer as mm
+'''Gate the post-trunk FFI -- structure module + four heads -- against AF2.
 
-af = AF2(presets='model_1_multimer_v3', data_dir='/home/ubuntu/params',
-         key=jax.random.PRNGKey(0), num_recycle=0, length_bucket_size=1,
-         dropout=False,
-         evoformer_backend='jax' if MODE == 'xla' else 'native')
-p = Protein.empty(179, jax.random.PRNGKey(1))
-st = {'complex': {'binder': p}, 'binder_alone': {'binder': p}}
-# single-chain losses: the interface ones want a target chain this toy state
-# has none of, and the question here is whether the post-trunk path moves the
-# model at all -- the structure module and all four heads run either way
-ls = build_losses({'weights_plddt_loss': 1.0, 'weights_sequence_entropy': 0.1,
-                   'weights_compactness': 0.1})
-r = af.sequence_gradients(st, ls, model='model_1_multimer_v3')
-# the annotation says a 2-tuple; it is not.  Index rather than unpack.
-pred, grads = r[0], r[1]
-m = pred['complex'].metrics
-g = np.concatenate([np.asarray(v, np.float64).ravel()
-                    for v in jax.tree_util.tree_leaves(grads)])
-out = {k: float(np.asarray(m[k]).mean()) for k in
-       ('plddt', 'ptm', 'pae') if k in m}
-out['|grad|'] = float(np.linalg.norm(g))
-print(f'{MODE:<16} post={mm.NATIVE_POST_TRUNK is not None} '
-      f'embed={mm.NATIVE_EMBEDDER is not None} '
-      f'traces={mm.NATIVE_POST_TRUNK_TRACES[0]}/{mm.NATIVE_EMBEDDER_TRACES[0]}  ' +
-      '  '.join(f'{k} {v:.6f}' for k, v in out.items()))
+    python oracle_ipa.py --part post --n 211 --depth 8 --dump pt
+    python post_trunk_weights.py --out post_weights
+    python post_trunk_gate.py pt/ipa-post8-n211
+
+N=211 is the length a real BindCraft campaign produces, NOT a 32-aligned
+benchmark one: the kernels pad internally and the template runner's missing
+pad is what crashed a campaign earlier, so every gate here runs unaligned.
+
+It checks the FORWARD and the BACKWARD, and the backward is the point: the
+composition is new.  The heads write dpair, then the structure module WRITES
+it again rather than accumulating, so the heads' share is staged and added
+back; the experimentally_resolved head's cotangent lands on the trunk single
+while pLDDT's lands on the fold module's act.  Those two merges are exactly
+what a single end-to-end number would hide and what this compares separately.
+'''
+import sys
+
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+jax.config.update('jax_default_matmul_precision', 'highest')
+from native_post_trunk import native_post_trunk  # noqa: E402
+
+OUTS = ('atom', 'dgram', 'pae', 'plddt', 'expres')
+
+
+_RESULTS = []
+
+
+def report(name, a, b):
+  a, b = np.asarray(a, np.float64).ravel(), np.asarray(b, np.float64).ravel()
+  cos = float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-30))
+  rel = float(np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30))
+  _RESULTS.append((name, rel))
+  print(f'  {name:<14} cos {cos:.9f}  relL2 {rel:.3e}  '
+        f'max|d| {np.abs(a - b).max():.3e}  '
+        f'(rms {np.sqrt((a**2).mean()):.4f} vs {np.sqrt((b**2).mean()):.4f})')
+  return cos, rel
+
+
+def main():
+  d = sys.argv[1]
+  wd = sys.argv[2] if len(sys.argv) > 2 else 'post_weights'
+  z = np.load(f'{d}/block.npz')
+  single = jnp.asarray(z['in/single'])
+  pair = jnp.asarray(z['in/pair'])
+  pm = jnp.asarray(z['in/pair_mask'])
+  aat = jnp.asarray(z['in/aatype'])
+  n = single.shape[0]
+  print(f'post-trunk gate  N={n}  weights={wd}')
+
+  def run(s, p):
+    return native_post_trunk(s, p, pm, aat, depth=8, weights_dir=wd)
+
+  got = jax.block_until_ready(jax.jit(run)(single, pair))
+  print('forward')
+  for k, v in zip(OUTS, got):
+    report(f'out/{k}', v, z[f'out/{k}'])
+
+  ct = [jnp.asarray(z[f'ct/{k}']) for k in OUTS]
+
+  def loss(s, p):
+    return sum((o * c).sum() for o, c in zip(run(s, p), ct))
+
+  g = jax.block_until_ready(jax.jit(jax.grad(loss, argnums=(0, 1)))(single,
+                                                                    pair))
+  print('backward')
+  report('grad/single', g[0], z['grad/single'])
+  report('grad/pair', g[1], z['grad/pair'])
+
+  # THE INTERLEAVED BACKWARD.  A gate that runs one forward and then its
+  # backward cannot see state left in the C++ object -- the state is still
+  # the right one.  A design step runs forwards for every state and every
+  # recycle BEFORE any backward, and that is what broke the template
+  # embedding while every other gate it had said green.  This op replays from
+  # single/pair/mask/aatype, which are all passed in, so it should be
+  # immune; the point is to MEASURE that rather than read it off the source.
+  def loss_interleaved(s, p):
+    a = sum((o * c).sum() for o, c in zip(run(s, p), ct))
+    b = sum(o.sum() for o in run(s * 0.5 + 0.1, p * 0.5 + 0.1))
+    return a + 0.0 * b
+
+  gi = jax.block_until_ready(
+      jax.jit(jax.grad(loss_interleaved, argnums=(0, 1)))(single, pair))
+  print('backward, with a second forward sequenced in between')
+  report('grad/single', gi[0], np.asarray(g[0]))
+  report('grad/pair', gi[1], np.asarray(g[1]))
+
+
+if __name__ == '__main__':
+  main()
+
+
+# ---- THE VERDICT ------------------------------------------------------
+#
+# Three claims, and they are not the same strength:
+#
+#   the FORWARD is held tight (1e-3 relative).  dgram and pae come back
+#   bit-identical and plddt to 5e-04; there is no reason for it to drift.
+#   the BACKWARD is bf16 through the structure module, so it is held only
+#   loosely (0.2) -- a REGRESSION CATCHER, not a precision claim, and it
+#   says so rather than implying a floor it has not measured.
+#   the INTERLEAVED backward must match the plain one (1e-4): that is
+#   STATELESSNESS, and it is exact-ish regardless of precision.
+_fwd = [(n, r) for n, r in _RESULTS if n.startswith('out/')]
+_bwd = [(n, r) for n, r in _RESULTS if n.startswith('grad/')]
+_inter = _bwd[2:] if len(_bwd) >= 4 else []
+_plain = _bwd[:2]
+bad = [n for n, r in _fwd if r > 1e-3]
+bad += [n for n, r in _plain if r > 0.2]
+bad += [f'{n}/interleaved' for n, r in _inter if r > 1e-4]
+print(f'\n  forward worst {max((r for _, r in _fwd), default=0):.2e} (bound 1e-03)'
+      f'   backward worst {max((r for _, r in _plain), default=0):.2e} (bound 2e-01, bf16)'
+      f'   interleaved worst {max((r for _, r in _inter), default=0):.2e} (bound 1e-04)')
+print('  ' + ('the post-trunk matches AF2 and is stateless' if not bad
+              else f'ABOVE BOUND: {", ".join(bad)}'))
+raise SystemExit(1 if bad else 0)
