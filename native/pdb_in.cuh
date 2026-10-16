@@ -67,6 +67,37 @@ inline int aaIndex(const std::string& three) {
 // ONE MODEL ONLY, and the first.  A multi-model NMR file would otherwise
 // stack every model into one chain, which presents as a target twice the
 // length it should be rather than as an error.
+// ONE PLACE A RESIDUE IS BUILT, shared by the PDB and the mmCIF readers.
+//
+// Factored out when the CIF reader arrived rather than transcribed into it:
+// the float16 rounding below is not an optimisation, it is what bc2's
+// Protein.atoms holds, and a second reader that forgot it would feed the
+// model a DIFFERENT TEMPLATE -- correct-looking coordinates, 0.031 A out at
+// 50 A, systematically.  pdb_gate.py catches that for the PDB path; a cif
+// path with its own copy would have no such gate.
+inline void addAtom(Structure* s, char chain, int resseq,
+                    const std::string& resname, const std::string& atom,
+                    double x, double y, double z) {
+  const int ai = atomIndex(atom);
+  if (ai < 0) return;                       // hydrogens and the rest
+  int ri = -1;
+  for (int i = (int)s->res.size() - 1; i >= 0; --i)
+    if (s->res[i].chain == chain && s->res[i].resseq == resseq) { ri = i; break; }
+  if (ri < 0) {
+    Residue r{};
+    r.chain = chain; r.resseq = resseq; r.aatype = aaIndex(resname);
+    ri = (int)s->res.size();
+    s->res.push_back(r);
+    if (std::find(s->chains.begin(), s->chains.end(), chain) == s->chains.end())
+      s->chains.push_back(chain);
+  }
+  Residue& r = s->res[ri];
+  r.xyz[ai][0] = half2f(x);
+  r.xyz[ai][1] = half2f(y);
+  r.xyz[ai][2] = half2f(z);
+  r.mask[ai] = 1.f;
+}
+
 inline Structure readPdb(const std::string& path) {
   Structure s;
   std::ifstream f(path);
