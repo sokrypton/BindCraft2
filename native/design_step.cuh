@@ -197,12 +197,25 @@ __global__ void idxToFloatK(const int32_t* __restrict__ src,
 // asserts NAA == 21.  Handing it the [N, 20] buffer compiles -- it is a
 // `const float*` either way -- and reads every row one column off, which
 // garbles the embedding without ever touching unmapped memory.
+// `off` SHIFTS THE COLUMNS, and it is not cosmetic.
+//
+// The multimer pads target_feat on the RIGHT -- jnp.pad(tf, [[0,0],[0,1]]),
+// 21 wide with the 20 sequence columns at 0..19 -- and the MONOMER pads BOTH
+// sides -- [[0,0],[1,1]], 22 wide with the sequence at 1..20.  Writing the
+// monomer's features at 0..19 reads `preprocess_1d`'s weight rows 0..19
+// where the model reads 1..20: every amino acid shifted by one, which costs
+// relL2 6.9e-02 on the 1-D preprocess and 3.2e-02 on the msa the trunk is
+// handed.  It is the exact failure embed_ptm_gate.py was built to catch, and
+// it did not, because that gate builds its own input -- the gate tested the
+// MODULE and the STEP built the buffer.
 __global__ void reColsK(const float* __restrict__ src, int sc,
-                        float* __restrict__ dst, int dc, int N) {
+                        float* __restrict__ dst, int dc, int N,
+                        int off = 0) {
   const size_t q = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (q >= (size_t)N * dc) return;
   const int i = (int)(q / dc), c = (int)(q % dc);
-  dst[q] = c < sc ? src[(size_t)i * sc + c] : 0.f;
+  const int sc_i = c - off;
+  dst[q] = (sc_i >= 0 && sc_i < sc) ? src[(size_t)i * sc + sc_i] : 0.f;
 }
 
 // THE STRUCTURE MODULE EMITS ATOM14, THE BOUNDARY IS ATOM37.  The per-piece
@@ -546,8 +559,12 @@ struct DesignStep {
     CU(cudaMalloc(&asym_f, n1 * 4));
     CU(cudaMalloc(&ent_f, n1 * 4));
     CU(cudaMalloc(&aatype_f, n1 * 4));
-    CU(cudaMalloc(&tf21, n1 * embed::NAA * 4));
-    CU(cudaMalloc(&d_tf21, n1 * embed::NAA * 4));
+    // NAA_MAX, because the monomer's target_feat is 22 wide where the
+    // multimer's is 21 and alloc() runs before the plan's regime could be
+    // read from anywhere else -- and because a re-derive at a shorter length
+    // may not ask for more than the first call took.
+    CU(cudaMalloc(&tf21, n1 * embed::NAA_MAX * 4));
+    CU(cudaMalloc(&d_tf21, n1 * embed::NAA_MAX * 4));
     CU(cudaMalloc(&atom37, n1 * ATOM * 3 * 4));
     CU(cudaMalloc(&trunk_msa, (size_t)(p.msa_rows + 1) * n1 * embed::CM * 4));
     CU(cudaMalloc(&trunk_msa_mask, (size_t)(p.msa_rows + 1) * n1 * 4));
@@ -848,12 +865,14 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   // 3. the embedder: target_feat and msa_feat -> msa and pair.
   //    The relative encoding reads the OFFSET MATRIX computed above, not
   //    residue_index -- see the note on pairInitK in embed.cuh.
-  reColsK<<<(int)(((size_t)N * embed::NAA + 127) / 128), 128, 0, st>>>(
-      feat, inputfeat::A, tf21, embed::NAA, N);
+  const int tf_w = emb.naa();                 // 21 multimer, 22 monomer
+  const int tf_off = plan.monomer ? 1 : 0;    // where the 20 columns start
+  reColsK<<<(int)(((size_t)N * tf_w + 127) / 128), 128, 0, st>>>(
+      feat, inputfeat::A, tf21, tf_w, N, tf_off);
   //    AF2 casts BOTH of the embedder's inputs to bf16 before the Linears
   //    (`batch['msa_feat'].astype(dtype)`, and target_feat inside the pad)
   {
-    const size_t n21 = (size_t)N * embed::NAA;
+    const size_t n21 = (size_t)N * tf_w;
     const size_t nmf = (size_t)plan.msa_rows * N * inputfeat::MSA;
     roundBf16K<<<(int)((n21 + 255) / 256), 256, 0, st>>>(tf21, n21);
     roundBf16K<<<(int)((nmf + 255) / 256), 256, 0, st>>>(msa_feat, nmf);
@@ -924,7 +943,7 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   foldit::accK<<<gacc, 256, 0, st>>>(pair_all, tpl_out, nn_cz);
   roundBf16K<<<gacc, 256, 0, st>>>(pair_all, nn_cz);
 
-  dsDump("tf21", tf21, (size_t)N * embed::NAA * 4);
+  dsDump("tf21", tf21, (size_t)N * tf_w * 4);
   dsDump("msa_feat", msa_feat, (size_t)N * inputfeat::MSA * 4);
   dsDump("emb_pair", emb.pair, nn_cz * 4);
   dsDump("emb_msa", emb.msa, (size_t)plan.msa_rows * N * embed::CM * 4);
@@ -1175,8 +1194,11 @@ inline void DesignStep::backward(const Inputs& in, const Cotangents& ct,
   //    belong to it; the template row's cotangent stops here.
   emb.backward(trunk.b.dm, d_pair, d_single, tf21, d_tf21, d_msa_feat);
   // and back down to the 20 the sequence features have
+  // ...and back, with the shift undone: d_feat column c is d_tf21 column
+  // c + off, which is the same kernel at -off.
   reColsK<<<(int)(((size_t)N * inputfeat::A + 127) / 128), 128, 0, st>>>(
-      d_tf21, embed::NAA, d_feat, inputfeat::A, N);
+      d_tf21, emb.naa(), d_feat, inputfeat::A, N,
+      plan.monomer ? -1 : 0);
 
   // 8. msa_feat and target_feat -> the sequence features and the profile
   inputfeat::msaFeatBwdK<<<(int)(((size_t)N * inputfeat::A + 127) / 128),

@@ -36,6 +36,8 @@
 #include "inputfeat.cuh"
 #include "confidence.cuh"
 #include "kabsch.cuh"
+#include "res_tables.cuh"   // RES_CHI_PI_PERIODIC: the monomer 1-D row's
+                            // only table the callers do not pass
 #include "design_step.cuh"
 #include "prod_losses.cuh"
 #include "act_const.cuh"
@@ -1339,6 +1341,43 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
                                 tpl1d::Tables t1, cudaStream_t st,
                                 bool defer_keep = false) {
   std::lock_guard<std::mutex> lk(g_mu);
+  auto W = [&](const std::string& d) -> Oracle& {
+    Oracle*& w = g_weights[d];
+    if (!w) w = new Oracle(d);
+    return *w;
+  };
+  // THE REGIME IS READ OFF THE WEIGHTS, not passed as an attribute.
+  //
+  // alphafold2_ptm pads target_feat on BOTH sides, so `preprocess_1d` is
+  // [22, 256] where multimer_v3 is [21, 256] -- the same shape test
+  // ckpt.cuh::looksMonomer and alphafold3/af2/convert.py both use, and the
+  // one that makes a conversion idempotent.  A new FFI attribute would have
+  // to be threaded through every caller in two repositories and could then
+  // DISAGREE with the directory it was passed beside; a property of the
+  // checkpoint cannot.  It needs no place in DsKey either: the five
+  // directories are already in the key, and two regimes never share them.
+  bool mono = false;
+  {
+    Oracle& e = W(k.emb);
+    const std::string nm = "param/preprocess_1d/weights";
+    mono = e.has(nm) && !e[nm].shape.empty() && e[nm].shape[0] == 22;
+  }
+  // AND THE MONOMER'S 1-D TEMPLATE ROW NEEDS A TABLE THE CALLERS DO NOT
+  // PASS.  `chi_pi_periodic` is what the alternative torsion angles mirror;
+  // it exists only on this path, and a fourth buffer argument through every
+  // caller to carry 88 floats that are AF2's own constants would be the same
+  // churn the regime flag avoids.  BEFORE the cache lookup, because the hit
+  // path re-stores `t1` every call -- a fill applied only on construction
+  // would hold for one call and be nulled on the next.
+  if (mono && !t1.chi_pi_periodic) {
+    static float* g_chipp = nullptr;
+    if (!g_chipp) {
+      CU(cudaMalloc(&g_chipp, sizeof(RES_CHI_PI_PERIODIC)));
+      CU(cudaMemcpy(g_chipp, RES_CHI_PI_PERIODIC,
+                    sizeof(RES_CHI_PI_PERIODIC), cudaMemcpyHostToDevice));
+    }
+    t1.chi_pi_periodic = g_chipp;
+  }
   auto it = g_ds.find(k);
   if (it != g_ds.end()) {
     it->second->setStream(st);
@@ -1363,12 +1402,8 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   p.defer_keep = defer_keep;
   p.dropout = k.dropout != 0;
   p.lean = k.lean != 0;
+  p.monomer = mono;
   m->alloc(p, st);
-  auto W = [&](const std::string& d) -> Oracle& {
-    Oracle*& w = g_weights[d];
-    if (!w) w = new Oracle(d);
-    return *w;
-  };
   m->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post), W(k.emb), t, t1);
   g_ds[k] = m;
   return m;

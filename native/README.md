@@ -1942,8 +1942,46 @@ silent.
 **And `monomer_campaign_gate.py` is not a parity gate**, which its own
 docstring says before it says anything else. It reaches the branch and checks
 the answer is in family. The gate that sees a WIRING error is
-`ds_compare.py`, against the JAX step, and it does not run the monomer regime
-yet: `ffi.cu`'s `DsKey` has no `monomer` field.
+`ds_compare.py`, against the JAX step -- and that one found the only real bug
+in all of this.
+
+### The one bug, and the gate that was written for it and could not see it
+
+`embed_ptm_gate.py` exists to catch ONE error: the monomer's `target_feat` is
+22 wide with the 20 sequence columns at **1**, and reading them at 0 applies
+`preprocess_1d`'s weight rows 0..19 where the model applies 1..20. The gate
+measures that mistake itself, at relL2 **6.9e-02**. It reports 3.5e-08.
+
+It passed while the DESIGN STEP was making exactly that mistake: `reColsK`
+wrote 21 columns at offset 0 into a buffer the monomer embedder read 22 wide.
+**The gate builds its own input**, so all it could ever test was the module.
+`ds_compare.py` -- the whole native step against the JAX step it replaces,
+read as a multiple of the model's own bf16 floor -- read 6-24x on the head
+outputs; after the fix every field is 0.57-1.79x, where the MULTIMER reads
+1.3-2.2x on the same instrument.
+
+The bisection, in the order it was done, each step cheap:
+
+```
+  1. the hand-offs      post-trunk pair cos 0.998, msa cos 0.965
+                        -> the msa track, not the pair
+  2. the known-good     the MULTIMER trunk, same instrument, reads WORSE
+     path               (msa row0 5.8e-02 against the monomer's 7.6e-02)
+                        -> the trunk is not it
+  3. the trunk's INPUT  monomer 3.0e-02, multimer 3.7e-03 -> 8x, pre-trunk
+                        (captured by patching EvoformerIteration eagerly:
+                        bc2's monomer modules.py has no native hook)
+  4. an independent     agreed with JAX and not with the port, and the
+     f32 restatement    error was 48% a per-channel constant -- which is
+                        what a shifted weight row looks like
+```
+
+`ds_compare_gate.py` now runs the monomer chain in the suite. And `ffi.cu`
+reads the regime off the WEIGHTS -- `preprocess_1d`'s row count, 22 against
+21, the same shape test `ckpt.cuh::looksMonomer` uses -- rather than taking
+an attribute: a new attribute would have to be threaded through every caller
+in two repositories and could then disagree with the directory it was passed
+beside.
 
 ## Pass four, fifth round: occupancy asked for directly
 
