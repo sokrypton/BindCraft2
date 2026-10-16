@@ -195,6 +195,7 @@ struct Embed {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const char* nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
@@ -203,6 +204,7 @@ struct Embed {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("preprocess_1d/weights", &w1d, (size_t)NAA * CM);
@@ -220,6 +222,7 @@ struct Embed {
       const std::string k = o.has(P + RE + nm) ? P + RE + nm : P + nm;
       Tensor& t = o[k];
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     getr("position_activations/weights", &wpos, (size_t)REL_TOT * CZ);

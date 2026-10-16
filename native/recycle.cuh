@@ -160,6 +160,7 @@ struct Recycle {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const std::string& nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
@@ -169,6 +170,7 @@ struct Recycle {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("prev_pos_linear/weights", &wpp, (size_t)DBINS * 128);

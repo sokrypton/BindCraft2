@@ -913,6 +913,7 @@ struct TriAttn {
     dKf = o.dKf; dVf = o.dVf; dnbbF = o.dnbbF; dnbbI = o.dnbbI;
   }
 
+
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };
     ln_scale = dev(P + "query_norm/scale");
@@ -943,11 +944,13 @@ struct TriAttn {
       CU(cudaMalloc(&d, host.size() * 4));
       CU(cudaMemcpy(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
       CU(cudaMalloc(&wcat, host.size() * 2));
+      recordWeightPack(wcat);
       // wcatT IS PADDED TO TOTP = 528 ROWS AND ZEROED.  scatterDxK contracts
       // the H = 4 bias columns as a 16-wide wmma tile, so it reads W rows
       // 512..527; the 12 that do not exist must be zero, not whatever the
       // allocator left there.
       CU(cudaMalloc(&wcatT, (size_t)TOTP * C * 2));
+      recordWeightPack(wcatT);
       CU(cudaMemset(wcatT, 0, (size_t)TOTP * C * 2));
       f32ToBf16K<<<(host.size() + 255) / 256, 256>>>(d, wcat, host.size());
       transposeWK<<<(host.size() + 255) / 256, 256>>>(d, wcatT, C, TOT);
@@ -956,6 +959,7 @@ struct TriAttn {
       // 256 bytes apart.  Built off the PADDED wcatT, so the tail stays zero.
       if (TA_FRAGPERM) {
         CU(cudaMalloc(&wcatS, (size_t)TOTP * C * 2));
+      recordWeightPack(wcatS);
         permuteFragK<<<((size_t)TOTP * C + 255) / 256, 256>>>(wcatT, wcatS, TOTP,
                                                               C, 0, C);
       } else {
@@ -965,7 +969,9 @@ struct TriAttn {
       // `wcat`/`wcatT` stay because the BACKWARD's dX = dY W reads the combined
       // bf16 form, where the gradient arrives as one [M, TOT] block.
       CU(cudaMalloc(&wqkvgTh, (size_t)QKVG * C * sizeof(half)));
+      recordWeightPack(wqkvgTh);
       CU(cudaMalloc(&wnbbTh, (size_t)H * C * sizeof(half)));
+      recordWeightPack(wnbbTh);
       transposeWHalfK<<<((size_t)C * QKVG + 255) / 256, 256>>>(d, wqkvgTh, C, TOT, 0, QKVG);
       transposeWHalfK<<<((size_t)C * H + 255) / 256, 256>>>(d, wnbbTh, C, TOT, QKVG, H);
       CU(cudaFree(d));
@@ -978,18 +984,23 @@ struct TriAttn {
       CU(cudaMalloc(&db, TOT * 4));
       CU(cudaMemcpy(db, hb.data(), TOT * 4, cudaMemcpyHostToDevice));
       CU(cudaMalloc(&bcat, TOT * 2));
+      recordWeightPack(bcat);
       f32ToBf16K<<<1, TOT>>>(db, bcat, TOT);
       CU(cudaMalloc(&bqkvgH, QKVG * sizeof(half)));
+      recordWeightPack(bqkvgH);
       f32ToHalfK<<<(QKVG + 255) / 256, 256>>>(db, bqkvgH, QKVG);
       CU(cudaFree(db));
     }
     {
       float* wof = dev(P + "attention/output_w");   // [H, D, C] == [C, C]
       CU(cudaMalloc(&wo, (size_t)C * C * 2));
+      recordWeightPack(wo);
       CU(cudaMalloc(&woT, (size_t)C * C * 2));
+      recordWeightPack(woT);
       f32ToBf16K<<<((size_t)C * C + 255) / 256, 256>>>(wof, wo, (size_t)C * C);
       transposeWK<<<((size_t)C * C + 255) / 256, 256>>>(wof, woT, C, C);
       CU(cudaMalloc(&bo, C * 2));
+      recordWeightPack(bo);
       f32ToBf16K<<<1, C>>>(dev(P + "attention/output_b"), bo, C);
     }
   }

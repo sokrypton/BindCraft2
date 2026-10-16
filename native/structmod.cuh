@@ -86,6 +86,7 @@ struct StructureModule {
     stack.setStream(s);
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     // the iterations live under fold_iteration/ when the dump carries the
     // whole module; see the same probe in foldstack.cu
@@ -95,6 +96,7 @@ struct StructureModule {
     auto get = [&](const char* nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("single_layer_norm/scale", &lnS, C);

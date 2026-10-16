@@ -404,6 +404,12 @@ struct Tensor {
     return t;
   }
   void to_device() {
+    // ONCE.  This had no guard, so every setWeights that read a tensor
+    // allocated ANOTHER float32 copy of it on the device and dropped the
+    // last -- about 400 MB a model swap, on top of the packs.  The design
+    // pool's note that "each Oracle keeps its own device copy" is what
+    // this is for: one copy per tensor, for the life of the Oracle.
+    if (dev) return;
     CU(cudaMalloc(&dev, n() * sizeof(float)));
     CU(cudaMemcpy(dev, host.data(), n() * sizeof(float), cudaMemcpyHostToDevice));
   }
@@ -411,6 +417,37 @@ struct Tensor {
 
 // Every array the oracle dumped, by its dotted name ("param/pair_transition/
 // transition1/weights", "in/pair", "grad/pair", ...).
+// ---- WHO OWNS A MODEL'S PACKED WEIGHTS ---------------------------------
+//
+// Nearly every module here PACKS its weights on setWeights: it allocates
+// device buffers and converts the oracle's float32 into the bf16/f16/
+// transposed/fragment-permuted forms its kernels read.  Those allocations
+// were never freed, so every model swap leaked the last model's pack --
+// measured at 1.29 GB per swap across a whole step, which took three
+// designs with two held-out models each from 10.5 GB to 20.9 GB and would
+// not have fit a fourth.  The design pool's own comment, "setWeights only
+// rebinds pointers, so a swap between steps costs nothing", was false.
+//
+// The owner cannot be the module: `EvoStack::setWeights` calls one block's
+// setWeights ONCE PER DEPTH and records where each call put its buffers,
+// so 48 live packs come out of one instance and a module that freed its
+// own previous pack would delete depth b-1 while packing depth b.  (That
+// is exactly what the first version of this fix did, and every loss went
+// NaN on the first step.)  The owner is the thing whose weights are being
+// REPLACED -- the DesignStep -- so it publishes a collector for the
+// duration of its setWeights and frees what the last one collected.
+//
+// A module that takes its pointers from another instance (shareWeights,
+// which setWeights calls immediately after) allocates nothing and records
+// nothing, so nothing is freed twice.
+inline std::vector<void*>*& weightPackCollector() {
+  static std::vector<void*>* p = nullptr;
+  return p;
+}
+inline void recordWeightPack(void* p) {
+  if (weightPackCollector() && p) weightPackCollector()->push_back(p);
+}
+
 struct Oracle {
   std::string dir;
   std::map<std::string, Tensor> t;

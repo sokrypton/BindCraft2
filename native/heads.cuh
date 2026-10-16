@@ -121,6 +121,7 @@ struct Heads {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const char* nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
@@ -129,6 +130,7 @@ struct Heads {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("distogram_head/half_logits/weights", &wdg, (size_t)CZ * NDGRAM);

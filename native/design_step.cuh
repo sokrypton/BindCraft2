@@ -717,9 +717,19 @@ struct DesignStep {
     t1d.setStream(s); rec.setStream(s);
   }
 
+  // what THIS step's modules packed for the model it is currently holding;
+  // see the note on weightPackCollector in common.cuh
+  std::vector<void*> packs_;
+
   void setWeights(Oracle& trunk_w, Oracle& extra_w, Oracle& tpl_w,
                   Oracle& post_w, Oracle& emb_w, inputfeat::Tables t,
                   tpl1d::Tables t1) {
+    // THE LAST MODEL'S PACK GOES FIRST.  Not the modules' own doing: a
+    // stack packs once per depth out of one instance, so only the thing
+    // whose whole weight set is being replaced can free it.
+    for (void* p : packs_) if (p) CU(cudaFree(p));
+    packs_.clear();
+    weightPackCollector() = &packs_;
     emb.setWeights(emb_w);
     // the two template_*_1d Linears live under the embedder's scope
     t1d.setWeights(emb_w);
@@ -730,6 +740,7 @@ struct DesignStep {
     trunk.setWeights(trunk_w);
     sm.setWeights(post_w);
     hd.setWeights(post_w);
+    weightPackCollector() = nullptr;
     tables = t;
   }
 

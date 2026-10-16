@@ -556,6 +556,7 @@ struct IPA {
     CU(cudaMalloc(&dtransS, n * 3 * 4));
     // the fused projection's output, per instance -- see buildCombined
     CU(cudaMalloc(&projbuf, n * PROJ_TOT * 4));
+      recordWeightPack(projbuf);
   }
 
   float* drotScratch() { return drotS; }
@@ -584,6 +585,7 @@ struct IPA {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const char* name, float** dst, size_t n) {
       Tensor& t = o[P + name];
@@ -592,6 +594,7 @@ struct IPA {
         abort();
       }
       CU(cudaMalloc(dst, n * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), n * 4, cudaMemcpyHostToDevice));
     };
     const std::string I = "invariant_point_attention/";

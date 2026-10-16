@@ -338,6 +338,7 @@ struct Atom14 {
     auto get = [&](const char* k, float** dst) {
       Tensor& t = o[k];
       CU(cudaMalloc(dst, t.n() * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), t.n() * 4, cudaMemcpyHostToDevice));
     };
     get("const/default_frame", &defFrame);

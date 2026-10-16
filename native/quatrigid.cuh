@@ -195,10 +195,12 @@ struct QuatRigid {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const char* name, float** dst, size_t cnt) {
       Tensor& t = o[P + name];
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("quat_rigid/rigid/weights", &w, (size_t)C * 6);

@@ -192,6 +192,7 @@ struct Opm {
     CU(cudaMalloc(&dL, (size_t)N * S * O * 4));
   }
 
+
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };
     auto& lw = o[P + "left_projection/weights"];
@@ -204,7 +205,9 @@ struct Opm {
       }
     float* d; CU(cudaMalloc(&d, host.size() * 4));
     CU(cudaMemcpy(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
-    CU(cudaMalloc(&wlr, host.size() * 2)); CU(cudaMalloc(&wlrT, host.size() * 2));
+    CU(cudaMalloc(&wlr, host.size() * 2));
+      recordWeightPack(wlr); CU(cudaMalloc(&wlrT, host.size() * 2));
+      recordWeightPack(wlrT);
     f32ToBf16K<<<(host.size() + 255) / 256, 256>>>(d, wlr, host.size());
     transposeWK<<<(host.size() + 255) / 256, 256>>>(d, wlrT, CM, 2 * O);
     CU(cudaFree(d));
@@ -213,10 +216,12 @@ struct Opm {
     for (int c = 0; c < O; ++c) { hb[c] = lb.host[c]; hb[O + c] = rb.host[c]; }
     float* db; CU(cudaMalloc(&db, 2 * O * 4));
     CU(cudaMemcpy(db, hb.data(), 2 * O * 4, cudaMemcpyHostToDevice));
-    CU(cudaMalloc(&blr, 2 * O * 2)); f32ToBf16K<<<1, 2 * O>>>(db, blr, 2 * O);
+    CU(cudaMalloc(&blr, 2 * O * 2));
+      recordWeightPack(blr); f32ToBf16K<<<1, 2 * O>>>(db, blr, 2 * O);
     CU(cudaFree(db));
     float* owf = dev(P + "output_w");
     CU(cudaMalloc(&ow, (size_t)O * O * CZ * 2));
+      recordWeightPack(ow);
     f32ToBf16K<<<((size_t)O * O * CZ + 255) / 256, 256>>>(owf, ow, (size_t)O * O * CZ);
     // output_w is [c][e][f]; the backward's single GEMM contracts over (c,f)
     auto& owh = o[P + "output_w"];
@@ -228,6 +233,7 @@ struct Opm {
     float* dw; CU(cudaMalloc(&dw, hw.size() * 4));
     CU(cudaMemcpy(dw, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
     CU(cudaMalloc(&owT, hw.size() * 2));
+      recordWeightPack(owT);
     f32ToBf16K<<<(hw.size() + 255) / 256, 256>>>(dw, owT, hw.size());
     CU(cudaFree(dw));
     ln_s = dev(P + "layer_norm_input/scale");

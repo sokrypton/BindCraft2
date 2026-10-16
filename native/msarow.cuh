@@ -255,6 +255,7 @@ struct MsaRow {
     CU(cudaMalloc(&lscale, 2 * 4)); CU(cudaMalloc(&lmax, 4));
   }
 
+
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };
     auto& qw = o[P + "attention/query_w"]; auto& kw = o[P + "attention/key_w"];
@@ -270,7 +271,9 @@ struct MsaRow {
       }
     float* d; CU(cudaMalloc(&d, host.size() * 4));
     CU(cudaMemcpy(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
-    CU(cudaMalloc(&wcat, host.size() * 2)); CU(cudaMalloc(&wcatT, host.size() * 2));
+    CU(cudaMalloc(&wcat, host.size() * 2));
+      recordWeightPack(wcat); CU(cudaMalloc(&wcatT, host.size() * 2));
+      recordWeightPack(wcatT);
     f32ToBf16K<<<(host.size() + 255) / 256, 256>>>(d, wcat, host.size());
     transposeWK<<<(host.size() + 255) / 256, 256>>>(d, wcatT, CM, TOT);
     CU(cudaFree(d));
@@ -279,16 +282,22 @@ struct MsaRow {
     for (int c = 0; c < W; ++c) hb[3 * W + c] = gb.host[c];
     float* db; CU(cudaMalloc(&db, TOT * 4));
     CU(cudaMemcpy(db, hb.data(), TOT * 4, cudaMemcpyHostToDevice));
-    CU(cudaMalloc(&bcat, TOT * 2)); f32ToBf16K<<<(TOT + 255) / 256, 256>>>(db, bcat, TOT);
+    CU(cudaMalloc(&bcat, TOT * 2));
+      recordWeightPack(bcat); f32ToBf16K<<<(TOT + 255) / 256, 256>>>(db, bcat, TOT);
     CU(cudaFree(db));
     float* wof = dev(P + "attention/output_w");
-    CU(cudaMalloc(&wo, (size_t)W * CM * 2)); CU(cudaMalloc(&woT, (size_t)W * CM * 2));
+    CU(cudaMalloc(&wo, (size_t)W * CM * 2));
+      recordWeightPack(wo); CU(cudaMalloc(&woT, (size_t)W * CM * 2));
+      recordWeightPack(woT);
     f32ToBf16K<<<((size_t)W * CM + 255) / 256, 256>>>(wof, wo, (size_t)W * CM);
     transposeWK<<<((size_t)W * CM + 255) / 256, 256>>>(wof, woT, W, CM);
     CU(cudaMalloc(&bo, CM * 2));
+      recordWeightPack(bo);
     f32ToBf16K<<<(CM + 255) / 256, 256>>>(dev(P + "attention/output_b"), bo, CM);
     float* w2f = dev(P + "feat_2d_weights");
-    CU(cudaMalloc(&w2d, (size_t)CZ * H * 2)); CU(cudaMalloc(&w2dT, (size_t)CZ * H * 2));
+    CU(cudaMalloc(&w2d, (size_t)CZ * H * 2));
+      recordWeightPack(w2d); CU(cudaMalloc(&w2dT, (size_t)CZ * H * 2));
+      recordWeightPack(w2dT);
     f32ToBf16K<<<((size_t)CZ * H + 255) / 256, 256>>>(w2f, w2d, (size_t)CZ * H);
     transposeWK<<<((size_t)CZ * H + 255) / 256, 256>>>(w2f, w2dT, CZ, H);
     qn_s = dev(P + "query_norm/scale");   qn_o = dev(P + "query_norm/offset");

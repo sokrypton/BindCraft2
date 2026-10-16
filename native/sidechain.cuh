@@ -146,6 +146,7 @@ struct Sidechain {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const std::string& nm, float** dst, size_t cnt) {
       // THE PREFIX IS THE DUMP'S.  A --part sc dump builds these Linears at
@@ -160,6 +161,7 @@ struct Sidechain {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("input_projection/weights", &wi0, (size_t)CIN * C);

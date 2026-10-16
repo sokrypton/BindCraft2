@@ -1254,6 +1254,7 @@ struct TriMul {
   }
 
 
+
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };
     ln_scale = dev(P + "left_norm_input/scale");
@@ -1275,14 +1276,18 @@ struct TriMul {
                       cudaMemcpyDeviceToDevice));
       }
       CU(cudaMalloc(&wcat, (size_t)C * PRE * 2));
+      recordWeightPack(wcat);
       CU(cudaMalloc(&wcatT, (size_t)C * PRE * 2));
+      recordWeightPack(wcatT);
       f32ToBf16K<<<((size_t)C * PRE + 255) / 256, 256>>>(cat, wcat, (size_t)C * PRE);
       transposeWK<<<((size_t)C * PRE + 255) / 256, 256>>>(cat, wcatT, C, PRE);
       CU(cudaFree(cat));
       // the fragment-contiguous copies: wcatG for projGateK (out of the
       // [C][PRE] form), wcatD for combineDxK (out of the [PRE][C] one)
       CU(cudaMalloc(&wcatG, (size_t)C * PRE * 2));
+      recordWeightPack(wcatG);
       CU(cudaMalloc(&wcatD, (size_t)C * PRE * 2));
+      recordWeightPack(wcatD);
       permuteFragK<<<((size_t)C * PRE + 255) / 256, 256>>>(wcat, wcatG, C, PRE, 0, PRE);
       permuteFragK<<<((size_t)C * PRE + 255) / 256, 256>>>(wcatT, wcatD, PRE, C, 0, C);
 
@@ -1294,16 +1299,20 @@ struct TriMul {
       CU(cudaMemcpy(bcatf + 2 * I, bg, 2 * I * 4, cudaMemcpyDeviceToDevice));
       CU(cudaMemcpy(bcatf + 4 * I, bgl, C * 4, cudaMemcpyDeviceToDevice));
       CU(cudaMalloc(&bcat, PRE * 2));
+      recordWeightPack(bcat);
       f32ToBf16K<<<1, PRE>>>(bcatf, bcat, PRE);
       CU(cudaFree(bcatf));
     }
     {
       float* wof = dev(P + "output_projection/weights");
       CU(cudaMalloc(&wo, (size_t)I * C * 2));
+      recordWeightPack(wo);
       CU(cudaMalloc(&woT, (size_t)I * C * 2));
+      recordWeightPack(woT);
       f32ToBf16K<<<((size_t)I * C + 255) / 256, 256>>>(wof, wo, (size_t)I * C);
       transposeWK<<<((size_t)I * C + 255) / 256, 256>>>(wof, woT, I, C);
       CU(cudaMalloc(&bo, C * 2));
+      recordWeightPack(bo);
       f32ToBf16K<<<1, C>>>(dev(P + "output_projection/bias"), bo, C);
     }
   }

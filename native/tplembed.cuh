@@ -79,6 +79,7 @@ struct TplEmbed {
                                    stack.setStream(s); }
   void setDropout(bool on, const uint32_t* seed) { stack.setDropout(on, seed); }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     // setWeights, NOT setWeightsFlat: the flat one deliberately gives every
     // block the SAME weights, which is a convenience for the stack's own gate
@@ -94,6 +95,7 @@ struct TplEmbed {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("query_embedding_norm/scale", &lnS, CQ);

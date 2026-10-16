@@ -214,6 +214,7 @@ struct FoldIteration {
     if (do_atoms) { sc.setStream(s); at.setStream(s); }
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     attn.setWeights(o, P);
     rig.setWeights(o, P);
@@ -225,6 +226,7 @@ struct FoldIteration {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("attention_layer_norm/scale", &ln1s, C);

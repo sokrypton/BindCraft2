@@ -288,6 +288,7 @@ struct MsaCol {
   }
 
   // weights straight from an oracle dump; a block will hand these in instead
+
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };
     auto& qw = o[P + "attention/query_w"]; auto& kw = o[P + "attention/key_w"];
@@ -303,7 +304,9 @@ struct MsaCol {
       }
     float* d; CU(cudaMalloc(&d, host.size() * 4));
     CU(cudaMemcpy(d, host.data(), host.size() * 4, cudaMemcpyHostToDevice));
-    CU(cudaMalloc(&wcat, host.size() * 2)); CU(cudaMalloc(&wcatT, host.size() * 2));
+    CU(cudaMalloc(&wcat, host.size() * 2));
+      recordWeightPack(wcat); CU(cudaMalloc(&wcatT, host.size() * 2));
+      recordWeightPack(wcatT);
     toBf16K<<<(host.size() + 255) / 256, 256>>>(d, wcat, host.size());
     transWK<<<(host.size() + 255) / 256, 256>>>(d, wcatT, CM, TOT);
     CU(cudaFree(d));
@@ -312,13 +315,17 @@ struct MsaCol {
     for (int c = 0; c < W; ++c) hb[3 * W + c] = gb.host[c];
     float* db; CU(cudaMalloc(&db, TOT * 4));
     CU(cudaMemcpy(db, hb.data(), TOT * 4, cudaMemcpyHostToDevice));
-    CU(cudaMalloc(&bcat, TOT * 2)); toBf16K<<<(TOT + 255) / 256, 256>>>(db, bcat, TOT);
+    CU(cudaMalloc(&bcat, TOT * 2));
+      recordWeightPack(bcat); toBf16K<<<(TOT + 255) / 256, 256>>>(db, bcat, TOT);
     CU(cudaFree(db));
     float* wof = dev(P + "attention/output_w");
-    CU(cudaMalloc(&wo, (size_t)W * CM * 2)); CU(cudaMalloc(&woT, (size_t)W * CM * 2));
+    CU(cudaMalloc(&wo, (size_t)W * CM * 2));
+      recordWeightPack(wo); CU(cudaMalloc(&woT, (size_t)W * CM * 2));
+      recordWeightPack(woT);
     toBf16K<<<((size_t)W * CM + 255) / 256, 256>>>(wof, wo, (size_t)W * CM);
     transWK<<<((size_t)W * CM + 255) / 256, 256>>>(wof, woT, W, CM);
     CU(cudaMalloc(&bo, CM * 2));
+      recordWeightPack(bo);
     toBf16K<<<(CM + 255) / 256, 256>>>(dev(P + "attention/output_b"), bo, CM);
     qn_s = dev(P + "query_norm/scale");
     qn_o = dev(P + "query_norm/offset");

@@ -114,6 +114,7 @@ struct Tpl1D {
     st = s; CUB(cublasSetStream(cub, st));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     auto get = [&](const std::string& nm, float** dst, size_t cnt) {
       Tensor& t = o[P + nm];
@@ -122,6 +123,7 @@ struct Tpl1D {
         abort();
       }
       CU(cudaMalloc(dst, cnt * 4));
+      recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
     get("template_single_embedding/weights", &w0, (size_t)NFEAT * CM);

@@ -468,6 +468,7 @@ struct Trans {
               who, took / 1e6, kept / 1e6);
   }
 
+
   void setWeights(Oracle& o, const std::string& P_) {
     // haiku names submodules created inside __call__ under "~"
     std::string P = P_;
@@ -478,11 +479,17 @@ struct Trans {
     // Allocated in alloc() they would all be the same six buffers and every
     // depth would end up running the last block's transition.
     CU(cudaMalloc(&w1, (size_t)C * I * 2));
+      recordWeightPack(w1);
     CU(cudaMalloc(&w1t, (size_t)C * I * 2));
+      recordWeightPack(w1t);
     CU(cudaMalloc(&w2, (size_t)I * C * 2));
+      recordWeightPack(w2);
     CU(cudaMalloc(&w2t, (size_t)I * C * 2));
+      recordWeightPack(w2t);
     CU(cudaMalloc(&b1, (size_t)I * 2));
+      recordWeightPack(b1);
     CU(cudaMalloc(&b2, (size_t)C * 2));
+      recordWeightPack(b2);
     ln_scale = dev(P + "input_layer_norm/scale");
     ln_offset = dev(P + "input_layer_norm/offset");
     float* w1f = dev(P + "transition1/weights");  // [C, I]

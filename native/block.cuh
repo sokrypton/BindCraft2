@@ -341,6 +341,7 @@ struct Block {
     CUB(cublasSetStream(tae.cub, s));
   }
 
+
   void setWeights(Oracle& o, const std::string& P = "param/") {
     // only the modules the prefix actually runs: a ladder dump holds no
     // weights for the ones it stops short of
@@ -351,6 +352,7 @@ struct Block {
       auto& ob = o[P + "outer_product_mean/output_b"];
       ob.to_device();
       CU(cudaMalloc(&opm_k, CZ * 4));
+      recordWeightPack(opm_k);
       opmConstK<<<1, CZ, 0, st>>>(ob.dev, opm_k, opm::OPM_EPS, CZ);
     }
     if (j > 0) opm_.setWeights(o, P + "outer_product_mean/");
