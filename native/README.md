@@ -1910,13 +1910,34 @@ Four modules, each with its own gate, plus two things that are NOT a port:
   to `alphafold3/af2/convert.py` composed with bc2's own dump writers:
   4081 + 341 + 100 + 68 files byte for byte.
 
-**What a single step cannot be is both regimes.** `Plan::monomer` is read at
-ALLOC time -- which template embedder is built, where the outer product mean
-sits in both stacks, `position_scale` -- and one DesignStep serves the whole
-design pool by rebinding weights. bc2's default campaign designs on multimer
-and validates on ptm, so it needs TWO objects. The driver refuses the MIX, in
-both places one can arrive, and names why; a campaign whose design model is
-itself a ptm checkpoint runs today.
+**And bc2's own regime runs: multimer design, AF2-ptm validation, one
+process.** `Plan::monomer` is read at ALLOC time -- which template embedder
+is built, where the outer product mean sits in both stacks, `position_scale`
+-- and one DesignStep serves the whole design pool by rebinding weights, so
+the validation pool gets its own pair:
+
+```
+  validation    2 held-out model(s), resident  (2 monomer, 0 multimer)
+  validation    a SECOND step for the monomer (alphafold2_ptm) regime
+                (predict-only)
+  ...
+      ensemble mean  i_pTM 0.3681  pLDDT 0.3874
+```
+
+Built only when the pool actually holds a model of the other kind, and
+`Plan::lean` because validation never asks for a gradient -- which is what
+makes a second complex-length object affordable. `ensembleEval` repoints
+`step`/`stepb` per model and puts them back before it returns: the POINTERS
+move, because every lambda in the design loop captures them by reference and
+threading a step argument through `runLosses`, `predictBinderAlone`,
+`computeActConst` and everything they call would touch a hundred lines to say
+one thing. `monomer_now` moves with them, because `actConstFor` reads it --
+the monomer embedder has no constant to hoist.
+
+A mixed DESIGN pool is still refused, and that one is not the same gap:
+`pickModel` installs a design model for a GRADIENT step and the second pair
+has no backward buffers at all. `refusal_gate.py` checks that the drop is not
+silent.
 
 **And `monomer_campaign_gate.py` is not a parity gate**, which its own
 docstring says before it says anything else. It reaches the branch and checks

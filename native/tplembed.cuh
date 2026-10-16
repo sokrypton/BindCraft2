@@ -75,9 +75,18 @@ struct TplEmbed {
     CU(cudaMalloc(&rs2, (size_t)N * N * 4));
   }
 
-  void setStream(cudaStream_t s) { st = s; CUB(cublasSetStream(cub, s));
-                                   stack.setStream(s); }
-  void setDropout(bool on, const uint32_t* seed) { stack.setDropout(on, seed); }
+  // GUARDED FOR THE SAME REASON tplembed_ptm's is, in the other direction:
+  // DesignStep holds both template embedders and allocates exactly one, and
+  // setStream runs over everything it holds.  Under a MONOMER plan this
+  // object is the unallocated one.
+  void setStream(cudaStream_t s) {
+    st = s;
+    if (cub) CUB(cublasSetStream(cub, s));
+    if (stack.blk.N) stack.setStream(s);
+  }
+  void setDropout(bool on, const uint32_t* seed) {
+    if (stack.blk.N) stack.setDropout(on, seed);
+  }
 
 
   void setWeights(Oracle& o, const std::string& P = "param/") {

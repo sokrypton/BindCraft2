@@ -185,9 +185,22 @@ struct TplEmbedPtm {
     CU(cudaMalloc(&rs, (size_t)N * N * 4));
   }
 
-  void setStream(cudaStream_t s) { st = s; CUB(cublasSetStream(cub, s));
-                                   stack.setStream(s); }
-  void setDropout(bool on, const uint32_t* seed) { stack.setDropout(on, seed); }
+  // A NEVER-ALLOCATED OBJECT STILL GETS ITS STREAM SET.  DesignStep holds
+  // both template embedders as members and allocates exactly one of them, and
+  // setStream runs over everything it holds -- so under a MULTIMER plan this
+  // object's `cub` is null and cublasSetStream returns NOT_INITIALIZED.  The
+  // fused-step gate found it as `tplembed_ptm.cuh:188 cublas: 1`, which is a
+  // hard abort in a path that has nothing to do with the monomer.  Guarding
+  // here rather than at the caller: the caller would have to know which of
+  // the two was built, which is the thing this flag exists to hide.
+  void setStream(cudaStream_t s) {
+    st = s;
+    if (cub) CUB(cublasSetStream(cub, s));
+    if (stack.blk.N) stack.setStream(s);
+  }
+  void setDropout(bool on, const uint32_t* seed) {
+    if (stack.blk.N) stack.setDropout(on, seed);
+  }
 
   void setWeights(Oracle& o, const std::string& P = "param/") {
     stack.setWeights(o);
