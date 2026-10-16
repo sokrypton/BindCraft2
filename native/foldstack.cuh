@@ -37,6 +37,8 @@ struct FoldStack {
   // asks for -- when the earlier ones are needed they become seven more
   // do_atoms flags and seven more datom inputs, nothing structural.
   bool do_atoms = false;
+  // 10 for alphafold2_ptm, 20 for multimer_v3; set before alloc with do_atoms
+  float pos_scale = foldit::POSITION_SCALE;
 
   void alloc(int N_, int depth_, cudaStream_t s = nullptr) {
     N = N_; depth = depth_; st = s;
@@ -44,6 +46,7 @@ struct FoldStack {
     // the flag has to be set BEFORE alloc: it is what decides whether the
     // sidechain and the atom builder get buffers at all
     if (do_atoms) it[depth - 1].do_atoms = true;
+    for (auto& f : it) f.pos_scale = pos_scale;
     for (auto& f : it) f.alloc(N, s);
     rot.resize(depth + 1); trans.resize(depth + 1);
     // rot[0]/trans[0] are the caller's and are never written

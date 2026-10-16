@@ -144,6 +144,17 @@ struct Block {
   // attempt inflated S instead and the gate read grad/pair 0.12.
   void alloc(int N_, int S_, cudaStream_t s = nullptr,
              const Block* donor = nullptr) {
+    // PAIR_ONLY COLLAPSES THE TWO BLOCK ORDERS.  The extra-MSA stack runs
+    // with its whole msa track dead and its outer product mean replaced by a
+    // constant (output_b / eps, because the extra alignment is entirely
+    // masked), and that constant reaches the pair chain in the SAME place
+    // under either order: opm_first reads m0 and opm_last reads m3, and with
+    // no msa track there is no m0 or m3 to tell apart.  The monomer network
+    // does have a 4-block extra stack -- alphafold2_ptm sets use_extra_msa --
+    // so refusing the combination (which this did) refused the monomer
+    // regime for a difference that does not exist.  Normalised once, here,
+    // rather than branched twice below.
+    if (pair_only) opm_first = true;
     N = N_; S = S_; st = s;
     size_t fb0 = 0, tb0 = 0;
     const bool mem = envOn("BLK_MEM");
@@ -175,13 +186,6 @@ struct Block {
       for (auto q : {&p1b, &p2b, &p3b, &p4b, &p5b}) CU(cudaMalloc(q, np * 2));
     for (auto q : {&m0b, &m1b, &m2b}) CU(cudaMalloc(q, nm * 2));
     if (!opm_first) {
-      // the extra-MSA stack's constant-OPM specialisation lives in the
-      // multimer branch only, and the monomer network has no extra stack to
-      // run anyway -- so refuse the combination rather than silently skip it
-      if (pair_only) {
-        fprintf(stderr, "block: pair_only needs the multimer order\n");
-        abort();
-      }
       if (donor) p0b = donor->p0b; else CU(cudaMalloc(&p0b, np * 2));
       CU(cudaMalloc(&m3b, nm * 2));
     }

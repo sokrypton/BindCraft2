@@ -165,10 +165,30 @@ struct TplBlock {
     ptr.setWeights(o, P + "pair_transition/");
   }
 
+  // THE TWO TEMPLATE STACKS RUN THEIR FOUR PAIR MODULES IN DIFFERENT ORDERS.
+  //
+  //   multimer (modules_multimer.TemplateEmbeddingIteration):
+  //       tri-mul out, tri-mul in, tri-attn start, tri-attn end, transition
+  //   monomer  (modules.TemplatePairStack):
+  //       tri-attn start, tri-attn end, tri-mul out, tri-mul in, transition
+  //
+  // Same modules, same widths, same weights names -- the ATTENTIONS COME
+  // FIRST under alphafold2_ptm.  Running the multimer order on monomer
+  // weights gates at cos 0.919 on the template representation, which is
+  // exactly the kind of number that reads as a precision problem.
+  //
+  // FORWARD ONLY.  Nothing differentiates the monomer template contribution:
+  // its features are template-only and its pointwise attention collapses to a
+  // Linear at one template, so the whole thing is a constant (see
+  // tplembed_ptm.cuh).  backward() therefore refuses this order rather than
+  // running the wrong one.
+  bool attn_first = false;
+
   void forward(const __nv_bfloat16* pair, const float* pair_mask) {
     size_t np = (size_t)N * N * CZ;
     int gp = (int)((np + 255) / 256);
     p1b = pair;
+    if (attn_first) { forwardAttnFirst(pair_mask, np, gp); return; }
     tmo.forward(p1b, pair_mask);
     if (use_dropout)
       addDropNarrowBK<true><<<gp, 256, 0, st>>>(p2b, p1b, tmo.out, N, CZ,
@@ -204,7 +224,44 @@ struct TplBlock {
   // the residual's input gradient is the delta's gradient plus what passed by,
   // and these backwards each read their cotangent once, at the top, into a
   // bf16 copy -- which is what makes the aliasing safe.  See block.cuh.
+  // the monomer order, forward.  The four modules are the same objects and
+  // each reads whatever precedes it; only the chain is rewired.
+  void forwardAttnFirst(const float* pair_mask, size_t np, int gp) {
+    tas.forward(p1b, pair_mask);
+    if (use_dropout)
+      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p2b, p1b, tas.out, N, CZ,
+          drop_seed, drop_depth, DM_TAS, DROP, np);
+    else
+      addNarrowBK<<<gp, 256, 0, st>>>(p2b, p1b, tas.out, np);
+    tae.forward(p2b, pair_mask);
+    if (use_dropout)
+      addDropNarrowBK<false><<<gp, 256, 0, st>>>(p3b, p2b, tae.out, N, CZ,
+          drop_seed, drop_depth, DM_TAE, DROP, np);
+    else
+      addNarrowBK<<<gp, 256, 0, st>>>(p3b, p2b, tae.out, np);
+    tmo.forward(p3b, pair_mask);
+    if (use_dropout)
+      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p4b, p3b, tmo.out, N, CZ,
+          drop_seed, drop_depth, DM_TMO, DROP, np);
+    else
+      addNarrowBK<<<gp, 256, 0, st>>>(p4b, p3b, tmo.out, np);
+    tmi.forward(p4b, pair_mask);
+    if (use_dropout)
+      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p5b, p4b, tmi.out, N, CZ,
+          drop_seed, drop_depth, DM_TMI, DROP, np);
+    else
+      addNarrowBK<<<gp, 256, 0, st>>>(p5b, p4b, tmi.out, np);
+    ptr.forward(p5b);
+    addNarrowBK<<<gp, 256, 0, st>>>(p6b, p5b, ptr.out, np);
+  }
+
   void backward(const __nv_bfloat16* ct, const float* pair_mask) {
+    if (attn_first) {
+      fprintf(stderr, "tplblock: the monomer template order has no backward "
+                      "-- its contribution is a constant (tplembed_ptm.cuh). "
+                      "Nothing should be asking for one.\n");
+      abort();
+    }
     size_t np = (size_t)N * N * CZ;
     CU(cudaMemcpyAsync(dp, ct, np * 2, cudaMemcpyDeviceToDevice, st));
     ptr.backward(dp, p5b, dp, /*acc*/true);

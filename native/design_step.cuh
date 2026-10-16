@@ -158,6 +158,15 @@ struct Plan {
   // size difference: calling backward() on a lean object dereferences a
   // null, so the key is what keeps a design off one.
   bool lean = false;
+  // THE MONOMER (alphafold2_ptm) REGIME.  Three runtime decisions, no second
+  // network: the embedder's target_feat is 22 wide with one 65-bin
+  // `pair_activiations` (embed.cuh), both Evoformer stacks run the outer
+  // product mean LAST, and the structure module's position_scale is 10 rather
+  // than 20.  Everything else the monomer checkpoint holds is the multimer
+  // graph's parameters in another layout -- the full diff is in ckpt.cuh.
+  // What is NOT covered: the monomer TEMPLATE embedder, which really is a
+  // different module, so a monomer step must run with templates off.
+  bool monomer = false;
 };
 
 // ffi.cu keeps its own bf16ToF32OutK next to the custom calls; a header
@@ -432,7 +441,10 @@ struct DesignStep {
     // msa_column_attention/attention/query_w, which is the first thing the
     // end-to-end gate found.
     extra.b.pair_only = true;
-    extra.b.opm_first = true;
+    extra.b.opm_first = !p.monomer;
+    trunk.b.opm_first = !p.monomer;
+    emb.monomer = p.monomer;
+    sm.pos_scale = p.monomer ? 10.f : foldit::POSITION_SCALE;
     // AND do_msa FALSE.  pair_only alone decides which modules are
     // ALLOCATED; it does not stop setWeights looking the msa modules up,
     // and the Oracle aborts on msa_column_attention -- which the extra

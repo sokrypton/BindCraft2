@@ -1756,43 +1756,110 @@ Against what the broken pairing gave -- native loss 0.391756 against XLA's
 there all along and was being bypassed: `check_params`, against the model's
 OWN parameters.
 
-### ...but the monomer BACKWARD does not gate, and it is off
+### RETRACTED: "the monomer BACKWARD does not gate, and it is off"
 
-The design step above is not a gate, and taking it for one would be the same
-mistake twice. Against its own oracle (`ORACLE_PTM=1 oracle.py --n-seq 1
---stack --blocks 48`, weights converted by the same `ptm_to_multimer`):
+This section used to say the monomer forward gated at cos 0.9969 and its
+backward did not gate at all -- NaN at full cotangent scale, cos 0.412 with
+the cotangent scaled down -- and `backend.enable` refused the monomer path on
+the strength of it. **That measurement was the instrument, not the port.**
+
+`oracle.py`'s default activations are N(0,1) with all-ones masks, and **one
+monomer block takes a unit-normal pair to rms 185** -- the oracle does it too
+(185.6 against our 185.9), so the forward agrees; what cannot survive is a
+backward through a map that amplifies like that. The control settles it: the
+MULTIMER stack, green everywhere else, reads **grad/pair cos 0.970** on the
+same synthetic SINGLE block, and 0.984 at depth 48. The synthetic regime has
+no resolution left for either network (see [[trunk-gate-resolution]]).
+
+On the MODEL'S OWN activations -- `dump_real.py` for the activations, masks
+and weights, then `oracle.py --inputs` at the same depth -- at depth 48:
 
 ```
-  monomer order + ptm weights, 48 blocks, N=256, S=1
-    forward   out/pair cos 0.996889   out/msa cos 0.999044
-    backward  grad/pair NaN           grad/msa NaN
+                 out/pair    out/msa    grad/pair   grad/msa
+  multimer_v3    0.999581   0.999990    0.967039    0.958525   (N=224, S=2)
+  ptm            0.999850   0.999989    0.991349    0.990324   (N=128, S=1)
 ```
 
-The forward works, though 0.9969 against the multimer path's 0.999962. The
-backward does not. Three measurements locate it:
+**The monomer is BETTER than the multimer in the regime the stack actually
+runs in**, forward and backward, and there is no NaN anywhere in it. The
+dynamic loss scaling added for the MSA attention's f16 backward
+(`maxAbsHalfK`/`pickScaleK`) was a fix for a problem that only the synthetic
+inputs had; it is exact up to range and stays.
 
-* **`GRAD_TRACE`**: the gradient is healthy walking back from block 47 --
-  rms(dp) 1.00 -> 0.62, rms(dm) 1.00 -> 139 -- and then block 2's backward
-  returns NaN. The multimer stack on the same oracle shape reaches rms(dm)
-  18.7 at block 2 and never blows up: **the monomer network amplifies the msa
-  gradient 7.5x harder**, and the attention backward is f16 (max 65504).
-* **`NAN_TRACE`** (new, in `block.cuh`) names the step: everything is finite
-  until `d:msa_row`, which is the f16 flash.
-* **`CT_SCALE`** (new, in `stack.cu`) settles what kind of problem it is. The
-  backward is LINEAR in the cotangent, so a scale leaves cos invariant and
-  moves only the dynamic range. At 1e-3 the NaN goes away and `grad/pair`
-  reads **cos 0.412**. So it is not only overflow: with the range fixed the
-  gradient is still wrong.
+Reproduce:
 
-Dynamic loss scaling for the MSA attention's f16 backward went in anyway
-(`maxAbsHalfK`/`pickScaleK` in common.cuh, applied in `msarow.cuh`: a
-power-of-two scale, so it is exact except for range) and it does NOT fix this
--- which is itself evidence, since it rules the MSA attention's own f16 range
-out as the whole story.
+```bash
+OUT=real_ptm.npz L=128 python dump_real.py
+for K in 1 8 48; do
+  ORACLE_PTM=1 python oracle.py --n 128 --n-seq 1 --stack --blocks $K \
+      --inputs real_ptm.npz --weights /home/ubuntu/params/params_model_1_ptm.npz \
+      --dump out_ptm_real
+done
+OPM_LAST=1 ./stack out_ptm_real/stack48-real-n128 ptm_weights 1
+```
 
-`backend.enable` therefore REFUSES a monomer model and says why;
-`NE_MONOMER_UNVALIDATED=1` runs it anyway. The multimer path is untouched:
-grad/pair 0.978626 at S=2 and 0.986919 at S=1.
+and `monomer_stack_gate.py` is the same question asked in situ, which is what
+runs in the suite: it builds the ptm model, reads `opm_first` off its config,
+picks `ptm_weights` by that and not by a flag, and scores the hook against the
+model's own scan (relL2 2.07e-02 pair, 1.72e-02 msa at N=128).
+
+### alphafold2_ptm is not a second network
+
+Diff the two checkpoints by NAME and by SHAPE and the whole difference is:
+
+```
+  evoformer/preprocess_1d, left_single, right_single   (22, .) vs (21, .)
+  evoformer/pair_activiations (65,128)    vs ~_relative_encoding/
+                                             position_activations (73,128)
+  triangle_multiplication_*   left/right projection + gate, two LayerNorms
+                                          vs one fused projection and gate
+  structure_module IPA        q_scalar / kv_scalar / q_point_local /
+                              kv_point_local, WITH BIASES
+                                          vs six separate projections
+  structure_module            affine_update (384,6)
+                                          vs quat_rigid/rigid (384,6)
+  template_embedding          a genuinely different module
+  masked_msa_head             23 classes vs 22   -- design never reads it
+```
+
+Every head, every Evoformer width, the whole structure module below the IPA's
+projections and the template PAIR stack are identical in name and shape. So
+the monomer runs on these kernels with **three runtime decisions** --
+`Plan::monomer`: the 22-wide embedder, the outer product mean last,
+`position_scale` 10 instead of 20 -- plus layout transforms. Two of the
+"differences" are the same operation under another name:
+
+* **`affine_update` IS `quat_rigid`.** `QuatAffine::pre_compose` forms
+  `q + q(0,v) = q(1,v)` and normalises, which is `q` composed with
+  `normalise(1, v)` -- exactly what `QuatRigid` builds from `(1, v)` -- and
+  both add `R_old @ t_update` to the old translation. A rename.
+* **the IPA's monomer projections are the multimer ones concatenated.** The
+  scalars reshape to (head, per) and split PER HEAD; the points are
+  coord-major where multimer is head-major, so they transpose. And the
+  monomer's scalar biases are NOT zero (max 0.90) where no multimer
+  checkpoint has them at all -- `ckpt.cuh` supplies zeros only when the key is
+  absent, so this lands by itself, but it is exactly the sort of thing that
+  would have been a plausible-everywhere wrong answer.
+
+`ckpt.cuh::monomerise` does all of it in C++ and `ckpt_ptm_gate.py` holds it
+to `alphafold3/af2/convert.py` composed with bc2's own dump writers -- two
+independent transcriptions of the same map: **4081 trunk files, 341 extra,
+101 template-stack and 68 structure-module files, byte for byte.**
+`embed_ptm_gate.py` holds the monomer embedder to bc2's own module at relL2
+3.5e-08 forward and 3.0e-07 backward; feeding it the multimer's 21-wide
+layout instead moves the answer by 6.9e-02, so the gate can see the column
+shift it exists to catch.
+
+**What is left is the TEMPLATE EMBEDDER.** The monomer's is one `embedding2d`
+of 88 features into 64 channels plus an attention over the template axis,
+where the multimer has nine `template_pair_embedding_*`, a
+`query_embedding_norm` and an `output_linear`. `model_1_ptm` and
+`model_2_ptm` -- the two bc2 validates on -- both enable templates, so a
+monomer run here would be a prediction with the target's template thrown
+away. The driver therefore REFUSES a monomer checkpoint, in all three places
+one can arrive (the design model, the design pool, the validation ensemble),
+and says which module is missing; `refusal_gate.py` checks it.
+
 
 ## Pass four, fifth round: occupancy asked for directly
 

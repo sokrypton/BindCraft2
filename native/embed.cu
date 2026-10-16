@@ -21,20 +21,31 @@ int main(int argc, char** argv) {
                         "ct/pair"})
     o[k].to_device();
 
-  // target_feat arrives 20-wide and the model pads it to 21
-  std::vector<float> tfp((size_t)N * embed::NAA, 0.f);
+  // EMBED_PTM gates the MONOMER (alphafold2_ptm) embedder: target_feat 22
+  // wide with the 20 sequence columns at 1, one 65-bin relative encoding, and
+  // no feature mask.  Same dump format, a different embedder -- see the
+  // NAA_PTM note in embed.cuh.
+  const bool ptm = envOn("EMBED_PTM");
+  const int naa = ptm ? embed::NAA_PTM : embed::NAA;
+  const int c0 = ptm ? 1 : 0;        // where the 20 sequence columns start
+  if (ptm) printf("  MONOMER (alphafold2_ptm) embedder: naa=%d relpos=%d\n",
+                  naa, embed::REL_BINS_PTM);
+
+  // target_feat arrives 20-wide and the model pads it
+  std::vector<float> tfp((size_t)N * naa, 0.f);
   for (int i = 0; i < N; ++i)
     for (int c = 0; c < 20; ++c)
-      tfp[(size_t)i * embed::NAA + c] = tf0.host[(size_t)i * 20 + c];
+      tfp[(size_t)i * naa + c0 + c] = tf0.host[(size_t)i * 20 + c];
   float* tf;
   CU(cudaMalloc(&tf, tfp.size() * 4));
   CU(cudaMemcpy(tf, tfp.data(), tfp.size() * 4, cudaMemcpyHostToDevice));
 
   embed::Embed m;
+  m.monomer = ptm;
   m.alloc(N, S);
   m.setWeights(o);
   float *dtf, *dmf;
-  CU(cudaMalloc(&dtf, (size_t)N * embed::NAA * 4));
+  CU(cudaMalloc(&dtf, (size_t)N * naa * 4));
   CU(cudaMalloc(&dmf, (size_t)S * N * embed::NMSA_F * 4));
 
   auto fwd = [&] {
@@ -54,11 +65,11 @@ int main(int argc, char** argv) {
   printf("backward\n");
   // the oracle differentiates the UNPADDED target_feat, so drop the pad column
   {
-    auto g = fetch(dtf, (size_t)N * embed::NAA);
+    auto g = fetch(dtf, (size_t)N * naa);
     std::vector<float> g20((size_t)N * 20);
     for (int i = 0; i < N; ++i)
       for (int c = 0; c < 20; ++c)
-        g20[(size_t)i * 20 + c] = g[(size_t)i * embed::NAA + c];
+        g20[(size_t)i * 20 + c] = g[(size_t)i * naa + c0 + c];
     report("grad/target_feat", compare(g20, o["grad/target_feat"].host));
   }
   report("grad/msa_feat", compare(fetch(dmf, (size_t)S * N * embed::NMSA_F),

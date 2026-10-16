@@ -44,6 +44,7 @@ struct StructureModule {
   cublasHandle_t cub = nullptr;
   foldstack::FoldStack stack;
   bool do_atoms = false;
+  float pos_scale = foldit::POSITION_SCALE;   // 10 under alphafold2_ptm
 
   float *lnS = nullptr, *lnSo = nullptr;     // single_layer_norm
   float *lnP = nullptr, *lnPo = nullptr;     // pair_layer_norm
@@ -62,6 +63,7 @@ struct StructureModule {
     CUB(cublasSetStream(cub, st));
     CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
     stack.do_atoms = do_atoms;
+    stack.pos_scale = pos_scale;
     stack.alloc(N, depth, s);
     size_t nc = (size_t)N * C, np = (size_t)N * N * CZ;
     for (auto q : {&initial, &act0, &dact0, &dinitial}) CU(cudaMalloc(q, nc * 4));

@@ -40,6 +40,27 @@ static const int MAX_CHAIN = 2;
 static const int CHAIN_BINS = 2 * MAX_CHAIN + 2; // 6
 static const int REL_TOT = REL_BINS + 1 + CHAIN_BINS;  // 73
 
+// THE MONOMER (alphafold2_ptm) EMBEDDER IS A DIFFERENT EMBEDDER, not the same
+// one on other weights.  Three things change and none of them is a weight
+// transform:
+//
+//   * target_feat is padded on BOTH sides -- jnp.pad(tf, [[0,0],[1,1]]) -- so
+//     it is 22 wide and the 20 sequence columns start at 1, where the multimer
+//     pads one column on the right only and starts at 0.  Feeding the
+//     multimer's 21-wide layout to the monomer's [22, C] weights reads a
+//     column shifted by one for every amino acid.
+//   * the relative encoding is ONE one-hot of 65 bins through a Linear named
+//     `pair_activiations` (AF2's own typo), not the multimer's 73-wide
+//     concatenation of offset + same_entity + chain offset.  No asym, no
+//     entity, no sym: a monomer has one chain.
+//   * there is no feature mask.  `preprocess_1d` is NOT zeroed on rows whose
+//     target_feat sums to zero -- that line belongs to the fork's multimer
+//     embedder (and only under its query-bias branch); bc2's monomer has no
+//     such line, and neither does DeepMind's.
+static const int NAA_PTM = 22;
+static const int REL_BINS_PTM = 2 * MAX_REL + 1;   // 65, clipped, no extra bin
+static const int NAA_MAX = NAA_PTM;                // what a caller must allocate
+
 // pair[i,j] = left[i] + right[j] + relpos(i,j), the three one-hot rows
 // gathered rather than multiplied
 __global__ void pairInitK(const float* __restrict__ left,
@@ -86,6 +107,33 @@ __global__ void pairInitK(const float* __restrict__ left,
   if (same_entity) v += wpos[(size_t)REL_BINS * CZ + c];
   v += wpos[(size_t)(REL_BINS + 1 + chain_bin) * CZ + c];
   v += bpos[c];
+  pair[idx] = v;
+}
+
+// The MONOMER relative encoding: one clipped offset one-hot, 65 bins, and
+// nothing else.  `off_mat` is bc2's own `offset` feature again -- modules.py
+// prefers batch['offset'] over residue_index differences exactly as
+// modules_multimer does, and bc2 always supplies it.
+__global__ void pairInitPtmK(const float* __restrict__ left,
+                             const float* __restrict__ right,
+                             const float* __restrict__ wpos,
+                             const float* __restrict__ bpos,
+                             const float* __restrict__ residue_index,
+                             const int32_t* __restrict__ off_mat,
+                             float* __restrict__ pair, int N) {
+  size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= (size_t)N * N * CZ) return;
+  int c = (int)(idx % CZ);
+  size_t ij = idx / CZ;
+  int j = (int)(ij % N), i = (int)(ij / N);
+
+  int off = off_mat ? off_mat[ij]
+                    : (int)residue_index[i] - (int)residue_index[j];
+  int bin = off + MAX_REL;
+  bin = bin < 0 ? 0 : (bin > 2 * MAX_REL ? 2 * MAX_REL : bin);
+
+  float v = left[(size_t)i * CZ + c] + right[(size_t)j * CZ + c];
+  v += wpos[(size_t)bin * CZ + c] + bpos[c];
   pair[idx] = v;
 }
 
@@ -150,6 +198,11 @@ __global__ void featMaskK(float* __restrict__ x, const float* __restrict__ tf,
 
 struct Embed {
   int N = 0, S = 0;
+  // set BEFORE setWeights and left set: it decides the parameter shapes, the
+  // target_feat width and which relative encoding runs
+  bool monomer = false;
+  int naa() const { return monomer ? NAA_PTM : NAA; }
+  int relTot() const { return monomer ? REL_BINS_PTM : REL_TOT; }
   cudaStream_t st = nullptr;
   cublasHandle_t cub = nullptr;
 
@@ -207,13 +260,13 @@ struct Embed {
       recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
-    get("preprocess_1d/weights", &w1d, (size_t)NAA * CM);
+    get("preprocess_1d/weights", &w1d, (size_t)naa() * CM);
     get("preprocess_1d/bias", &b1d, CM);
     get("preprocess_msa/weights", &wmsa, (size_t)NMSA_F * CM);
     get("preprocess_msa/bias", &bmsa, CM);
-    get("left_single/weights", &wl, (size_t)NAA * CZ);
+    get("left_single/weights", &wl, (size_t)naa() * CZ);
     get("left_single/bias", &bl, CZ);
-    get("right_single/weights", &wr, (size_t)NAA * CZ);
+    get("right_single/weights", &wr, (size_t)naa() * CZ);
     get("right_single/bias", &br, CZ);
     // the dump keeps haiku's method scope, as the checkpoint does; see the
     // naming note in oracle_ipa.py
@@ -225,8 +278,17 @@ struct Embed {
       recordWeightPack(*dst);
       CU(cudaMemcpy(*dst, t.host.data(), cnt * 4, cudaMemcpyHostToDevice));
     };
-    getr("position_activations/weights", &wpos, (size_t)REL_TOT * CZ);
-    getr("position_activations/bias", &bpos, CZ);
+    if (monomer) {
+      // AF2's own spelling.  A lookup under the correct spelling would abort
+      // in the Oracle, which is the right failure, but the name is worth
+      // saying out loud: `pair_activiations`, in modules.py and in every
+      // alphafold2_ptm checkpoint.
+      get("pair_activiations/weights", &wpos, (size_t)REL_BINS_PTM * CZ);
+      get("pair_activiations/bias", &bpos, CZ);
+    } else {
+      getr("position_activations/weights", &wpos, (size_t)REL_TOT * CZ);
+      getr("position_activations/bias", &bpos, CZ);
+    }
     // OPTIONAL: single_activations belongs to the post-trunk step, so an
     // embedder-only dump has no reason to carry it.  The driver loads a dump
     // that does.
@@ -241,22 +303,27 @@ struct Embed {
                const float* asym_id, const float* entity_id,
                const float* sym_id, const int32_t* off_mat = nullptr) {
     size_t nm = (size_t)N * CM, sm = (size_t)S * N * CM;
-    gemm(N, CM, NAA, tf, w1d, pre1d);
+    gemm(N, CM, naa(), tf, w1d, pre1d);
     addRowBiasK<<<(int)((nm + 255) / 256), 256, 0, st>>>(pre1d, b1d, CM, nm);
-    featMaskK<<<N, 256, 0, st>>>(pre1d, tf, N, CM);
+    // the monomer has no feature mask; see the note on NAA_PTM
+    if (!monomer) featMaskK<<<N, 256, 0, st>>>(pre1d, tf, N, CM);
     gemm(S * N, CM, NMSA_F, mf, wmsa, premsa);
     addRowBiasK<<<(int)((sm + 255) / 256), 256, 0, st>>>(premsa, bmsa, CM, sm);
     msaAddK<<<(int)((sm + 255) / 256), 256, 0, st>>>(pre1d, premsa, msa, S, N);
 
-    gemm(N, CZ, NAA, tf, wl, left);
+    gemm(N, CZ, naa(), tf, wl, left);
     addRowBiasK<<<(int)(((size_t)N * CZ + 255) / 256), 256, 0, st>>>(
         left, bl, CZ, (size_t)N * CZ);
-    gemm(N, CZ, NAA, tf, wr, right);
+    gemm(N, CZ, naa(), tf, wr, right);
     addRowBiasK<<<(int)(((size_t)N * CZ + 255) / 256), 256, 0, st>>>(
         right, br, CZ, (size_t)N * CZ);
-    pairInitK<<<(int)(((size_t)N * N * CZ + 255) / 256), 256, 0, st>>>(
-        left, right, wpos, bpos, residue_index, asym_id, entity_id, sym_id,
-        off_mat, pair, N);
+    if (monomer)
+      pairInitPtmK<<<(int)(((size_t)N * N * CZ + 255) / 256), 256, 0, st>>>(
+          left, right, wpos, bpos, residue_index, off_mat, pair, N);
+    else
+      pairInitK<<<(int)(((size_t)N * N * CZ + 255) / 256), 256, 0, st>>>(
+          left, right, wpos, bpos, residue_index, asym_id, entity_id, sym_id,
+          off_mat, pair, N);
 
   }
 
@@ -289,12 +356,12 @@ struct Embed {
     gemmNT(S * N, NMSA_F, CM, dmsaact, wmsa, dmf);
     msaAddBwdK<<<(int)(((size_t)N * CM + 255) / 256), 256, 0, st>>>(
         dmsaact, dpre1d, S, N);
-    featMaskK<<<N, 256, 0, st>>>(dpre1d, tf, N, CM);
-    gemmNT(N, NAA, CM, dpre1d, w1d, dtf);
+    if (!monomer) featMaskK<<<N, 256, 0, st>>>(dpre1d, tf, N, CM);
+    gemmNT(N, naa(), CM, dpre1d, w1d, dtf);
 
     pairInitBwdK<<<N * CZ, 256, 0, st>>>(dpair, dleft, dright, N);
-    gemmNT(N, NAA, CZ, dleft, wl, dtf, /*beta*/1.f);
-    gemmNT(N, NAA, CZ, dright, wr, dtf, /*beta*/1.f);
+    gemmNT(N, naa(), CZ, dleft, wl, dtf, /*beta*/1.f);
+    gemmNT(N, naa(), CZ, dright, wr, dtf, /*beta*/1.f);
   }
 };
 

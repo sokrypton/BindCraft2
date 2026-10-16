@@ -166,6 +166,13 @@ struct FoldIteration {
   static constexpr float SM_DROP = 0.1f;
 
   bool do_atoms = false;
+  // THE MONOMER'S FRAME IS IN DIFFERENT UNITS.  alphafold2_ptm's structure
+  // module config says position_scale 10, multimer_v3 says 20, and that is
+  // the ONLY thing besides the weights and the block order that separates the
+  // two structure modules -- see the monomer note in ckpt.cuh.  A member
+  // rather than the constant, because one process runs both (a multimer
+  // design and a monomer validation) and a recompile is not an option.
+  float pos_scale = POSITION_SCALE;
   sidechain::Sidechain sc;
   atom14::Atom14 at;
   float* tscaled = nullptr;     // the frame's translation x position_scale
@@ -295,7 +302,7 @@ struct FoldIteration {
       // the sidechain reads the frame AFTER the update, with its translation
       // in angstroms
       scaleToK<<<(N * 3 + 255) / 256, 256, 0, st>>>(tscaled, tout,
-                                                    POSITION_SCALE, (size_t)N * 3);
+                                                    pos_scale, (size_t)N * 3);
       sc.forward(a4, initial);
       at.forward(sc.ang, rout, tscaled, aatype);
     }
@@ -359,7 +366,7 @@ struct FoldIteration {
       addScaledK<<<(N * 9 + 255) / 256, 256, 0, st>>>(drotSum, drout, drotA, 1.f,
                                                       (size_t)N * 9);
       addScaledK<<<(N * 3 + 255) / 256, 256, 0, st>>>(
-          dtransSum, dtout, dtransA, POSITION_SCALE, (size_t)N * 3);
+          dtransSum, dtout, dtransA, pos_scale, (size_t)N * 3);
       drUse = drotSum; dtUse = dtransSum;
       sc.backward(dang, a4, initial, dscAct, dinitial, accInitial);
     }
