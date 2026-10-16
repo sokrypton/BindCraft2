@@ -1861,6 +1861,69 @@ one can arrive (the design model, the design pool, the validation ensemble),
 and says which module is missing; `refusal_gate.py` checks it.
 
 
+### And the whole monomer network now runs, end to end, in C++
+
+```
+  bindcraft camp.json params=/home/ubuntu/params/params_model_1_ptm.npz \
+      steps=2 mutate_steps=1 validation_models=0
+  ...
+  MONOMER (alphafold2_ptm): the 22-wide embedder, the outer product mean
+  last, position_scale 10, and its own template embedder
+  ...
+  plddt mean 0.3930 over 175 residues   ptm 0.3545   iptm 0.4990
+```
+
+Four modules, each with its own gate, plus two things that are NOT a port:
+
+* `embed.cuh` grew a `monomer` flag: target_feat 22 wide with the 20
+  sequence columns at **1**, one 65-bin `pair_activiations` (AF2's own
+  typo), and no feature mask. Against bc2's own module, relL2 3.5e-08
+  forward and 3.0e-07 backward; fed the multimer's 21-wide layout instead,
+  the answer moves 6.9e-02, which is what makes `embed_ptm_gate.py` able to
+  see the column shift it exists for.
+* `tplembed_ptm.cuh` is the monomer template embedder -- and the reason it
+  is 250 lines rather than a second `tplembed` is that **the query never
+  reaches the output**. Monomer `SingleTemplateEmbedding` reads
+  `query_embedding` for its dtype and nothing else; all 88 of its features
+  are template-only; and `TemplatePointwiseAttention` softmaxes over a
+  template axis of length ONE, so the weight is 1 whatever the logit is. So
+  the whole contribution is a constant with no backward, and the attention
+  folds to one `[64, 128]` Linear. Both measured against bc2's module rather
+  than argued: **max|d| 0.000e+00 on a seven-times-larger query**, and
+  2.1e-06 for the fold.
+* its pair stack runs the **attentions first** where the multimer runs the
+  multiplications first (`tplblock::attn_first`). Running the multimer order
+  on monomer weights gates at cos 0.919 -- a number that reads as a
+  precision problem and is a reordering.
+* `tpl1d.cuh::featPtmK` is the 1-D template row: all seven torsions, their
+  alternatives under the naming ambiguities, and seven masks -- 57 features
+  against the multimer's 34. Every DEFINED feature is bit-exact against
+  bc2's `atom37_to_torsion_angles`. The undefined ones are NOT JUDGED and
+  the gate says so: residue 0's previous atoms are zeros, AF2 does not
+  replace them (`placeholder_for_undefined = not zero_init`, and zero_init
+  is True), the Gram-Schmidt then subtracts two near-equal vectors and
+  divides by `sqrt(|.|^2 + 1e-8)`, and a ONE-ULP move of the input
+  coordinates flips the result by 2.0. There is no bound there that both
+  means something and can be met.
+* `ckpt.cuh::monomerise` does the layout transforms in C++, so
+  `params=...ptm.npz` still needs no Python, and `ckpt_ptm_gate.py` holds it
+  to `alphafold3/af2/convert.py` composed with bc2's own dump writers:
+  4081 + 341 + 100 + 68 files byte for byte.
+
+**What a single step cannot be is both regimes.** `Plan::monomer` is read at
+ALLOC time -- which template embedder is built, where the outer product mean
+sits in both stacks, `position_scale` -- and one DesignStep serves the whole
+design pool by rebinding weights. bc2's default campaign designs on multimer
+and validates on ptm, so it needs TWO objects. The driver refuses the MIX, in
+both places one can arrive, and names why; a campaign whose design model is
+itself a ptm checkpoint runs today.
+
+**And `monomer_campaign_gate.py` is not a parity gate**, which its own
+docstring says before it says anything else. It reaches the branch and checks
+the answer is in family. The gate that sees a WIRING error is
+`ds_compare.py`, against the JAX step, and it does not run the monomer regime
+yet: `ffi.cu`'s `DsKey` has no `monomer` field.
+
 ## Pass four, fifth round: occupancy asked for directly
 
 The BMF/BMG/BMS sweeps moved occupancy *indirectly*, through the tile size,

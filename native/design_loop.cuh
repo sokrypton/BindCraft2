@@ -16,6 +16,7 @@ namespace dsloop {
 // matmul and not the missing table.
 struct ConstTables {
   float *a14m = nullptr, *a37m = nullptr, *chim = nullptr;
+  float *chipp = nullptr;           // chi_pi_periodic, the monomer row only
   int32_t *a1437 = nullptr, *a3714 = nullptr, *chii = nullptr;
   void upload() {
     auto F = [&](float** p, const float* h, size_t n) {
@@ -25,11 +26,15 @@ struct ConstTables {
       CU(::cudaMalloc(p, n * 4)); CU(cudaMemcpy(*p, t.data(), n * 4, cudaMemcpyHostToDevice)); };
     F(&a14m, RES_ATOM14_MASK, 308); F(&a37m, RES_ATOM37_MASK, 814);
     F(&chim, RES_CHI_MASK, 88);
+    // MONOMER ONLY, but uploaded unconditionally: 88 floats, and a table that
+    // is present-but-unread is cheaper than a second upload path that is
+    // skipped on the branch nobody runs.
+    F(&chipp, RES_CHI_PI_PERIODIC, 88);
     I(&a1437, RES_ATOM14_TO_ATOM37, 308); I(&a3714, RES_ATOM37_TO_ATOM14, 814);
     I(&chii, RES_CHI_ATOM_INDICES, 352);
   }
   inputfeat::Tables feat() const { return inputfeat::Tables{a14m, a37m, a1437, a3714}; }
-  tpl1d::Tables chi() const { return tpl1d::Tables{chii, chim}; }
+  tpl1d::Tables chi() const { return tpl1d::Tables{chii, chim, chipp}; }
 };
 
 // One state's device buffers: the inputs the step reads and the outputs it

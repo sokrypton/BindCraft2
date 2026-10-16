@@ -29,6 +29,8 @@
 #include "structmod.cuh"
 #include "heads.cuh"
 #include "tplembed.cuh"
+#include "tplembed_ptm.cuh"   // the MONOMER template embedder; only one of
+                               // the two is ever allocated, see DesignStep
 #include "tpl1d.cuh"
 #include "recycle.cuh"
 
@@ -298,6 +300,11 @@ struct DesignStep {
 
   embed::Embed emb;
   tplembed::TplEmbed tpl;
+  // THE MONOMER'S TEMPLATE EMBEDDER IS A DIFFERENT OBJECT, and only one of
+  // the two is ever allocated: each owns a 2-block template pair stack, which
+  // is the largest single allocation in the library, so building both would
+  // cost 6 GB at N=736 to use one.
+  tpeptm::TplEmbedPtm tplp;
   stack::Stack extra;          // the 4-block extra-MSA stack, pair only
   stack::Stack trunk;          // the 48-block Evoformer
   structmod::StructureModule sm;
@@ -433,7 +440,9 @@ struct DesignStep {
     // can prove its scratch is throwaway without enumerating 60-odd members
     // in a list that would drift.  See nbrealloc::scribble.
     tpl_ledger_first = nbrealloc::ledger().size();
-    tpl.alloc(N, p.tpl_depth, s);  dstook("tplembed");
+    if (p.monomer) tplp.alloc(N, p.tpl_depth, s);
+    else           tpl.alloc(N, p.tpl_depth, s);
+    dstook("tplembed");
     tpl_ledger_last = nbrealloc::ledger().size();
     // THE EXTRA-MSA STACK IS NOT A SMALL TRUNK.  It uses
     // msa_column_GLOBAL_attention, and its outer-product-mean comes first.
@@ -491,7 +500,8 @@ struct DesignStep {
     // 607 is unchanged bit for bit, and the ceiling goes 687 -> 747.
     // NB_TPL_SHARE=0 gives the template stack its own scratch back.
     if (envOnDef("NB_TPL_SHARE", true)) {
-      tpl.adoptScratch(extra.b);
+      if (plan.monomer) tplp.adoptScratch(extra.b);
+      else              tpl.adoptScratch(extra.b);
       dstook("tplembed share");
     }
     t1d.alloc(N, s);  dstook("tpl1d");
@@ -723,7 +733,7 @@ struct DesignStep {
 
   void setStream(cudaStream_t s) {
     st = s;
-    emb.setStream(s); tpl.setStream(s);
+    emb.setStream(s); tpl.setStream(s); tplp.setStream(s);
     extra.setStream(s); trunk.setStream(s);
     sm.setStream(s); hd.setStream(s);
     t1d.setStream(s); rec.setStream(s);
@@ -744,10 +754,12 @@ struct DesignStep {
     weightPackCollector() = &packs_;
     emb.setWeights(emb_w);
     // the two template_*_1d Linears live under the embedder's scope
+    t1d.monomer = plan.monomer;
     t1d.setWeights(emb_w);
     rec.setWeights(emb_w);     // prev_* also live under the embedder's scope
     t1d_tab = t1;
-    tpl.setWeights(tpl_w);
+    if (plan.monomer) tplp.setWeights(tpl_w);
+    else              tpl.setWeights(tpl_w);
     extra.setWeights(extra_w);
     trunk.setWeights(trunk_w);
     sm.setWeights(post_w);
@@ -809,7 +821,8 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   if (plan.dropout) {
     trunk.b.drop_seed = const_cast<uint32_t*>(in.seed);
     extra.b.drop_seed = const_cast<uint32_t*>(in.seed);
-    tpl.setDropout(true, in.seed);
+    if (plan.monomer) tplp.setDropout(true, in.seed);
+    else              tpl.setDropout(true, in.seed);
     sm.setDropout(true, in.seed);
   }
 
@@ -886,7 +899,17 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   // passes both scribbles and breaks the moment the bytes are shared.
   if (envOn("NB_TPL_DIRTY"))
     nbrealloc::scribble(tpl_ledger_first, tpl_ledger_last, st);
-  tpl.forward(emb.pair, in.act_const, pair_mask, tpl_out, /*save*/nullptr);
+  if (plan.monomer)
+    // NOTHING FROM `emb.pair` AND NOTHING FROM `act_const`.  Under ptm the
+    // template contribution is a function of the TEMPLATE alone -- see the
+    // note at the top of tplembed_ptm.cuh -- so this does not read the query
+    // and there is no hoisted constant to be handed either.  It is
+    // recomputed every step rather than cached per state: a step runs
+    // several states at several lengths and a cache keyed on the wrong thing
+    // is worse than 1 ms.
+    tplp.forward(t_pos, t_mask, t_aatype, in.asym_id, pair_mask, tpl_out, N);
+  else
+    tpl.forward(emb.pair, in.act_const, pair_mask, tpl_out, /*save*/nullptr);
   // NB_TPL_SCRIBBLE: destroy the template stack's scratch the instant its
   // forward returns.  tpl.backward REPLAYS from its query (see the note
   // above), so nothing downstream should be able to tell -- and if the
@@ -1133,6 +1156,10 @@ inline void DesignStep::backward(const Inputs& in, const Cotangents& ct,
   // so must also tolerate dirty scratch on entry
   if (envOn("NB_TPL_DIRTY"))
     nbrealloc::scribble(tpl_ledger_first, tpl_ledger_last, st);
+  // NO TEMPLATE BACKWARD UNDER ptm: its contribution does not depend on the
+  // query or on anything the losses differentiate, so d_pair passes straight
+  // through to the embedder.
+  if (!plan.monomer)
   tpl.backward(d_pair, emb.pair, in.act_const, pair_mask,
                tpl_save, d_tpl_query);
   foldit::accK<<<(int)((nn_cz + 255) / 256), 256, 0, st>>>(
