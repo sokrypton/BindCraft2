@@ -837,6 +837,348 @@ section: the atomics win, and dS is not materialised at all.
    to be lucky at once.  It reproduced to three digits across runs, so it did
    not look like noise.  All numbers above are from an uncontended card.
 
+## The campaign tables: a schema, not a summary
+
+`campaign_output.py` is 607 lines and almost none of it is arithmetic. It
+is a FILE FORMAT -- three stage tables, a column order, a rounding rule, a
+summary, a metadata record -- and every tool downstream of a campaign
+reads a campaign by reading those files. `bindcraft rank` reranks a
+finished campaign on whichever check matters; `bindcraft filter`
+reapplies thresholds to see what a different filter would have kept;
+`parameter_sweep` compares arms; the desperation ladder counts what the
+campaign is failing at. None of them loads a model. All of them take a
+folder.
+
+So the port wrote a table of its own with thirteen columns, one row per
+trajectory in all three files, and a campaign it ran was a campaign
+nothing bc2 ships could read.
+
+`campaign_out.cuh` is the schema. What it writes:
+
+```
+<project>/
+  1_Trajectories/!_Trajectories.csv     one row per trajectory, finished or dropped
+  1_Trajectories/<design>/<design>_losses.csv   one row per gradient step
+  2_Refolded/!_Refolded.csv             one row per MPNN CANDIDATE
+  3_Ranked/!_Ranked.csv                 one row per ACCEPTED SEQUENCE, ranked
+  summary.csv                           mean/std/min/max per (scope, metric)
+  campaign_metadata.json                the settings, resolved
+```
+
+**The gate is bc2's own tools, run on the port's folder.** The component
+half (`campaign_output_gate.py` with no arguments) drives the port's
+`ordered_csv_columns`, its `recorded_number` and its summary arithmetic
+against bc2's own functions on column sets the gate chooses -- including
+shapes no campaign this port can run would produce. The end-to-end half
+(`--campaign <folder>`) takes a folder the C++ driver actually wrote and
+calls `rerank_campaign`, `refilter_campaign` and `summarize_campaign` on
+it. They are not two strengths of the same check, and the second one
+found three things the first could not:
+
+| what | how it showed |
+|---|---|
+| the metadata record carried `targets` as a STRING | `rank.py` iterates it, so `'h'.get(...)` -> AttributeError and `bindcraft rank` died on the port's own folder |
+| the metadata record carried the RAW `filters` block | bc2's `FINAL_CONFIDENCE_FILTERS` maps four flat settings onto it before anything reads it; `bindcraft filter` reapplying "the campaign's own filters" threw out both designs the campaign had accepted, on `i_pTM >= 0.7` for a campaign that asked for 0.0 |
+| `i_pDAE` of -1 for a design with no interface | bc2 returns None there, and -1 is a number that RANKS: below every real reading and above the `-inf` an empty cell gets |
+
+Two smaller ones came out of the component half. `strtod` stops at the
+first character it cannot use and reports success, so the design identity
+`74611a93a194c3ec` parsed as 74611 and the campaign summary carried a row
+averaging the hash column -- `float(part)` requires the WHOLE string.
+And `statistics.fmean` is `math.fsum(data) / n`, which is exact: a naive
+accumulation differs in the last ulp, invisible until a value lands on a
+rounding boundary, which for a summary rounded to two places is the only
+kind of disagreement it can have.
+
+**The loss column names are load-bearing.** `parameter_sweep.py`'s
+autotune reads a trajectory's losses.csv with
+`column.partition('.')[2].partition('.')[0]` and keeps the columns that
+are in `build_losses(settings)`. A column called `complex.i_con` is a
+column autotune cannot see, so the stage-length review runs, finds no
+loss, and silently changes nothing -- and the file parses either way.
+The columns are bc2's loss names, carrying the WEIGHTED value, because
+af2.py records `metrics[name] = weighted_losses[name]`.
+
+**The one divergence, stated up front.** `design_hash` hashes the
+settings, the values DRAWN for the trajectory and a fingerprint of the
+target conformation. The port's draws are not bc2's draws, so the hash
+cannot be bc2's hash whatever basis it uses. It is an identity WITHIN a
+folder and is not comparable across the two implementations.
+
+## A mask built once, and a length drawn per trajectory
+
+`binder_lengths` is a RANGE in most shipped presets, and the driver draws
+a new length for every trajectory and rebuilds the states for it
+(`buildComplex`, `buildBinderAlone`, `dev.upload`). It did not rebuild
+the MASKS -- `bchain`, `bchain1`, `tchain`, the framework/paratope/target
+sets, the coldspot and rigidity pair masks, interface_pae's weights, the
+per-protomer `cb_*` sets, compactness's globular radius and protomer
+count, distogram_cce's binned target distances. All of them are derived
+from `cx` and `binder_len`, and all of them were built once, from the
+campaign's FIRST length.
+
+Measured on a `[56, 80]` campaign whose only trajectory drew 66:
+
+| loss | bc2 | the port | rel |
+|---|---|---|---|
+| `interface_contacts` | 4.0026 | 4.9822 | 2.45e-01 |
+| `binder_helicity` | 1.7409 | 1.8703 | 7.43e-02 |
+| `binder_pae` | 0.5450 | 0.5287 | 3.00e-02 |
+| `binder_contacts` | 3.9076 | 3.8414 | 1.69e-02 |
+| `interface_pae` | 0.7081 | 0.6992 | 1.26e-02 |
+| `compactness` | 1.0185 | 1.0255 | 6.91e-03 |
+
+and the filters too, because `bchain` feeds `interface_contacts` and
+`Interface_Residues` alike. After the rebuild: all 8 losses, all 18
+filters and the gradients agree.
+
+**Every campaign in `run_gates.sh` named ONE length**, which makes a row
+set built once agree with the states rebuilt inside the loop whether it
+is rebuilt or not. The same sentence as the Fab, as `copies`, and as the
+four row-sets a de novo binder makes identical: a convention that
+coincides when there is one of a thing is not checked when there is one
+of it.
+
+**And the first attempt to measure it read MATCH on everything**, because
+`BC2_DUMP_FINAL` is overwritten per trajectory: a two-trajectory run was
+gated on whichever length happened to come last, and the last one was the
+campaign's first length. The gate runs ONE trajectory.
+
+## What ProteinMPNN is not allowed to change
+
+`mark_redesign_residues` is four lines of set algebra:
+
+```
+held  = mobile_residues                      induced_fit_mobile_residues
+held |= binder x target contacts (4 A)       if keep_interface OR mobile
+held |= the TEMPLATE rows                    if binder_scaffold
+held |= the linker                           if multidomain and mpnn_fix_linker
+```
+
+and `keep_interface = not settings['redesign_interface']`, where
+`redesign_interface` **defaults to false**. So bc2 holds the paratope
+through ProteinMPNN on every default campaign, and the port held only its
+non-designed rows -- it redesigned the part of the binder that makes it a
+binder, and then scored the result as though it were bc2's candidate.
+
+`redesign_interface` was on the IGNORED list and the entry was TRUE: the
+setting is not read. What the entry did not say is that **not reading a
+boolean takes a default**, and here the default it took was the opposite
+of bc2's. An IGNORED list answers "is this implemented"; it does not
+answer "what happens instead".
+
+The second set is the one that is easy to miss. `induced_fit_mobile_residues`
+is not an induced-fit feature: `prepare_binder_redesign` computes it
+whenever a binder_alone prediction exists, which is every campaign that
+weights a loss on the free fold -- so it is on by default too. And when
+it is non-empty the interface is held *whatever* `redesign_interface`
+says.
+
+`mpnn_hold_gate.py` compares the SET, not a count, against bc2's own
+`induced_fit_mobile_residues` and `binder_target_contact_masks` run on
+the arrays the port used (`BC2_DUMP_MPNN`). A hold set one residue
+different is a different candidate.
+
+One trap paid for in the writing: the contact mask has to use the
+PREDICTION's atom mask. `cx.atom_mask` is the state as built and has
+nothing in the binder's rows, so a contact mask computed with it finds no
+interface at all -- and an empty hold set looks exactly like the feature
+not being there.
+## relax_accepted_designs is a restrained minimiser, not a force field
+
+TODO.md said this "needs an energy minimiser" and left it for last.
+`protein.relax_protein_complex` is about seventy lines: Adam over the
+RESOLVED atoms with three quadratic terms, all O(N^2), all
+differentiable by hand. No OpenMM, no AMBER, no hydrogens.
+
+```
+clash      0.5 * w_clash * sum_ij C_ij * relu(closest_ij - d_ij)^2
+bond       w_bond * sum_b (d_b - d_b0)^2
+restraint  sum_i pw_i * |x_i - x0_i|^2
+```
+
+**The bond lengths are the input's own.** `bond_lengths` is read off the
+structure being relaxed, so the bond term holds the geometry the model
+predicted while the clash term pushes overlapping atoms apart. A
+relaxation that pulled towards ideal bond lengths would be a different
+operation with the same name, and would agree with this one on the clash
+term while quietly rebuilding the backbone -- which is why the gate
+checks the backbone moves less than an angstrom as well as checking the
+coordinates.
+
+**The gate's tolerance is measured, not chosen.** `relax_geometry` casts
+`input_atoms` to float32, so the whole optimisation is float32 whatever
+`jax_enable_x64` says -- running bc2's own relaxation under x64 moves
+*nothing*, which is the control for that. And the restrained basin is
+flat in the sidechain directions (restraint 0.5 against backbone 10.0),
+so a tiny input difference is amplified: nudging bc2's own input by
+1e-5 A moves its own output by up to **1.5e-02 A**. A fixed tolerance
+here would be measuring the arithmetic. The port sits at **2.03x** that
+floor with a median difference of 1.5e-05; a wrong `closest_approach`
+reads 173x and a wrong bond target 189x.
+
+**And an accepted design has no clashes to relieve**, because the
+campaign rejected every design that did -- so a relaxation of one
+relieves nothing and agrees with a reference that also relieves nothing.
+The gate pushes the binder chain into the target until its backbone
+overlaps, the same way `geom_probe` builds geometry for the terminus
+relus, and then both sides take 2 clashes to 0.
+
+## autotune: the campaign tunes its own stage lengths
+
+`autotune` is **true in settings/core/default.json** and sat on the
+port's unimplemented list, because `autotune_review` reads the
+campaign's own tables -- `terminated` from the trajectory table and the
+loss curve from each trajectory's losses.csv -- and the port had neither
+until the schema landed. It is a feature the output format made
+reachable.
+
+Every ten trajectories it splits each tuned stage's rows into thirds by
+step, takes the mean weighted loss in each, and moves the stage length
+by +-25%:
+
+```
+closing >= opening            the stage made the loss WORSE: leave it
+rejecting, or still falling   +25%   (final third holds > 50% of the fall)
+flattened                     -25%   (final third holds < 10% of it)
+```
+
+held within [0.5x, 2x] of what the campaign configured, so a review can
+never run away from the setting it is tuning.
+
+**It changes nothing on a de novo campaign.** The loop skips an axis the
+campaign has not SET, and default.json sets neither `screen_steps` nor
+`refine_steps` -- four shipped modalities do (peptide, cyclic_peptide,
+large_binder, multidomain), and those are the campaigns where this is
+live. Worth saying because "autotune: true" in the defaults reads like
+it is always on.
+
+`autotune_gate.py` runs eleven trajectories of a campaign that sets both
+axes -- one past the review threshold -- and asks bc2's OWN
+`autotune_review` what it would have decided from the same tables. Both
+decide `screen_steps 6 -> 8` with a block loss of 1.10475, for the same
+reason. Lowering the port's "still descending" cut to 0.9 makes it
+decide nothing where bc2 still decides 8, which is the gate's failure
+direction.
+
+**The weight half is refused, not half-implemented.**
+`autotune_loss_weights` alternates a modality's loss weights between
+review blocks and reverts them when the block got worse. The weights
+here are resolved once and captured by every loss lambda, so honouring
+it would mean rebuilding the objective per trajectory -- and a campaign
+that asked for it and got a constant objective would look exactly like
+one that asked for nothing. The driver says so at startup.
+
+## The features nothing was auditing, and the cheapest of them
+
+The settings guard classifies SETTINGS and the derived-filter guard
+classifies FILTERS. Neither classifies FEATURES -- and a feature is what
+a user asks for. An unimplemented one shows up as one ignored setting in
+a list of twenty, and the run then produces a design for a campaign that
+asked for something else.
+
+`feature_audit.py` drives the driver with a campaign that REQUESTS each
+of bc2's 26 `CAMPAIGN_FEATURES` in turn and records which of four things
+happens: REFUSED, IGNORED, WARNED-and-ran, or HONOURED. It found five
+gaps, none of which were in the work queue:
+
+| feature | what the port did | now |
+|---|---|---|
+| `cyclize_peptide` | IGNORED -- designed a LINEAR peptide | implemented |
+| `trajectory_only` | IGNORED -- accepted designs for a campaign that asked for none | implemented |
+| multitarget | WARNED and designed against the first of the targets | REFUSED |
+| `binder_shapes` | IGNORED | REFUSED |
+| `idr_crop_count` | IGNORED | REFUSED |
+| `initial_guess` | HONOURED by the guard and read by nothing | named by the audit |
+
+**22 honoured, 4 refused, 0 ignored.** The three refusals are the port's
+own rule applied where nothing had been looking: a campaign this port
+cannot run is refused before it spends anything. A binder designed
+against the first of two targets is not a worse answer to the campaign's
+question -- it is an answer to a different question, with the campaign's
+name on it.
+
+The last one is a hole in the guard rather than only a gap in the port: a
+key that names a shipped PROPERTY preset is skipped as "honoured by
+composition", which is right for `forced_targeting` (whose layer is a
+loss weight and a filter) and wrong for `initial_guess` (whose layer is
+the switch itself).
+
+**And `cyclize_peptide` turned out to be a flag.** `inputfeat::offsetK`
+was already bc2's `cyclic_sequence_offsets`, wrapping the relative
+position the short way round when both ends carry `F_CYCLIC` -- written
+for this feature, and nothing in the driver ever set the flag. So the
+work was: OR it onto the binder chains, give the host side the same wrap
+(`dsin::sequenceOffset`, for `binder_helicity`'s i,i+3 band and the
+separation masks -- on a 14-mer ring the ends are neighbours and a helix
+through the junction is a helix), and add `Cyclic_Closure_Distance`.
+
+Both gates read the FLAGS out of the dump, so bc2 wraps on its side too:
+a port that set the flag and did not wrap, or wrapped and did not set it,
+disagrees on `binder_helicity` and on the closure. All 19 filters and all
+8 losses agree on a cyclic campaign, the closure at 1.5e-09.
+
+`cyclic_offset_mode` has three values and this implements `direction`,
+the default and the only one any shipped preset uses. The other two are
+refused: both are a one-line change in two places, and a campaign that
+asked for one and got `direction` would be a different relative encoding
+wearing the right name.
+
+## An exact sum is not enough; it has to be the same exact sum
+
+`statistics.fmean` is `math.fsum(data) / n`, and the port's summary rows
+go through it. `math.fsum` does not simply add carefully: it keeps a list
+of non-overlapping partials, adds them **from the top**, stops at the
+first one that makes the running sum inexact, and then applies a
+half-even fix-up when the next partial shares the residue's sign --
+fsum's own comment is that this is "needed so that `sum([1e-16, 1,
+1e16])` will round up the last digit to two instead of down to zero".
+
+Summing the same partials in reverse is also exact, and gives a different
+last ulp. On six two-decimal readings out of a real campaign the mean
+came out `0.49499999999999994` against Python's `0.49500000000000005`,
+and `recorded_number` turned that into `0.49` against `0.5`. One cell of
+a 123-row summary.
+
+The check that sees it compares against `math.fsum` **bit for bit**, on
+values two decimals wide (what a recorded table holds), values spanning
+twenty orders of magnitude, and the cancelling sequences fsum's docstring
+is about. "Agrees to 1e-12" would have passed the broken version.
+
+## "Inert" is a statement about the verdict, not about the record
+
+`load_settings` calls `add_design_property_records` for every campaign,
+which installs a dozen checks with a **non-rejecting** threshold -- inf,
+or 0.0 on a minimum. A port that does not compute them accepts exactly
+the same designs, and the startup guard said so: it classifies a missing
+metric as *rejecting* or *inert* by comparing the resolved threshold with
+the `ModalityCheck` default, and these are inert.
+
+That was true for as long as the output was a pile of PDBs and some
+stdout. Writing bc2's tables turned every one of them into a COLUMN --
+one `bindcraft rank` offers, `bindcraft filter` reapplies and
+`summarize_campaign` summarises. On the default campaign bc2 installs 31
+metrics and the port reported 20.
+
+| added | |
+|---|---|
+| `All_Atom_Clashes` | the clash count over 37 atoms rather than CA alone -- and the other half of `Relaxed_All_Atom_Clashes`, which turns out to be the number that shows the relaxer working: 24 all-atom clashes to 0 where the backbone count was 0 to 0 |
+| `SS_pLDDT`, `Binder_Loop_Fraction`, `Interface_{Helix,BetaSheet,Loop}_Fraction` | P-SEA again, over the structured residues and over the interface ones |
+| `Binder_Mass_kDa`, `Binder_pI`, `Binder_Net_Charge`, `Binder_Cysteines`, `Binder_Extinction`, `Binder_Free_Cysteines` | sequence readings; the pI is fifty fixed bisections of [0, 14], not a convergence test, because that is what bc2 runs |
+| `Interface_BuriedArea` and its fraction, `Surface_Hydrophobicity` | a SECOND solvent-accessible-area pass, over the binder chains ALONE. The area the port already had is the COMPLEX's; the difference between them is what the interface buries, and computing one and using it for both makes the metric identically zero |
+| `Interface_Hydrophobicity`, `Receptor_Chains_Contacted`, `Target_RMSD` | |
+
+`filter_gate` now agrees with bc2 on 38 of them. The twelfth,
+`Receptor_Chains_Contacted`, is None on a single-chain target on both
+sides, and the gate says that rather than skipping it.
+
+**And the gate's own blind spot was `if name in cpp`.** It compared every
+metric the PORT reported, so a metric the port did not report was
+skipped -- which is how eleven of them stayed missing through months of
+"all 18 agree with bc2". For the metrics bc2 installs on every campaign
+it now computes bc2's value anyway and FAILS when there is one.
+
+
 ## Files
 
 * `oracle.py` -- builds one block (or any sub-module list) from the real binder
@@ -1982,6 +2324,59 @@ reads the regime off the WEIGHTS -- `preprocess_1d`'s row count, 22 against
 an attribute: a new attribute would have to be threaded through every caller
 in two repositories and could then disagree with the directory it was passed
 beside.
+
+
+### A multi-chain binder is not an oligomer, and six conventions say so
+
+A Fab or an scFv is ONE binder spanning two scaffold chains with a SEQUENCE
+EACH; `copies` is N chains sharing one. bc2 RAISES on the pairing
+(`resolve_binder_chains`), so the two never co-occur and
+`max(copies, scaffold chains)` is the chain count -- but BOTH name their
+chains `binder_0, binder_1, ...`, so **the chain count does not say which
+layout you are in**. Only the setting does, which is why `copies` now
+travels in the dump: `loss_campaign_gate` counted distinct asym ids among
+the binder rows, read a Fab as two copies, and applied `configure_oligomer`
+-- `per_protomer=True` on three losses bc2 leaves merged.
+
+Everything that reads "the binder chain" then splits again. Every one of
+these was wrong, and every de novo and oligomer gate was green:
+
+```
+  the per-trajectory rebuild   scaf_chains defaulted to 1, so the target's
+                               asym collapsed onto the second binder chain
+  Backbone_Clashes             every chain pair; L-H counts        2 vs 39
+  Scaffold_Framework_RMSD      one Kabsch PER CHAIN, pooled    16.79 vs 1.19
+  Binder_Chain_Breaks          per chain; the L-H junction is not a bond
+  Induced_Fit_TM               binder_0 alone                 0.178 vs 0.119
+  Interdomain_*, Domain_Sep    binder_0 alone -- 55 rows, so bc2 returns
+                               None and the port reported two filters bc2
+                               does not run
+  interface_pae (loss)         binder_0 x target            0.748 vs 0.763
+```
+
+The rule that makes them derivable: **anything taking a chain NAME gets
+`binder_0`; anything calling `binder_copy_chains` fans out.** Key the masks
+on the ASYM ID, never on `i < binder_len` -- those agree only while the
+binder is one chain repeated.
+
+**And one that was not multi-chain at all.** The per-trajectory rebuild
+called `buildBinderAlone` WITHOUT the scaffold, so from the first trajectory
+on, a VHH's free fold was an all-designed chain while the complex held the
+framework -- two states disagreeing about what the binder is, which is the
+thing `buildBinderAlone`'s own comment warns about. Nothing caught it
+because no gate compares the binder_alone STATE: the dump carries its atoms
+and not its flags. It surfaced only because a second call site had to change
+for the chain layout.
+
+`state_gate.py` now builds Fab.cif, scFv.cif and VHH.cif through bc2's own
+`Protein.with_scaffold` and compares residue_index, asym, entity,
+interface_asym, seq_mask and the DESIGN flags -- it caught the target's
+entity id (2 behind two binder entities, not 1) -- and `multi-chain
+filters` / `multi-chain losses` run the whole campaign on a two-chain
+scaffold. That scaffold is a SMALL one (`make_test_scaffold.py`, 55 residues
+a chain) because bc2's own Fab is 434 and this port's two states do not fit
+beside a 115-residue target on a 24 GB card: a 440-residue DE NOVO binder
+fails identically, so it is the existing length ceiling and not the layout.
 
 ## Pass four, fifth round: occupancy asked for directly
 
