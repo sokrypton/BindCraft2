@@ -474,4 +474,60 @@ __global__ void accDgramK(float* __restrict__ dst, const float* __restrict__ src
   if (i < n) dst[i] += src[i];
 }
 
+// ===================== distogram_cce ====================================
+//
+// The cross-entropy of the predicted distogram against the TEMPLATE's own
+// distances, binned.  bc2:
+//
+//   reference_bins = (pdist(pseudo_beta) > bin_edges[1:]).sum(-1)
+//   ce_ij          = -(one_hot(bin_ij) * log_softmax(distogram_ij)).sum(-1)
+//   loss           = masked_mean(ce, ref_mask[:,None] * ref_mask[None,:])
+//
+// The bins come from the template and take no gradient; only log_softmax
+// does, and its derivative is the familiar softmax - one_hot.
+//
+// `bins` is per PAIR and is -1 where the pair is masked out, which is both
+// the mask and a guard: a bin index read from an unmasked-out pair would
+// index the distogram with whatever the template left there.
+__global__ void distogramCceK(const float* __restrict__ dg,
+                              const short* __restrict__ bins,
+                              size_t npair, int nbins,
+                              float* __restrict__ ce) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= npair) return;
+  const int b = bins[i];
+  if (b < 0) { ce[i] = 0.f; return; }
+  const float* row = dg + i * (size_t)nbins;
+  float m = row[0];
+  for (int k = 1; k < nbins; ++k) m = fmaxf(m, row[k]);
+  float sum = 0.f;
+  for (int k = 0; k < nbins; ++k) sum += __expf(row[k] - m);
+  // log_softmax(x)_b = x_b - m - log(sum exp(x - m))
+  ce[i] = -(row[b] - m - __logf(sum));
+}
+
+// d(ce_i)/d(dg_ik) = softmax_ik - [k == b_i], scaled by the incoming dce_i.
+__global__ void distogramCceBwdK(const float* __restrict__ dg,
+                                 const short* __restrict__ bins,
+                                 const float* __restrict__ dce,
+                                 size_t npair, int nbins,
+                                 float* __restrict__ ddg) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= npair) return;
+  float* out = ddg + i * (size_t)nbins;
+  const int b = bins[i];
+  if (b < 0 || dce[i] == 0.f) {
+    for (int k = 0; k < nbins; ++k) out[k] = 0.f;
+    return;
+  }
+  const float* row = dg + i * (size_t)nbins;
+  float m = row[0];
+  for (int k = 1; k < nbins; ++k) m = fmaxf(m, row[k]);
+  float sum = 0.f;
+  for (int k = 0; k < nbins; ++k) sum += __expf(row[k] - m);
+  const float g = dce[i];
+  for (int k = 0; k < nbins; ++k)
+    out[k] = g * (__expf(row[k] - m) / sum - (k == b ? 1.f : 0.f));
+}
+
 }  // namespace prodloss
