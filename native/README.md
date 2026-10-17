@@ -1179,6 +1179,264 @@ skipped -- which is how eleven of them stayed missing through months of
 it now computes bc2's value anyway and FAILS when there is one.
 
 
+## Two targets: the round goes to ONE of them
+
+A campaign that names two positive `targets` is asking for a binder that
+holds BOTH, and bc2 does not answer it by scoring both every round. It
+ROTATES. `target_schedule.py`'s `MultitargetSchedule` hands each round to
+one prepared state, `losses_for_active_states` drops every loss whose
+states are not in it, and the sequence update happens on that round's
+gradient alone -- except at **anneal**, where `merged_gradient_targets`
+turns the rotation into a sweep: every state contributes a gradient and
+ONE update follows them all.
+
+The port used to run the complex AND every off-target every step and sum
+the gradients. That is a different optimiser on the same losses, and no
+value gate can see it: `off-target repulsion` compares the TERM, and the
+term was right. What it hid was worse -- the off-target's gradient was
+accumulated into `grad` inside `runLosses` and the caller then
+**overwrote** `grad` with a memcpy of `dev.d_sequence`, so the repulsion
+steered the reported loss and never the search. It has its own
+accumulator now.
+
+Two transitions, and which one is in force is `_select_target_transition`:
+
+* **fixed cadence** -- merged gradients, or an epitope rotation: swap
+  after `rounds_before_target_swap()` rounds whatever the prediction says.
+* **objective gated** -- the default. A positive target is left when its
+  i_pTM clears `multitarget_swap_threshold` or patience runs out; an
+  off-target when the binder has actually come off it, which is **two**
+  criteria and not one. bc2's own note: a short binder holds a whole
+  epitope at a confidence no threshold rejects, so the repulsion would
+  keep the round forever. `detarget_avoided` asks for quiet at the
+  interface AND no contact left.
+
+**The round after a swap is not judged.** `predictions` holds only the
+state that was just predicted, so the entry that has just become active
+is not in it and the transition test does not run -- every target gets
+one free round on arrival. Reproduced by `Observed::have`.
+
+Three things follow from the rotation that are easy to miss:
+
+* **The stage check cannot read the last round.** `judge_stage` filters
+  the per-state PEAK of the stage (`stage_filter_predictions` with
+  `cumulative`), so every state answers for the stage rather than
+  whichever one ran last. The schedule keeps the peaks.
+* **The budget doubles.** `rounds_per_binding_target` gives a campaign
+  with two positive targets twice the DEFAULT rounds in every stage --
+  the default only; a campaign that writes `anneal_steps` gets what it
+  asked for.
+* **Every state is judged at the end.** `design_stage_filters`
+  instantiates each campaign filter once per state as `<filter>.<state>`
+  and `evaluate_design_filters` fails the design if any copy fails. The
+  port folds each target in turn on the final sequence and runs the whole
+  battery on each -- with the PRIMARY last, because the buffers it leaves
+  are what the MPNN decode, the structure writer and the dump read next.
+
+And the tables do not widen. `target_ordered_row` COLLAPSES
+`<metric>.<state>` into one `<metric>` cell holding the readings joined
+by `;` in weight-descending order, with `targets` and `target_weights`
+beside them; `rank.py` derives `_mean`, `_worst`, `_best`, `_spread` and
+`_selectivity` from that single cell. A port that wrote two columns would
+be unreadable to every tool bc2 ships.
+
+Gated twice: `target_schedule_gate.py` drives the port's schedule and
+bc2's own class through the same scripted rounds and compares the state
+chosen for every one of them (11 cases, plus a negative control that
+moves one knob and must disagree), and `multitarget_gate.py` runs a
+two-target campaign end to end -- both states get rounds, both are
+judged, bc2's `per_target_readings` and `on_target_mean` read the cells
+back, and a threshold no design can meet has to be named once per state
+and reject every candidate.
+
+
+## And the protomers of an oligomer
+
+`oligomer_tie` is `symmetric` by default and bc2 then hands ProteinMPNN
+the binder's chains as `multi_chain_binders`: one tied group per
+position, the protomers' logits averaged, one draw.  The port decoded
+the FIRST protomer and replicated its letters -- the same sequence in
+the end, and a different draw, because the other protomers' logits never
+entered it.  It ties them now, and a campaign asking for `oligomer_tie:
+none` (independent protomers, which this port cannot express: it carries
+one logits array and scatters it) is refused rather than silently tied.
+
+
+## A target with no structure, and the crop it is cut to
+
+bc2's disordered-target modality points `target_path` at a FASTA.
+`Protein.from_fasta` builds the chain with the SEQUENCE flag and nothing
+else -- no coordinates, no atom mask, no TEMPLATE -- so the model folds
+the target rather than being handed it, which is the point for an IDR.
+And it is CROPPED: `crop_fasta_sequence` defaults to (10, 40), every
+window of those lengths is a candidate, and the trajectory draws one it
+has not sampled.
+
+**The port read it with `readPdb`, which keeps ATOM records.** A fasta
+has none, so the target read ZERO residues and the campaign built a
+complex of the binder alone, designed against nothing, and wrote it to
+the table as a binder to dynorphin A. `feature_audit` called the feature
+HONOURED, because the run reached the weights check and an audit that
+classifies the START of a run cannot see what the run then designs.
+That is the sharpest version of the lesson this whole file is about: an
+unimplemented feature is not the dangerous case; a feature that RUNS and
+answers a different question is.
+
+Three pieces, all gated against bc2's own functions
+(`fasta_gate.py`):
+
+* **the read** -- the same sequence, with no resolved atom, and the
+  target rows marked SEQUENCE and not TEMPLATE (a post-pass, because
+  `buildComplex` marks every target row from a structure).
+* **the crop** -- the same candidate windows and the same draw, which is
+  `random.Random(seed).choice(windows)` and therefore CPython's
+  `_randbelow` on the list.
+* **`idr_crop_count`** -- N crops become N PREPARED STATES named
+  `<target>_epitope_1..N`, which the multitarget rotation then runs with
+  a FIXED CADENCE (`epitope_rotation_interval` = the design-model count)
+  rather than the objective gate, because "it bound" says nothing about
+  which crop to move to. The N windows are distinct: the sampled set is
+  shared across the draws of one call.
+
+And one bug the crops exposed in the rotation itself: `DeviceState::
+upload` copies the ALLOCATION, not the row count, and the step reads `n`
+from the device -- so swapping to a target of a different length
+predicted the previous one's rows. hPDL1 is 115 residues and mPDL1 is
+116, so the multitarget gate had been passing with the second state
+predicted one row short, and nothing it checks could see it. The gate
+now reads the predicted lengths out of the log.
+
+
+## The campaign tunes its own weights, and the seed is a string
+
+`autotune_loss_weights` adds a second axis to the autotune review: every
+`weights_*` the campaign SET away from bc2's default is ALTERNATED by
+0.5x or 2x between review blocks, and the next block optimises that
+objective. A design accepted since the last review puts the weights
+back; a block that got WORSE than the one before undoes the draw
+(`restores`), and the record carries `alternating` to say whether there
+was one to undo.
+
+Two things make it a port rather than a formula:
+
+* **The weights have to be mutable.** They were resolved once into 36
+  `const float`s captured by every loss lambda, so the alternation would
+  have been inert. They are a registry of slots now, reset to the
+  campaign's own value and then overridden per trajectory -- which is
+  what bc2's `{**settings, **record['overrides']}` does on every call.
+  Resetting cannot undo a DERIVED default (non_contact's 1.0 when a
+  campaign names an off-target), because a weight the campaign never
+  wrote is not an axis.
+* **The multiplier is drawn from `random.Random(f"{seed}:{n}")`, and a
+  STRING seed is not an integer one.** CPython does
+  `int.from_bytes(a + sha512(a).digest())` and seeds init_by_array with
+  that integer's limbs, so `pyrandom.cuh` carries SHA-512 and the limb
+  conversion; `domains.cuh`'s MT does the rest. Checked against CPython
+  on the digest, the limbs and the first five draws.
+
+And one defect the gate found on the first run: `modality_loss_weight_axes`
+skips a weight that EQUALS bc2's default, and the port compared a
+campaign's double (-0.3) with its own float default (-0.3f widened).
+Five axes where bc2 has one, and the extra four would have been
+alternated -- a different objective every block, on a campaign that
+asked for one axis.
+
+
+## The tied decode: one letter for the same row in every state
+
+The rotation designs a binder against two targets; the MPNN stage has to
+REDESIGN it against both, and `prepare_binder_redesign` does not pick
+one. `predict_tied_candidates` puts every state into ONE ProteinMPNN
+input, translated 1000 A apart so no state sees another's backbone, and
+TIES the binder's rows across them: the group is decoded in a single
+step, its members' logits are AVERAGED, and one gumbel draw picks the
+letter for all of them. bc2's own note on why the mean and the single
+draw: *averaging a draw per state shrinks it by sqrt(N) and quietly
+lowers the sampling temperature.*
+
+Tying changes two things in the decoder and only one of them is obvious:
+
+* **the draw** -- one letter per group rather than one per position.
+* **`ar_mask`** -- every member of a group shares one decoding STEP, so a
+  member is masked against its own group-mates rather than ordered after
+  them. A port that gave each member its own step would still produce a
+  plausible sequence, which is the worst way for it to be wrong.
+
+`mpnn_tied_gate.py` gates both: the port's sampler, teacher-forced on the
+same letters and the same group order, must reproduce bc2's `score()` on
+that same `ar_mask` (3.4e-06 relative, argmax 96 of 96), every tied group
+has to come back with one letter, and -- the control -- an UNTIED run on
+the same input has to split a group, or the gate is measuring nothing.
+`multitarget_tied_redesign: false` takes bc2's other branch, where
+candidate i is decoded on state i % N, and the end-to-end gate drives
+that one too.
+
+**And the probe this gate runs had no source.** `mpnn_probe` was a binary
+in the tree built from `mpnn_probe.cpp`, which the ignore file's
+inversion drops (only `.cu/.cuh/.py/.md/.txt/.sh` are kept at the top
+level) -- so it was never tracked and the file was gone. `mpnn_gate.py`
+had been running a binary nobody could rebuild: green on whatever
+`mpnn.cuh` looked like the last time someone compiled it, and blind to
+every change since. It is `mpnn_probe.cu` now, and the gate rebuilds it
+when the header is newer, which is what every other probe here does.
+
+
+## All three exposed_loops measures
+
+`protease_stable` asks for `measure="plddt"`, which reads loopiness off
+the confidence head. The other two read the BACKBONE:
+
+* **geometry** -- a smoothed soft "is residue i within 7 A of residue
+  i+3", which is what separates a helix or a turn from an extended run,
+  and `exposed_loops_distinguish_sheets` (TRUE by default) maxes in a
+  STRAND propensity, because an extended strand fails the i,i+3 test
+  exactly as a loop does and calling a sheet a loop is the error the
+  measure exists to avoid. The strand half reads `-cos` of the CA
+  PSEUDO-DIHEDRAL.
+* **both** -- the elementwise maximum, so the gradient follows whichever
+  branch won.
+
+Two traps, both paid:
+
+* **The smoothing kernel is `ones(4)/4`, and 4 is EVEN.** numpy's
+  `'same'` is the middle m of the full convolution starting at
+  `(k-1)//2`, so for even k the window is not centred -- it reaches two
+  back and one forward. The port's `convSame` was written for odd k (the
+  plddt measure smooths with 3) and would have been quietly off by one
+  position. `y[i] = (1/k) * sum_j x[i + (k-1)/2 - j]` is the general
+  rule.
+* **The dihedral's gradient has to follow bc2's own expression.** bc2
+  projects b1 and b3 off `b2_hat` and calls `atan2`; the textbook torsion
+  formula is the same function with different eps handling, and jax
+  differentiates the expression that is written. The port reverse-modes
+  that expression by hand -- `atan2`, the two projections, the
+  normalisation -- and agrees with `jax.grad` to 2e-09 on a random coil.
+
+## statistics.pstdev is exact, and "close" is a different cell
+
+`summary_row` writes mean, std, min and max per metric and every cell
+goes through `recorded_number` -- two decimals. Two accepted designs at
+i_pDAE 0.04 and 0.01 have a population standard deviation of exactly
+0.015, and 0.015 is a TIE: the double just below it prints 0.01 and the
+double just above it prints 0.02. CPython's `statistics.pstdev` sums the
+squared deviations as RATIONALS and takes a correctly-rounded square
+root, lands exactly on 0.015, and prints 0.01. The port had the right
+FORMULA -- population, not sample -- and the float arithmetic landed on
+0.015000000000000001 and printed 0.02.
+
+`exact_stats.cuh` is CPython's algorithm with the integers it needs: every
+double is `n * 2^-e` exactly, so with `E = max(e_i)` the sums of `a_i` and
+`a_i^2` are integers, `mss = (count*B - A^2) / (count^2 * 2^2E)` is a
+rational, and `_float_sqrt_of_frac`'s round-to-odd integer square root
+makes the conversion correctly rounded. 219 vectors bit-identical,
+weighted towards the ties.
+
+Same lesson as `fsum`, one function along: **where bc2's number is a
+CPython primitive, the primitive is the specification.** And the same
+shape of miss -- it passed two full suite runs before a campaign produced
+a tie.
+
+
 ## Files
 
 * `oracle.py` -- builds one block (or any sub-module list) from the real binder
