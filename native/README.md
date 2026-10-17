@@ -1298,6 +1298,16 @@ Three pieces, all gated against bc2's own functions
   which crop to move to. The N windows are distinct: the sampled set is
   shared across the draws of one call.
 
+**And the refold sees more than the design did.**
+`validation_crop_flank` (5 by default) widens a cropped target for the
+CANDIDATE refold, so an MPNN draw is judged with the context the crop
+cut away; the trajectory's own filters stay on the crop it designed
+against.  The two tables therefore disagree about `Target_Crop_Length`
+-- 11 in the trajectory row, 13 in the candidate rows of the same
+trajectory -- and that disagreement IS the feature.  It was on the
+IGNORED list, which on a port with no fasta target meant nothing and on
+this one would have meant validating on the easier question.
+
 And one bug the crops exposed in the rotation itself: `DeviceState::
 upload` copies the ALLOCATION, not the row count, and the step reads `n`
 from the device -- so swapping to a target of a different length
