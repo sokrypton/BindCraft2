@@ -1346,6 +1346,34 @@ conformation or a group of two needs threefry (`jax.random.split`, then
 `randint` over what is left), and two BOUND groups would need two
 complex folds in a round where `cx`/`dev` is one.
 
+**And the draw, once there is more than one bound state.**  A campaign
+with two positive targets and `binder_shapes` is bc2's
+`MixedDesignSchedule`: the target rotation and the conformation draw
+take `multitarget_steps` / `induced_fit_steps` sequence updates in
+turn, so a gradient stage runs TWICE the rounds and every other round
+has its state chosen by jax.random rather than by the rotation.  That
+needed the stream itself -- `jaxrandom.cuh` is threefry-2x32 with
+JAX's own `PRNGKey`, `fold_in`, `split` and `randint` on top, and it is
+the DEFAULT implementation rather than an equivalent one:
+
+* the partitionable split, which has been JAX's default since 0.4.36
+  and feeds the cipher the counter `(0, i)` instead of a flat
+  `iota(2n)` -- the two give completely different numbers, so the gate
+  asks jax for the flag as well as for the values;
+* `randint`'s two uint32 OVERFLOWS.  The offset is built with
+  `lax.mul`/`lax.add` on uint32 and wraps; and the multiplier,
+  `(2**16 % span)**2 % span`, is itself computed in uint32 -- so for
+  any span above 65536 it is `65536 * 65536 = 2**32 = 0`, the high word
+  drops out of the draw entirely, and the answer is just
+  `lower % span`.  jax's own comment says the identity avoids overflow.
+  The code overflows anyway, and the code is what runs.
+
+A fit round must also not spend the rotation's patience --
+`MixedDesignSchedule` delegates to the ACTIVE schedule alone -- and
+that delegation is invisible in a finished trajectory, so the driver
+traces which schedule chose each round under `BC2_SCHEDULE_TRACE` and
+`mixed_schedule_gate.py` reads the counter off it.
+
 **Its two parameters reach no setting.**  `LOSS_PARAMETERS` maps
 `induced_fit_tm_target` onto `induced_fit_global`'s `tm_target` and maps
 nothing onto this loss's, so a campaign can only write `tm_target` and
