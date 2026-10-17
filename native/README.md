@@ -1464,6 +1464,43 @@ multiplier.  That is the cell that moves only if the override reached
 the objective.
 
 
+## The trajectory folder becomes a zip, and three readers follow it in
+
+`archive_trajectories` is the last setting bc2 ships that this port did
+not read, and it looked like the cheapest: zip the finished trajectory
+folder, delete it, done.  The write is indeed small -- `zipfile.cuh` is
+deflate at zlib's default level with the raw window zip wants, a local
+header, a central directory and the DOS timestamps and unix mode
+CPython writes, so `zipfile.ZipFile` opens what the port writes and
+`testzip()` checks every CRC.
+
+What made it worth a gate is the other half.  **Deleting the folder
+changes what three later readers can see**, and bc2 handles each of them
+by falling back to the archive:
+
+* `summarize_campaign`, which averages every trajectory's losses.csv
+  into the `trajectory` scope of summary.csv;
+* `recorded_trajectory_rows`, which is how autotune and the parameter
+  sweep review the block of trajectories since the last decision;
+* `trajectory_metric_rows`, the pair of the two.
+
+A port that wrote a perfect zip and read none of it back would produce a
+summary with no trajectory scope at all and an autotune review that
+measured an empty block and concluded nothing had changed -- on a
+campaign that ran exactly as asked, with no error anywhere.  So
+`archive_gate.py` archives a REAL campaign's trajectory and then
+compares the port's whole summary.csv against bc2's own
+`summarize_campaign` on the same folder, row for row; and because every
+one of those checks would also pass if some other reader were quietly
+supplying the rows, it moves the archive aside and requires the
+trajectory scope to vanish with it.
+
+Two more things the gate insists on, each invisible in the contents.
+The members must be **deflated, not stored** -- a stored archive reads
+back identically and writes several times the bytes -- and the port must
+open an archive **CPython wrote**, which is the direction a campaign
+resumed under bc2's own CLI takes.
+
 ## The campaign tunes its own weights, and the seed is a string
 
 `autotune_loss_weights` adds a second axis to the autotune review: every
