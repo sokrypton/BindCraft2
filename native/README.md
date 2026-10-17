@@ -1086,17 +1086,18 @@ gaps, none of which were in the work queue:
 |---|---|---|
 | `cyclize_peptide` | IGNORED -- designed a LINEAR peptide | implemented |
 | `trajectory_only` | IGNORED -- accepted designs for a campaign that asked for none | implemented |
-| multitarget | WARNED and designed against the first of the targets | REFUSED |
+| multitarget | WARNED and designed against the first of the targets | implemented |
 | `binder_shapes` | IGNORED | REFUSED |
-| `idr_crop_count` | IGNORED | REFUSED |
+| `idr_crop_count` | IGNORED | implemented |
 | `initial_guess` | HONOURED by the guard and read by nothing | named by the audit |
 
-**22 honoured, 4 refused, 0 ignored.** The three refusals are the port's
-own rule applied where nothing had been looking: a campaign this port
-cannot run is refused before it spends anything. A binder designed
-against the first of two targets is not a worse answer to the campaign's
-question -- it is an answer to a different question, with the campaign's
-name on it.
+**24 honoured, 2 refused, 0 ignored.** The refusals are the port's own
+rule applied where nothing had been looking: a campaign this port cannot
+run is refused before it spends anything. Both that are left are the same
+gap -- `binder_shapes`, and `fold_switching`, the loss that reads it. A
+binder designed against the first of two conformations is not a worse
+answer to the campaign's question -- it is an answer to a different
+question, with the campaign's name on it.
 
 The last one is a hole in the guard rather than only a gap in the port: a
 key that names a shipped PROPERTY preset is skipped as "honoured by
