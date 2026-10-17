@@ -1087,17 +1087,18 @@ gaps, none of which were in the work queue:
 | `cyclize_peptide` | IGNORED -- designed a LINEAR peptide | implemented |
 | `trajectory_only` | IGNORED -- accepted designs for a campaign that asked for none | implemented |
 | multitarget | WARNED and designed against the first of the targets | implemented |
-| `binder_shapes` | IGNORED | REFUSED |
+| `binder_shapes` | IGNORED | implemented (the shipped shape) |
 | `idr_crop_count` | IGNORED | implemented |
 | `initial_guess` | HONOURED by the guard and read by nothing | named by the audit |
 
-**24 honoured, 2 refused, 0 ignored.** The refusals are the port's own
-rule applied where nothing had been looking: a campaign this port cannot
-run is refused before it spends anything. Both that are left are the same
-gap -- `binder_shapes`, and `fold_switching`, the loss that reads it. A
-binder designed against the first of two conformations is not a worse
-answer to the campaign's question -- it is an answer to a different
-question, with the campaign's name on it.
+**26 honoured, 0 refused, 0 ignored.** Every one of them is implemented
+now, as a campaign writes it. What a refusal still covers is not a
+feature but a SHAPE of one: `binder_shapes` with a third conformation,
+with two states in one group, or with two bound groups -- each needs
+either jax.random's threefry stream or a second complex fold. A binder
+designed against the first of two conformations is not a worse answer to
+the campaign's question -- it is an answer to a different question, with
+the campaign's name on it.
 
 The last one is a hole in the guard rather than only a gap in the port: a
 key that names a shipped PROPERTY preset is skipped as "honoured by
@@ -1316,6 +1317,123 @@ predicted the previous one's rows. hPDL1 is 115 residues and mPDL1 is
 116, so the multitarget gate had been passing with the second state
 predicted one row short, and nothing it checks could see it. The gate
 now reads the predicted lengths out of the log.
+
+
+## Two shapes of the same binder, and the last loss
+
+`fold_switching` was the 37th of bc2's 37 registered losses and the one
+left, and the reason it was left is that it is not really a loss
+problem.  The arithmetic is `induced_fit_global_loss` -- the same
+`relu(TM - tm_target)^2` between a binder's CA in two predictions -- so
+the term itself is a third call to the comparison the other two induced
+fit hinges already make.  What it needs is the pair of STATES, and those
+come from `binder_shapes`, which drives a schedule:
+
+    InducedFitSchedule.select_protein_states
+      next_conformation = a draw over the conformations EXCLUDING the
+                          current one
+      next_state        = a draw inside that conformation
+      predict           = {current state, next state}
+
+The shipped shape is `[["<target>"], ["binder_alone"]]` -- two groups of
+one.  Both draws then have a single outcome, because the first must
+leave the conformation it is on and the second has one member, so every
+round predicts the target complex and the binder alone: the pair this
+driver already folds.  That is why the feature runs here with no
+jax.random stream reproduced anywhere.  Every shape where the draw
+actually matters is REFUSED and says which half is missing: a third
+conformation or a group of two needs threefry (`jax.random.split`, then
+`randint` over what is left), and two BOUND groups would need two
+complex folds in a round where `cx`/`dev` is one.
+
+**Its two parameters reach no setting.**  `LOSS_PARAMETERS` maps
+`induced_fit_tm_target` onto `induced_fit_global`'s `tm_target` and maps
+nothing onto this loss's, so a campaign can only write `tm_target` and
+`binder_shapes` in the `losses` block -- which is exactly what
+`examples/pdl1_fold_switching.json` does.  The driver reads them there
+and DUMPS what it resolved, because a gate that built bc2's loss from
+`default.json` would get `binder_shapes=()`, which makes bc2's own
+function return a constant 0.0 and agree with a port that never ran the
+term.  With them, and with a `tm_target` deliberately different from
+`induced_fit_global`'s, the two terms are different numbers and the gate
+can tell an alias from an implementation.
+
+**And the MPNN stage changes under it.**  `prepare_binder_redesign` sets
+`binder_alone_complex = None` when any group names `binder_alone`, so
+`induced_fit_mobile_residues` is never computed on a fold switcher --
+otherwise every residue that moves between the two states would be HELD
+through ProteinMPNN, and on a design whose whole point is to move
+between them that is most of the binder.  The interface hold still
+follows `redesign_interface`.
+
+
+## A campaign that is several campaigns: parameter_sweep
+
+`parameter_sweep` does not change a campaign's settings -- it runs
+SEVERAL campaigns and says which settings won.  A baseline arm and one
+arm per swept level, each in its own subfolder with its own tables,
+`max_trajectories` split between them, and a record at the top saying
+which arm came out ahead and whether that answer is resolved.  A port
+that ignored the setting ran every trajectory on the baseline and
+reported the result under the campaign's name, which is why this was
+refused rather than ignored until the arms existed.
+
+**The axes are derived when the campaign names none.**  In bc2's order:
+a modality switch that brings one (`forced_targeting` ->
+`forced_targeting_shell`), then every `weights_*` the campaign moved off
+bc2's own default (`modality_loss_weight_axes` -- the same function
+autotune's weight half needed), then whichever of the five default
+weight axes the campaign actually set, then the two stage lengths.
+`max_arms` truncates that list AXIS BY AXIS rather than arm by arm, so
+an axis is swept at every level or not at all.  One axis,
+`weights_binder_helicity`, is swept at ABSOLUTE values (-0.6 and 0.3)
+instead of multiplied -- a negative weight times 0.5 is still negative
+and the question about helicity is which sign wins -- and only when the
+campaign named no axes of its own.
+
+**bc2 raises on three kinds of axis and so does this.**  An axis naming
+a setting nothing reads, an axis read by the model constructor every arm
+shares (`design_recycles`, `copies`, the backends), and an axis the
+campaign wrote as an ARRAY, which is a draw per trajectory and so has no
+single value for an arm to move.  This driver adds a fourth of its own:
+an axis IT does not vary per arm.  `forced_targeting_shell` is the live
+case -- the epitope cutoff is 10.0 everywhere in filters.cuh -- and a
+sweep over it would run three identical arms under three names that say
+otherwise, which is the feature's own failure mode wearing its output
+format.
+
+**The arms interleave.**  `sweep_block_budgets` gives (10, 20, ...,
+arm_trajectories) and the loop is `for budget: for arm:`, so every arm
+reaches trajectory 10 before any reaches 20 and a campaign killed
+halfway holds a comparison rather than one finished arm and nothing
+else.  The record is rewritten after every block for the same reason.
+Inside an arm, `autotune` is OFF (bc2 passes `autotune=False`): a sweep
+moves the settings on purpose and a tuner moving them underneath would
+be measuring two changes at once.  And resuming an arm between blocks is
+not a second mechanism -- bc2's `CampaignProgress` COUNTS THE TABLES
+rather than keeping a journal, so "continue this arm" and "resume this
+campaign" are the same code, here as there.
+
+**The objective is PAIRED, and the honest column is `resolved`.**
+Trajectory 7 of one arm and trajectory 7 of another start from the same
+seed, so the arms are compared trajectory by trajectory and the variance
+between trajectories -- which is far larger than the difference a sweep
+looks for -- drops out.  An arm whose mean paired change is smaller than
+twice its own standard error, or which has fewer than ten pairs, is NOT
+RESOLVED, and the record says so rather than ranking it anyway.  Three
+scenarios in `sweep_gate.py` drive that flag both ways: a clean
+difference, a difference the size of its own noise, and four pairs with
+a large mean.
+
+**And what the arithmetic gate cannot see.**  A driver that computed the
+arms correctly, wrote the subfolders and then ran the campaign's own
+settings in all three would produce a record with a winner and nothing
+would say the arms were identical.  So `sweep_campaign_gate.py` reads a
+real three-arm run and checks that round 1 of trajectory 0 -- which
+every arm starts from the same seed and the same logits -- has the
+baseline's weighted `interface_contacts` times that arm's own
+multiplier.  That is the cell that moves only if the override reached
+the objective.
 
 
 ## The campaign tunes its own weights, and the seed is a string
