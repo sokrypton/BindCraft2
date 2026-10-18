@@ -1501,6 +1501,42 @@ back identically and writes several times the bytes -- and the port must
 open an archive **CPython wrote**, which is the direction a campaign
 resumed under bc2's own CLI takes.
 
+## Eight pairs that cannot both hold
+
+bc2's `CampaignFeature` table lets a feature declare what it CONFLICTS
+with, and `preflight.py` refuses a campaign that asks for both halves
+before anything runs.  There are eight pairs.  A scaffold is the hub of
+five of them -- a framework fixes the fold, so it cannot also be
+cyclised, switched, told to change its secondary structure, or copied
+into an oligomer -- and the rest are a sequence target with forced
+targeting or coldspots (neither of which a sequence carries), induced
+fit with an off-target (it freezes ONE bound structure), and a
+multidomain oligomer (the domain split does not engage across copies).
+
+This driver refused two of them, by hand, in its own words.  The other
+six it ran: a campaign asking for a scaffold AND a cyclic peptide
+designed something, with one half of the request quietly winning.  All
+eight are now one table in the driver, in bc2's own words, and the
+refusal collects every conflict rather than stopping at the first --
+`preflight_gate.py` asks bc2's `conflicting_campaign_features` what it
+would have said and requires exactly that, line for line, on a campaign
+holding two conflicts as well as on the eight holding one.
+
+**And the controls are the point.**  Seven campaigns ask for ONE half --
+a scaffold alone, an oligomer alone, a cyclic peptide alone -- and must
+still run.  A driver that refused every scaffold would pass a
+conflicts-only gate perfectly.
+
+The same gate covers the other refusal that was left: a campaign that
+validates on MULTIMER and leaves no multimer model held out of design.
+bc2 refuses it, because the monomer network it would otherwise fall back
+to cannot resolve a framework paratope or read an assembly as one
+molecule -- and a scaffolded binder and an oligomer ask for the multimer
+pool on their own.  The port used to print a warning and validate on
+FEWER models than the campaign asked for, which is the same campaign
+silently weakened.  Where bc2 does NOT refuse (the same squeeze on the
+monomer pool), the gate requires the port not to refuse either.
+
 ## The campaign tunes its own weights, and the seed is a string
 
 `autotune_loss_weights` adds a second axis to the autotune review: every
