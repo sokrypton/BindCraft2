@@ -1527,6 +1527,30 @@ a scaffold alone, an oligomer alone, a cyclic peptide alone -- and must
 still run.  A driver that refused every scaffold would pass a
 conflicts-only gate perfectly.
 
+**And the two notices, which took a reader fix with them.**
+`partly_trimmed_input_residues` names the residues bc2 DROPPED from an
+input: a residue that does not carry N, CA and C is not read with holes,
+it is gone, and everything numbered after it moves.  This port kept
+them -- so a target with two trimmed residues was two residues longer
+here than in bc2, with the break in the middle of the chain -- and read
+MSE as an unknown X where bc2 reads selenomethionine as MET.  Both are
+fixed in `pdb_in.cuh` (and the mmCIF reader shares it), and no shipped
+structure has either, so `pdb_gate.py` now builds one that does.
+
+That gate had stopped seeing the reader at all: `pdb_probe.cu` had been
+deleted and the gate went on running the binary built from it, so every
+later edit to `pdb_in.cuh` was invisible to the only gate that reads a
+real file.  The source is back and the gate rebuilds it when the headers
+are newer.
+
+The second notice, `undecided_avoidance`, is an off-target steered away
+from by WEIGHT with nothing deciding whether it got away.  Its subtlety
+is that the ceiling it asks about is ON by default
+(`configure_negative_selection` sets it to 3), so the notice belongs
+only to a campaign that switched it off with `null` -- and a port that
+read "absent" as "no ceiling" would print it on every negative-selection
+campaign bc2 says nothing about.  Both states are in the gate.
+
 The same gate covers the other refusal that was left: a campaign that
 validates on MULTIMER and leaves no multimer model held out of design.
 bc2 refuses it, because the monomer network it would otherwise fall back

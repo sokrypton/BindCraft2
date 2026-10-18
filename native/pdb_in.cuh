@@ -46,6 +46,11 @@ struct Residue {
 struct Structure {
   std::vector<Residue> res;
   std::vector<char> chains;    // in order of first appearance
+  // the residues `trimPartlyResolved` threw away, as bc2's
+  // `partly_trimmed_residues` names them ("THR A/20") -- the campaign
+  // prints them, because a target silently two residues shorter than the
+  // file is the kind of input difference nothing downstream can report
+  std::vector<std::string> dropped;
   int size() const { return (int)res.size(); }
 };
 
@@ -59,9 +64,49 @@ inline int atomIndex(const std::string& name) {
   for (int i = 0; i < ATOM37; ++i) if (name == ATOM_TYPES[i]) return i;
   return -1;
 }
+// bc2's MODIFIED_RESIDUE_PARENTS: selenomethionine IS methionine, and it
+// is common enough in crystal structures that reading it as "unknown"
+// turns a MET into an X in the target sequence.  Its SE is the MET SD
+// (MODIFIED_RESIDUE_ATOM_NAMES), which `modifiedAtom` renames.
 inline int aaIndex(const std::string& three) {
   for (int i = 0; i < 20; ++i) if (three == AA3[i]) return i;
+  if (three == "MSE") return 12;             // MET
   return 20;
+}
+
+inline std::string modifiedAtom(const std::string& resname,
+                                const std::string& atom) {
+  return (resname == "MSE" && atom == "SE") ? std::string("SD") : atom;
+}
+
+// `from_structure` keeps only the residues whose atoms cover the whole
+// BACKBONE (N, CA, C) and DROPS the rest -- a partly resolved residue is
+// not a residue with holes, it is gone, and every index downstream counts
+// without it.  The port used to keep them, so a target with two trimmed
+// residues was two residues longer here than in bc2, with the hole in the
+// middle of the chain.
+inline void trimPartlyResolved(Structure* s) {
+  std::vector<Residue> kept;
+  for (const Residue& r : s->res) {
+    if (r.mask[0] > 0.f && r.mask[1] > 0.f && r.mask[2] > 0.f) {
+      kept.push_back(r);
+      continue;
+    }
+    // reported only for the residues bc2 reports: the standard twenty
+    // (MSE already mapped onto MET above)
+    if (r.aatype < 20)
+      s->dropped.push_back(std::string(AA3[r.aatype]) + " " + r.chain + "/" +
+                           std::to_string(r.resseq));
+  }
+  if (kept.size() == s->res.size()) return;
+  s->res = kept;
+  // a chain whose every residue was trimmed is no longer a chain
+  std::vector<char> chains;
+  for (char c : s->chains) {
+    for (const Residue& r : s->res)
+      if (r.chain == c) { chains.push_back(c); break; }
+  }
+  s->chains = chains;
 }
 
 // ONE MODEL ONLY, and the first.  A multi-model NMR file would otherwise
@@ -78,7 +123,7 @@ inline int aaIndex(const std::string& three) {
 inline void addAtom(Structure* s, char chain, int resseq,
                     const std::string& resname, const std::string& atom,
                     double x, double y, double z) {
-  const int ai = atomIndex(atom);
+  const int ai = atomIndex(modifiedAtom(resname, atom));
   if (ai < 0) return;                       // hydrogens and the rest
   int ri = -1;
   for (int i = (int)s->res.size() - 1; i >= 0; --i)
@@ -113,7 +158,7 @@ inline Structure readPdb(const std::string& path) {
     std::string name = line.substr(12, 4);
     while (!name.empty() && name.front() == ' ') name.erase(name.begin());
     while (!name.empty() && name.back() == ' ') name.pop_back();
-    const int ai = atomIndex(name);
+    const int ai = atomIndex(modifiedAtom(line.substr(17, 3), name));
     if (ai < 0) continue;                     // hydrogens and the rest
     const char chain = line[21];
     const int resseq = std::atoi(line.substr(22, 4).c_str());
@@ -150,6 +195,7 @@ inline Structure readPdb(const std::string& path) {
     r.xyz[ai][2] = half2f(std::atof(line.substr(46, 8).c_str()));
     r.mask[ai] = 1.f;
   }
+  trimPartlyResolved(&s);
   return s;
 }
 
