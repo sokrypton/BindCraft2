@@ -1561,6 +1561,101 @@ FEWER models than the campaign asked for, which is the same campaign
 silently weakened.  Where bc2 does NOT refuse (the same squeeze on the
 monomer pool), the gate requires the port not to refuse either.
 
+## One campaign, several processes
+
+bc2 runs a campaign as N worker processes -- one per GPU, several per
+GPU when the card has room -- that share nothing but the project folder.
+Two halves make that work, and the port needed both.
+
+**The claim.**  A single process can count the tables to know where it
+is, which is what this driver did and why resume worked without a
+journal.  Two processes counting the tables is a race: both read "4
+recorded" and both design trajectory 5, and the only trace is two rows
+with the same number in a table nobody rereads.  bc2 answers it with
+`CampaignProgress`: the trajectory number, the recipe hash and the
+accepted count are all taken under an **flock on the campaign FOLDER**,
+with the state in `.campaign_state.json`.  `progress.cuh` is that, and
+three details are not transcription:
+
+* the lock is on the directory, not the file, because every write
+  replaces the file -- two writers locking "the state file" would hold
+  two different inodes;
+* the state is RECOVERED FROM THE TABLES when the file is missing
+  (`recovered_state`), so a campaign that crashed, or one written by a
+  version that kept no journal, resumes to the same numbers;
+* the bytes are Python's `json.dumps(..., sort_keys=True)`, because bc2
+  reads this file and writes it back and a campaign can change hands
+  between the two implementations mid-run.
+
+`progress_gate.py` compares the file with bc2's byte for byte in both
+directions and then **races eight processes for one twenty-trajectory
+budget**: they must claim 1..20 exactly once.  The control is the same
+build with the lock removed, which claims 36.
+
+**The plan.**  `workers.cuh` is `design_workers.py`'s arithmetic,
+constant for constant -- 38000 bytes per residue pair, 3.4 GB resident,
+a safety factor of 2, 4 GB of headroom, 8 workers a card and 7 when the
+count is `auto` -- plus the length-bucket split that stops every worker
+compiling every length, and the launch that hands each child its card,
+its id, the worker count, its memory fraction and its lengths.
+`workers_gate.py` checks each function against bc2's on INJECTED memory
+readings (a plan that depends on what else is on the card cannot be
+compared with anything) and the launch with a stub that prints its
+environment.
+
+**One divergence, and the driver says it out loud.**  bc2's `auto` packs
+seven workers onto a card because a JAX worker's allocation is capped by
+`XLA_PYTHON_CLIENT_MEM_FRACTION`, which the plan sets.  This driver
+allocates what the model needs and has no such cap, so `auto` here is
+one worker per GPU; `workers_per_gpu` packs a card when the campaign
+asks, with a warning that two steps on one card can exhaust it.  Taking
+bc2's seven would be faithful arithmetic and a dead campaign at the
+second worker.
+
+`fanout_gate.py` runs the whole thing: a real campaign with
+`workers_per_gpu: 2` on this one card, four trajectories, and the three
+things a race breaks -- every number designed exactly once, BOTH workers
+present in the table's `worker=` stamp, and the state file still
+agreeing with the tables it sits beside.
+
+## What localfold's speedups were worth here
+
+sokrypton/localfold's `opus-55-opt` branch has a long run of CUDA work on
+AF2 folding, and this port already carries its flash kernel
+(`lf_flash.cuh`).  Read against this port's profile -- `flashBwdK` 15.1%,
+the masked `flashGridHalf` 7.5%, `projGateK` 7.0% of a design step at
+L=224 -- three things looked transferable, and all three were built and
+measured on the C++ driver (one fixed PD1 campaign, 120 gradient rounds,
+two interleaved rounds of every arm):
+
+| arm | wall, round 1 | round 2 |
+|---|---|---|
+| baseline | 143.3 s | 144.0 s |
+| A: `projGateK`'s bias hoisted out of the epilogue | 144.7 | 144.9 |
+| A + the unmasked flash (`flashGrid2R`) | 143.6 | 143.6 |
+| A + B: the weight fragment prefetched a k-step ahead | 144.8 | 144.9 |
+| A + B + unmasked | 143.6 | 143.6 |
+
+* **A is about 0.9% SLOWER.**  It is localfold's `gridInK` lesson
+  (a bias read from global memory after the MMAs), and `projGateK` had the
+  same shape -- but its bias is 2.5 KB that every block reads, it lives in
+  L1, and the compiler was already issuing the loads early.  Hoisting them
+  into registers bought nothing and cost a little.
+* **B is nothing**: `ptxas -v` reports the same 96 registers and no
+  spills either way, because the fragment load was already scheduled
+  ahead.
+* **The unmasked flash is worth about 0.9%**, and it is not free: its
+  scores are f16 where this port's backward recomputes them in f32 from
+  the forward's lse, so taking it makes the forward and the backward
+  slightly different functions.  Under 1% is not worth that.
+
+None of the three is in the tree (they live in a scratch worktree).  What
+did not transfer at all, and why: the extra-stack column attention fusion
+(design runs the extra stack with ONE row), the 8-wide unpadded heads (the
+same stack), FP8 contractions (the A10 has none, and these are the paths
+the gradient runs through), and everything for the backward -- localfold is
+inference-only, and `flashBwdK` is this port's largest kernel.
+
 ## The campaign tunes its own weights, and the seed is a string
 
 `autotune_loss_weights` adds a second axis to the autotune review: every
