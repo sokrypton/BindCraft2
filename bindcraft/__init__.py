@@ -2,6 +2,7 @@ import ast
 import functools
 import importlib.util
 import os
+import warnings
 import pkgutil
 
 def append_xla_flags(flags: str) -> None:
@@ -9,6 +10,10 @@ def append_xla_flags(flags: str) -> None:
 
 os.environ.setdefault('TF_CPP_MIN_LOG_LEVEL', '3')
 os.environ.setdefault('XLA_PYTHON_CLIENT_PREALLOCATE', 'false')
+if os.environ.get('BINDCRAFT_WORKER_CPUS') and hasattr(os, 'sched_setaffinity'):
+    os.sched_setaffinity(0, {int(cpu) for cpu in os.environ['BINDCRAFT_WORKER_CPUS'].split(',') if cpu.strip()})
+if os.path.exists('/usr/lib/wsl/lib/libcuda.so.1'):
+    os.environ.setdefault('XLA_PYTHON_CLIENT_ALLOCATOR', 'cuda_async')
 OPERATOR_COMPILATION_CACHE = os.environ.get('JAX_COMPILATION_CACHE_DIR')
 # WHERE COMPILED GRAPHS LIVE.  This has to be set before jax is imported --
 # jax reads it into its config at import and a later assignment does nothing,
@@ -55,6 +60,7 @@ if os.environ.get('BC2_AUTOTUNE', '') != '1' and \
     append_xla_flags('--xla_gpu_autotune_level=0')
 if os.environ.get('BC2_XLA_EXTRA', '').strip():
     append_xla_flags(os.environ['BC2_XLA_EXTRA'].strip())
+warnings.filterwarnings('ignore', message=r"Error reading persistent compilation cache entry for 'jit_(_where|dot_product_attention)", category=UserWarning)
 
 COMMAND_ENTRY = 'main'
 DEFINITION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
