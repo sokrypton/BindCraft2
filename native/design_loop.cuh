@@ -131,6 +131,46 @@ struct DeviceState {
   }
 };
 
+// ONE ROUND'S PREDICTION, KEPT.  bc2's run_gradient_design_stage keeps the
+// round with the lowest design loss (`best_protein_states,
+// best_predictions`) and the stage ENDS THERE: its filters judge that
+// round's prediction and the next stage starts from that round's sequence.
+// The device only ever holds the latest forward, so the outputs of the best
+// round are copied aside when it is seen and copied back when the stage
+// ends -- the prediction itself, not a re-run of it, because a re-run
+// redraws the design model and the dropout.
+struct OutputSnapshot {
+  size_t n1 = 0, nn = 0;
+  float *atoms = nullptr, *plddt = nullptr, *pae = nullptr, *ptm = nullptr;
+  float *iptm = nullptr, *iptm_res = nullptr, *expres = nullptr, *dgram = nullptr;
+  bool* amask = nullptr;
+  void alloc(const DeviceState& d) {
+    n1 = (size_t)d.nmax; nn = n1 * n1;
+    auto F = [&](float** p, size_t k) { CU(::cudaMalloc(p, k * 4)); };
+    F(&atoms, n1 * 37 * 3); F(&plddt, n1); F(&pae, nn); F(&ptm, 1);
+    F(&iptm, 1); F(&iptm_res, n1); F(&expres, n1);
+    F(&dgram, nn * design_step::DBINS);
+    CU(::cudaMalloc(&amask, n1 * 37));
+  }
+  static void copy(float* dst, const float* src, size_t k) {
+    CU(cudaMemcpy(dst, src, k * 4, cudaMemcpyDeviceToDevice));
+  }
+  void save(const DeviceState& d) {
+    copy(atoms, d.o_atoms, n1 * 37 * 3); copy(plddt, d.o_plddt, n1);
+    copy(pae, d.o_pae, nn); copy(ptm, d.o_ptm, 1); copy(iptm, d.o_iptm, 1);
+    copy(iptm_res, d.o_iptm_res, n1); copy(expres, d.o_expres, n1);
+    copy(dgram, d.o_dgram, nn * design_step::DBINS);
+    CU(cudaMemcpy(amask, d.o_amask, n1 * 37, cudaMemcpyDeviceToDevice));
+  }
+  void restore(DeviceState& d) const {
+    copy(d.o_atoms, atoms, n1 * 37 * 3); copy(d.o_plddt, plddt, n1);
+    copy(d.o_pae, pae, nn); copy(d.o_ptm, ptm, 1); copy(d.o_iptm, iptm, 1);
+    copy(d.o_iptm_res, iptm_res, n1); copy(d.o_expres, expres, n1);
+    copy(d.o_dgram, dgram, nn * design_step::DBINS);
+    CU(cudaMemcpy(d.o_amask, amask, n1 * 37, cudaMemcpyDeviceToDevice));
+  }
+};
+
 // THE FOUR DESIGN SCALARS, which bc2 RAMPS across a trajectory:
 // softmax_weight, one_hot_weight, temperature, logit_scale.  They ride in a
 // buffer rather than an attribute precisely so the ramp does not recompile.
