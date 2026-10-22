@@ -187,8 +187,6 @@ struct Stack {
     //
     // useOwnOut() covers the standalone path, which has nobody to hand it a
     // buffer.
-    CU(cudaMalloc(&dpc, np * 2));
-    CU(cudaMalloc(&dmc, nm * 4));
 
     // ONLY WHAT COMFORTABLY FITS, TIER BY TIER.  Every buffer here grows as
     // N^2, so at N=384 the flash tier alone is 3.9 GB on top of a scratch that
@@ -487,6 +485,7 @@ struct Stack {
         if (keepWholeOnly(t)) { n = 0; break; }
       }
       tdepth[t] = tbase[t] ? n : 0;
+      tbytes[t] = (size_t)tdepth[t] * tstride[t];
       budget -= (size_t)tdepth[t] * tstride[t];
       took += (size_t)tdepth[t] * tstride[t];
     }
@@ -923,32 +922,26 @@ struct Stack {
     // f32.
     const __nv_bfloat16* pb = nullptr;
     for (int i = 0; i < depth; ++i) {
-      // narrow on save: this IS the approximation, and it is also what
-      // makes the forward and the replay see the same values
-      if (pb) CU(cudaMemcpyAsync(pin[i], pb, np * 2, cudaMemcpyDeviceToDevice, b.st));
-      else toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pin[i], p, np);
-      CU(cudaMemcpyAsync(min_[i], m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
-      // SAVE_BF16 is a PROBE, and it REJECTED the idea it was built to price.
-      // The remat save-set is f32 and it is the biggest allocation here --
-      // np*4*depth is 3.6 GB at N=384, the one reason that length cannot keep
-      // the flash outputs -- so storing it as bf16 would halve the memory and
-      // the replay's read traffic both. It costs too much:
-      //
-      //            fwd pair    fwd msa   grad pair   grad msa
-      //   f32      7.541e-03  4.092e-03  8.3e-02     9.99e-02
-      //   bf16     2.264e-02  1.754e-02  1.56e-01    2.96e-01
-      //
-      // 3x on the forward and 3x on the msa gradient, which takes the stack
-      // from 34x the bf16 floor (2.23e-04) to 100x. The block already rounds
-      // its input to bf16 for the modules; what this would additionally round
-      // is p0, the base of the f32 residual chain, and that error compounds
-      // over 48 blocks. Kept as a probe so the next person can re-price it
-      // rather than re-derive it.
-      // SAVE_BF16 used to round the pair save-set here as a PROBE.  It is
-      // the real storage now, so only the msa half is left to probe -- and
-      // that one is 0.02 GB and has never been worth narrowing.
-      if (save_probe)
-        roundInPlaceK<<<(nm + 255) / 256, 256, 0, b.st>>>(min_[i], nm);
+      const __nv_bfloat16* p_in = nullptr;
+      const float* m_in = nullptr;
+      if (save_full || !BLK_BF16CHAIN || save_probe) {
+        // narrow on save: this IS the approximation, and it is also what
+        // makes the forward and the replay see the same values
+        if (pb) CU(cudaMemcpyAsync(pin[i], pb, np * 2, cudaMemcpyDeviceToDevice, b.st));
+        else toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pin[i], p, np);
+        CU(cudaMemcpyAsync(min_[i], m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
+        if (save_probe)
+          roundInPlaceK<<<(nm + 255) / 256, 256, 0, b.st>>>(min_[i], nm);
+        p_in = pin[i];
+        m_in = min_[i];
+      } else {
+        if (!pb) {
+          toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(b.p6b, p, np);
+          pb = b.p6b;
+        }
+        p_in = pb;
+        m_in = m;
+      }
       use(i);
       // THE COMMENT HERE SAID keepGates=false AND THE ARGUMENT WAS haveActs.
       // Nine positional arguments reach `haveActs`, not `keepGates`, so the
@@ -961,12 +954,14 @@ struct Stack {
       //
       // `wantMask` is KEEP_RELU's pack, and it is gated twice: on the depth
       // being covered, and on this being the differentiated forward.
-      b.forward(pin[i], min_[i], pair_mask, msa_mask, /*tail*/true,
+      b.forward(p_in, m_in, pair_mask, msa_mask, /*tail*/true,
                 /*haveFlash*/false, /*haveStats*/false, /*haveBias*/false,
                 /*haveActs*/false, /*haveT*/false, /*haveMsa*/false,
                 /*haveRelu*/false,
                 /*wantMask*/have(KEEP_RELU, i) && save_full,
-                /*keepGates*/have(KEEP_ACTS, i));
+                /*keepGates*/have(KEEP_ACTS, i) && save_full,
+                /*keepFlash*/have(KEEP_FLASH, i) && save_full,
+                /*haveOpmNz*/(i > 0), /*haveMaskT*/(i > 0));
       if (BLK_BF16CHAIN) pb = b.p6b; else p = b.p6;
       m = b.m3;
     }
@@ -1002,7 +997,8 @@ struct Stack {
                 /*haveFlash*/false, /*haveStats*/false, /*haveBias*/false,
                 /*haveActs*/false, /*haveT*/false, /*haveMsa*/false,
                 /*haveRelu*/false, /*wantMask*/false,
-                /*keepGates*/have(KEEP_ACTS, j));
+                /*keepGates*/false, /*keepFlash*/false,
+                /*haveOpmNz*/(j > s), /*haveMaskT*/(j > s));
       if (BLK_BF16CHAIN)
         CU(cudaMemcpyAsync(pin[j + 1], b.p6b, np * 2,
                            cudaMemcpyDeviceToDevice, b.st));
@@ -1024,8 +1020,8 @@ struct Stack {
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
     // the caller's cotangent is f32 (it crosses the FFI that way); narrow it
     // once here, because the chain inside is bf16
-    __nv_bfloat16* dp = dpc;
-    float* dm = dmc;
+    __nv_bfloat16* dp = b.dp;
+    float* dm = b.dm;
     toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(dp, ct_pair, np);
     CU(cudaMemcpyAsync(dm, ct_msa, nm * 4, cudaMemcpyDeviceToDevice, b.st));
     // GRAD_TRACE prints ||dp|| and ||dm|| as the backward walks from block 47
@@ -1089,11 +1085,11 @@ struct Stack {
                 /*haveActs*/have(KEEP_ACTS, i),
                 /*haveT*/have(KEEP_TMUL_T, i),
                 /*haveMsa*/have(KEEP_MSA, i),
-                /*haveRelu*/have(KEEP_RELU, i), /*wantMask*/false);
+                /*haveRelu*/have(KEEP_RELU, i), /*wantMask*/false,
+                /*keepGates*/true, /*keepFlash*/true,
+                /*haveOpmNz*/(i < depth - 1), /*haveMaskT*/(i < depth - 1));
       if (ovl) b.setStream(b_st_main);
       b.backward(dp, dm, pair_mask, msa_mask, /*haveReluB*/have(KEEP_RELU, i));
-      CU(cudaMemcpyAsync(dp, b.dp, np * 2, cudaMemcpyDeviceToDevice, b.st));
-      CU(cudaMemcpyAsync(dm, b.dm, nm * 4, cudaMemcpyDeviceToDevice, b.st));
     }
   }
 };

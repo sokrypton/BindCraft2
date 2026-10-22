@@ -882,7 +882,7 @@ __device__ __forceinline__ float dropScale(const uint32_t* seedp,
 // its column for per_row.  PER_ROW here means the mask is shared ACROSS rows,
 // which is the opposite of what the name first suggests -- apply_dropout sets
 // shape[broadcast_dim] = 1, so per_row (broadcast_dim 0) shares over dim 0.
-template <bool PER_ROW>
+template <bool PER_ROW, bool TRANSPOSE_DELTA = false>
 __global__ void addDropNarrowBK(__nv_bfloat16* __restrict__ dst,
                                 const __nv_bfloat16* __restrict__ src,
                                 const __nv_bfloat16* __restrict__ delta,
@@ -890,13 +890,21 @@ __global__ void addDropNarrowBK(__nv_bfloat16* __restrict__ dst,
                                 uint32_t mod, float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  int c = (int)(i % C);
-  size_t rc = i / C;
-  int col = (int)(rc % N), row = (int)(rc / N);
-  uint32_t idx = (uint32_t)((PER_ROW ? col : row) * C + c);
+  uint32_t c, rc;
+  if ((C & (C - 1)) == 0) {
+    c = (uint32_t)i & (uint32_t)(C - 1);
+    rc = (uint32_t)(i >> (__ffs(C) - 1));
+  } else {
+    c = (uint32_t)(i % (size_t)C);
+    rc = (uint32_t)(i / (size_t)C);
+  }
+  uint32_t col = rc % (uint32_t)N;
+  uint32_t row = (PER_ROW && !TRANSPOSE_DELTA) ? 0u : (rc / (uint32_t)N);
+  uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
   float s = dropScale(seedp, depth, mod, idx, rate);
+  size_t di = TRANSPOSE_DELTA ? ((size_t)col * N + row) * C + c : i;
   dst[i] = __float2bfloat16(__bfloat162float(src[i]) +
-                            s * __bfloat162float(delta[i]));
+                            s * __bfloat162float(delta[di]));
 }
 
 // the bf16 form, which is what the block's chain actually carries: a module's
@@ -917,19 +925,27 @@ __global__ void dropFlatK(float* __restrict__ dst, const float* __restrict__ src
   dst[i] = src[i] * dropScale(seedp, depth, mod, (uint32_t)i, rate);
 }
 
-template <bool PER_ROW>
+template <bool PER_ROW, bool TRANSPOSE_OUT = false>
 __global__ void dropScaleBK(__nv_bfloat16* __restrict__ dst,
                             const __nv_bfloat16* __restrict__ src, int N, int C,
                             const uint32_t* __restrict__ seedp, uint32_t depth, uint32_t mod,
                             float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  int c = (int)(i % C);
-  size_t rc = i / C;
-  int col = (int)(rc % N), row = (int)(rc / N);
-  uint32_t idx = (uint32_t)((PER_ROW ? col : row) * C + c);
-  dst[i] = __float2bfloat16(__bfloat162float(src[i]) *
-                            dropScale(seedp, depth, mod, idx, rate));
+  uint32_t c, rc;
+  if ((C & (C - 1)) == 0) {
+    c = (uint32_t)i & (uint32_t)(C - 1);
+    rc = (uint32_t)(i >> (__ffs(C) - 1));
+  } else {
+    c = (uint32_t)(i % (size_t)C);
+    rc = (uint32_t)(i / (size_t)C);
+  }
+  uint32_t col = rc % (uint32_t)N;
+  uint32_t row = (PER_ROW && !TRANSPOSE_OUT) ? 0u : (rc / (uint32_t)N);
+  uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
+  size_t di = TRANSPOSE_OUT ? ((size_t)col * N + row) * C + c : i;
+  dst[di] = __float2bfloat16(__bfloat162float(src[i]) *
+                             dropScale(seedp, depth, mod, idx, rate));
 }
 
 // the same mask on the way back: the cotangent on the DELTA is mask * dout,
@@ -941,10 +957,17 @@ __global__ void dropScaleK(float* __restrict__ dst, const float* __restrict__ sr
                            uint32_t mod, float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  int c = (int)(i % C);
-  size_t rc = i / C;
-  int col = (int)(rc % N), row = (int)(rc / N);
-  uint32_t idx = (uint32_t)((PER_ROW ? col : row) * C + c);
+  uint32_t c, rc;
+  if ((C & (C - 1)) == 0) {
+    c = (uint32_t)i & (uint32_t)(C - 1);
+    rc = (uint32_t)(i >> (__ffs(C) - 1));
+  } else {
+    c = (uint32_t)(i % (size_t)C);
+    rc = (uint32_t)(i / (size_t)C);
+  }
+  uint32_t col = rc % (uint32_t)N;
+  uint32_t row = PER_ROW ? 0u : (rc / (uint32_t)N);
+  uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
   dst[i] = src[i] * dropScale(seedp, depth, mod, idx, rate);
 }
 
@@ -964,10 +987,17 @@ __global__ void addDropNarrowK(float* __restrict__ dst,
                                uint32_t mod, float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  int c = (int)(i % C);
-  size_t rc = i / C;
-  int col = (int)(rc % N), row = (int)(rc / N);
-  uint32_t idx = (uint32_t)((PER_ROW ? col : row) * C + c);
+  uint32_t c, rc;
+  if ((C & (C - 1)) == 0) {
+    c = (uint32_t)i & (uint32_t)(C - 1);
+    rc = (uint32_t)(i >> (__ffs(C) - 1));
+  } else {
+    c = (uint32_t)(i % (size_t)C);
+    rc = (uint32_t)(i / (size_t)C);
+  }
+  uint32_t col = rc % (uint32_t)N;
+  uint32_t row = PER_ROW ? 0u : (rc / (uint32_t)N);
+  uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
   float s = dropScale(seedp, depth, mod, idx, rate);
   float v = src[i] + s * __bfloat162float(delta[i]);
   dst[i] = v;
@@ -1183,13 +1213,22 @@ static const bool BLK_BF16CHAIN = envOnDef("NE_BF16CHAIN", true);
 // f32 store goes away and the read halves.  Callers that have no narrow of
 // their source (the msa chain, which is 0.5 MB and not worth changing) pass
 // nullptr and keep the f32 path whatever the flag says.
+template <bool TRANSPOSE_DELTA = false>
 __global__ void addNarrowBK(__nv_bfloat16* __restrict__ dstb,
                             const __nv_bfloat16* __restrict__ srcb,
-                            const __nv_bfloat16* __restrict__ delta, size_t n) {
+                            const __nv_bfloat16* __restrict__ delta, size_t n,
+                            int N = 0, int C = 0) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
+  size_t di = i;
+  if (TRANSPOSE_DELTA) {
+    int c = (int)(i % C);
+    size_t rc = i / C;
+    int col = (int)(rc % N), row = (int)(rc / N);
+    di = ((size_t)col * N + row) * C + c;
+  }
   dstb[i] = __float2bfloat16(__bfloat162float(srcb[i]) +
-                             __bfloat162float(delta[i]));
+                             __bfloat162float(delta[di]));
 }
 __global__ void addNarrowK(float* __restrict__ dst, __nv_bfloat16* __restrict__ dstb,
                            const float* __restrict__ src,
@@ -1299,6 +1338,32 @@ __global__ void addGateNarrowBK(__nv_bfloat16* __restrict__ dstb,
   dstb[i] = __float2bfloat16(__bfloat162float(srcb[i]) + prod);
 }
 
+template <bool PER_ROW>
+__global__ void addDropGateNarrowBK(__nv_bfloat16* __restrict__ dstb,
+                                    const __nv_bfloat16* __restrict__ srcb,
+                                    const __nv_bfloat16* __restrict__ o,
+                                    const gt2_t* __restrict__ t2,
+                                    int N, int C, const uint32_t* __restrict__ seedp,
+                                    uint32_t depth, uint32_t mod, float rate, size_t n) {
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  uint32_t c, rc;
+  if ((C & (C - 1)) == 0) {
+    c = (uint32_t)i & (uint32_t)(C - 1);
+    rc = (uint32_t)(i >> (__ffs(C) - 1));
+  } else {
+    c = (uint32_t)(i % (size_t)C);
+    rc = (uint32_t)(i / (size_t)C);
+  }
+  uint32_t col = rc % (uint32_t)N;
+  uint32_t row = PER_ROW ? 0u : (rc / (uint32_t)N);
+  uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
+  float s = dropScale(seedp, depth, mod, idx, rate);
+  float prod = __bfloat162float(o[i]) * gt2Load(t2[i]);
+  prod = __bfloat162float(__float2bfloat16(prod));
+  dstb[i] = __float2bfloat16(__bfloat162float(srcb[i]) + s * prod);
+}
+
 // THE NORMALISER IS PER (r, c) AND WAS COMPUTED PER ELEMENT.  `nz` depends on
 // the mask and on (r, c) alone, so the old form recomputed it for all CZ=128
 // channels of every pair element -- and identically at all 48 depths, with
@@ -1336,7 +1401,7 @@ __global__ void addOpmNarrowK(float* __restrict__ dst,
   v = __bfloat162float(__float2bfloat16(v));            // addBiasK's rounding
   v = __bfloat162float(__float2bfloat16(v / (eps + nz)));  // normDivK's
   float w = widen(src[i]) + v;
-  if (!chain_bf16) dst[i] = w;        // host-side flag, device code cannot
+  if (!chain_bf16 && dst) dst[i] = w; // host-side flag, device code cannot
                                       // read the `static const bool`
   dstb[i] = __float2bfloat16(w);
 }
@@ -1349,15 +1414,17 @@ __global__ void addOpmNarrowK(float* __restrict__ dst,
 // absmax 34.2 against pair activations of rms ~63. `k` is that constant,
 // precomputed per depth with addOpmNarrowK's own two bf16 roundings already
 // applied, so this kernel and that one agree bit for bit on a zero mask.
-template <class SRC>
+template <class SRC, int CZT = 128>
 __global__ void addConstNarrowK(float* __restrict__ dst,
                                 __nv_bfloat16* __restrict__ dstb,
                                 const SRC* __restrict__ src,
-                                const float* __restrict__ k, int CZ_, size_t n) {
+                                const float* __restrict__ k, int CZ_, size_t n,
+                                bool chain_bf16 = false) {
+  static_assert((CZT & (CZT - 1)) == 0, "CZ a power of two, for the mask");
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  float w = widen(src[i]) + k[i % CZ_];
-  dst[i] = w;
+  float w = widen(src[i]) + k[i & (CZT - 1)];
+  if (!chain_bf16 && dst) dst[i] = w;
   dstb[i] = __float2bfloat16(w);
 }
 
@@ -1377,7 +1444,7 @@ __global__ void copyNarrowK(float* __restrict__ dst, __nv_bfloat16* __restrict__
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float v = widen(src[i]);
-  dst[i] = v;
+  if (dst) dst[i] = v;
   dstb[i] = __float2bfloat16(v);
 }
 

@@ -38,6 +38,50 @@ __global__ void identityFrameK(float* __restrict__ rot, float* __restrict__ tran
   T[0] = T[1] = T[2] = 0.f;
 }
 
+// `initial_atom_pos` -> (rot0, trans0):
+//   multimer (pos_scale == 20): all_atom_multimer.make_transform_from_reference(
+//       a_xyz=N, b_xyz=CA, c_xyz=C).scale_translation(1 / position_scale)
+//   monomer  (pos_scale == 10): quat_affine.QuatAffine(rot_to_quat(
+//       make_transform_from_reference(N, CA, C)[0]), CA).scale_translation(...)
+// The two produce the same Gram-Schmidt rotation matrix on any non-zero
+// N/CA/C triple; on an all-zero row (a de novo binder residue on pass 0, or a
+// padded row past *np) multimer produces the 3x3 zero matrix while monomer's
+// eigh(0) returns last eigenvector (0,0,0,1) -> QUAT_TO_ROT[3,3] = diag(-1,-1,1).
+__global__ void refFrameK(const float* __restrict__ pos,
+                          const int32_t* __restrict__ np,
+                          float* __restrict__ rot,
+                          float* __restrict__ trans,
+                          float pos_scale, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+  float* R = rot + (size_t)i * 9;
+  float* T = trans + (size_t)i * 3;
+  const float z[3] = {0.f, 0.f, 0.f};
+  const float* p = (np && i >= *np) ? nullptr : pos + (size_t)i * 37 * 3;
+  const float* n  = p ? p + 0 * 3 : z;
+  const float* ca = p ? p + 1 * 3 : z;
+  const float* c  = p ? p + 2 * 3 : z;
+  float e0[3] = {c[0] - ca[0], c[1] - ca[1], c[2] - ca[2]};
+  float e1[3] = {n[0] - ca[0], n[1] - ca[1], n[2] - ca[2]};
+  float l0 = sqrtf(e0[0]*e0[0] + e0[1]*e0[1] + e0[2]*e0[2]) + 1e-20f;
+  for (int k = 0; k < 3; ++k) e0[k] /= l0;
+  const float d = e1[0]*e0[0] + e1[1]*e0[1] + e1[2]*e0[2];
+  for (int k = 0; k < 3; ++k) e1[k] -= d * e0[k];
+  float l1 = sqrtf(e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2]) + 1e-20f;
+  for (int k = 0; k < 3; ++k) e1[k] /= l1;
+  const float e2[3] = {e0[1]*e1[2] - e0[2]*e1[1],
+                       e0[2]*e1[0] - e0[0]*e1[2],
+                       e0[0]*e1[1] - e0[1]*e1[0]};
+  R[0] = e0[0]; R[1] = e1[0]; R[2] = e2[0];
+  R[3] = e0[1]; R[4] = e1[1]; R[5] = e2[1];
+  R[6] = e0[2]; R[7] = e1[2]; R[8] = e2[2];
+  if (pos_scale == 10.f && R[0]*R[0] + R[4]*R[4] + R[8]*R[8] == 0.f) {
+    R[0] = -1.f; R[4] = -1.f; R[8] = 1.f;
+  }
+  const float inv = 1.f / pos_scale;
+  T[0] = ca[0] * inv; T[1] = ca[1] * inv; T[2] = ca[2] * inv;
+}
+
 struct StructureModule {
   int N = 0, depth = 8;
   cudaStream_t st = nullptr;
@@ -114,7 +158,9 @@ struct StructureModule {
   void setDropout(bool on, const uint32_t* seed) { stack.setDropout(on, seed); }
 
   void forward(const float* single, const float* pair, const float* mask,
-               const float* aatype = nullptr) {
+               const float* aatype = nullptr,
+               const float* init_pos = nullptr,
+               const int32_t* np_dev = nullptr) {
     size_t nc = (size_t)N * C, np = (size_t)N * N * CZ;
     int gc = (int)((nc + 255) / 256), gp = (int)((np + 255) / 256);
     foldit::lnFwdK<><<<(N + 7) / 8, 256, 0, st>>>(single, lnS, lnSo, initial,
@@ -128,7 +174,11 @@ struct StructureModule {
     CUB(cublasSgemm(cub, CUBLAS_OP_N, CUBLAS_OP_N, C, N, C, &alpha, wip, C,
                     initial, C, &beta, act0, C));
     addRowBiasK<<<gc, 256, 0, st>>>(act0, bip, C, nc);
-    identityFrameK<<<(N + 255) / 256, 256, 0, st>>>(rot0, trans0, N);
+    if (init_pos)
+      refFrameK<<<(N + 255) / 256, 256, 0, st>>>(init_pos, np_dev, rot0, trans0,
+                                                 pos_scale, N);
+    else
+      identityFrameK<<<(N + 255) / 256, 256, 0, st>>>(rot0, trans0, N);
     stack.forward(act0, pairN, mask, rot0, trans0, initial, aatype);
     (void)gp;
   }

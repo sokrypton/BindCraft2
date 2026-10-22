@@ -1744,9 +1744,11 @@ ffi::Error DesignStepPredictImpl(
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
-  // bc2's cyclic_offset_mode and target_flexibility, this call's -- one
-  // object serves every state, so they are set per call, not per object
-  m->plan.cyclic_mode = (int)cyclic_mode;
+  // bc2's cyclic_offset_mode, target_flexibility and initial_atom_pos
+  // (bit 2 of cyclic_mode), this call's -- one object serves every state,
+  // so they are set per call, not per object
+  m->plan.cyclic_mode = (int)(cyclic_mode & 3);
+  m->plan.init_pos = (cyclic_mode & 4) != 0;
   m->plan.flexibility = flexibility;
 
   design_step::Inputs in{};
@@ -1833,9 +1835,11 @@ ffi::Error DesignStepImpl(
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
-  // bc2's cyclic_offset_mode and target_flexibility, this call's -- one
-  // object serves every state, so they are set per call, not per object
-  m->plan.cyclic_mode = (int)cyclic_mode;
+  // bc2's cyclic_offset_mode, target_flexibility and initial_atom_pos
+  // (bit 2 of cyclic_mode), this call's -- one object serves every state,
+  // so they are set per call, not per object
+  m->plan.cyclic_mode = (int)(cyclic_mode & 3);
+  m->plan.init_pos = (cyclic_mode & 4) != 0;
   m->plan.flexibility = flexibility;
 
   design_step::Inputs in{};
@@ -1948,9 +1952,11 @@ ffi::Error DesignStepBwdImpl(
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
-  // bc2's cyclic_offset_mode and target_flexibility, this call's -- one
-  // object serves every state, so they are set per call, not per object
-  m->plan.cyclic_mode = (int)cyclic_mode;
+  // bc2's cyclic_offset_mode, target_flexibility and initial_atom_pos
+  // (bit 2 of cyclic_mode), this call's -- one object serves every state,
+  // so they are set per call, not per object
+  m->plan.cyclic_mode = (int)(cyclic_mode & 3);
+  m->plan.init_pos = (cyclic_mode & 4) != 0;
   m->plan.flexibility = flexibility;
 
   design_step::Inputs in{};
@@ -1979,7 +1985,7 @@ ffi::Error DesignStepBwdImpl(
         reinterpret_cast<__nv_bfloat16*>(carry_psave.typed_data()),
         carry_msave.typed_data(), carry_pout.typed_data(),
         carry_mout.typed_data());
-  m->skip_trunk = carry;
+  m->skip_trunk = carry && (recycles == 0);
   // NB_DS_TIME: what the replay still costs, against the backward it
   // serves.  The carry took 48 of 54 blocks out of it; whether the six
   // that remain are worth carrying too is a question only this answers,

@@ -227,6 +227,9 @@ def weights_from_params(params, out_dir=None, depth=None, prefix=_MAIN):
 # scope up, under template_embedding/ itself -- SingleTemplateEmbedding returns
 # before it.
 _TPE = 'alphafold/alphafold_iteration/evoformer/template_embedding'
+_TPL_MONO = (
+    'alphafold/alphafold_iteration/evoformer/template_embedding/'
+    'single_template_embedding/template_pair_stack/__layer_stack_no_state')
 _TPE_FLAT = {
     f'{_TPE}/single_template_embedding/query_embedding_norm':
         'query_embedding_norm',
@@ -243,6 +246,19 @@ _TPE_FLAT = {
         'output_layer_norm',
     f'{_TPE}/output_linear': 'output_linear',
 }
+_TPE_FLAT_MONO = {
+    f'{_TPE}/single_template_embedding/embedding2d':
+        'single_template_embedding/embedding2d',
+    f'{_TPE}/single_template_embedding/output_layer_norm':
+        'single_template_embedding/output_layer_norm',
+    f'{_TPE}/attention': 'attention',
+}
+
+
+def looks_monomer(params) -> bool:
+    """True if `params` is an alphafold2_ptm (22-wide preprocess_1d) checkpoint."""
+    d = params.get('alphafold/alphafold_iteration/evoformer/preprocess_1d')
+    return bool(d and 'weights' in d and np.asarray(d['weights']).shape[0] == 22)
 
 
 def tplembed_weights_from_params(params, out_dir=None):
@@ -258,7 +274,12 @@ def tplembed_weights_from_params(params, out_dir=None):
     import hashlib
     import tempfile
 
+    mono = looks_monomer(params)
+    tpl_prefix = _TPL
     mods = {k: v for k, v in params.items() if k.startswith(_TPL)}
+    if not mods and mono:
+        tpl_prefix = _TPL_MONO
+        mods = {k: v for k, v in params.items() if k.startswith(_TPL_MONO)}
     if not mods:
         raise KeyError(f'no {_TPL}* in these params')
     depth = min(int(np.asarray(a).shape[0])
@@ -266,14 +287,15 @@ def tplembed_weights_from_params(params, out_dir=None):
 
     flat = {}
     for mod in sorted(mods):
-        path = mod[len(_TPL) + 1:] if len(mod) > len(_TPL) else ''
+        path = mod[len(tpl_prefix) + 1:] if len(mod) > len(tpl_prefix) else ''
         for pname in sorted(mods[mod]):
             w = np.asarray(mods[mod][pname], np.float32)
             for b in range(depth):
                 key = f'param/block{b}/{path}/{pname}' if path else \
                       f'param/block{b}/{pname}'
                 flat[key] = np.ascontiguousarray(w[b], dtype=np.float32)
-    for scope, leaf in _TPE_FLAT.items():
+    flat_leaves = _TPE_FLAT_MONO if mono else _TPE_FLAT
+    for scope, leaf in flat_leaves.items():
         if scope not in params:
             raise KeyError(f'template embedding: no {scope} in these params')
         for pname, v in params[scope].items():
@@ -339,6 +361,54 @@ def post_weights_from_params(params, out_dir=None):
             flat[key] = np.asarray(v, np.float32)
     if not flat:
         raise KeyError('no structure_module or head parameters in these params')
+
+    # Convert monomer IPA and affine_update parameters onto the multimer layout
+    # (matching ckpt.cuh::monomerise and alphafold3/af2/convert.py).
+    ipa = 'param/fold_iteration/invariant_point_attention/'
+    hh = 12
+    for src, parts in (
+            ('q_scalar', (('q_scalar_projection', 16),)),
+            ('kv_scalar', (('k_scalar_projection', 16),
+                           ('v_scalar_projection', 16)))):
+        wk, bk = f'{ipa}{src}/weights', f'{ipa}{src}/bias'
+        if wk in flat:
+            w = flat.pop(wk)
+            b = flat.pop(bk)
+            d = w.shape[0]
+            w = w.reshape(d, hh, -1)
+            b = b.reshape(hh, -1)
+            off = 0
+            for dst, ch in parts:
+                flat[f'{ipa}{dst}/weights'] = np.ascontiguousarray(
+                    w[:, :, off:off + ch], np.float32)
+                flat[f'{ipa}{dst}/bias'] = np.ascontiguousarray(
+                    b[:, off:off + ch], np.float32)
+                off += ch
+    for src, parts in (
+            ('q_point_local', (('q_point_projection/point_projection', 4),)),
+            ('kv_point_local', (('k_point_projection/point_projection', 4),
+                                ('v_point_projection/point_projection', 8)))):
+        wk, bk = f'{ipa}{src}/weights', f'{ipa}{src}/bias'
+        if wk in flat:
+            w = flat.pop(wk)
+            b = flat.pop(bk)
+            d = w.shape[0]
+            w = w.reshape(d, 3, hh, -1).transpose(0, 2, 1, 3)
+            b = b.reshape(3, hh, -1).transpose(1, 0, 2)
+            off = 0
+            for dst, pts in parts:
+                flat[f'{ipa}{dst}/weights'] = np.ascontiguousarray(
+                    w[:, :, :, off:off + pts].reshape(d, hh, 3 * pts),
+                    np.float32)
+                flat[f'{ipa}{dst}/bias'] = np.ascontiguousarray(
+                    b[:, :, off:off + pts].reshape(hh, 3 * pts),
+                    np.float32)
+                off += pts
+    au = 'param/fold_iteration/affine_update/'
+    qr = 'param/fold_iteration/quat_rigid/rigid/'
+    if f'{au}weights' in flat:
+        flat[f'{qr}weights'] = flat.pop(f'{au}weights')
+        flat[f'{qr}bias'] = flat.pop(f'{au}bias')
 
     for m in _IPA_ZERO_BIAS:
         wk, bk = f'param/{m}/weights', f'param/{m}/bias'
@@ -453,6 +523,7 @@ _EMB_LEAVES = ('preprocess_1d', 'preprocess_msa', 'left_single',
                'right_single', 'position_activations', 'single_activations',
                'template_single_embedding', 'template_projection',
                'prev_pos_linear', 'prev_msa_first_row_norm', 'prev_pair_norm')
+_EMB_LEAVES_ALL = frozenset(_EMB_LEAVES + ('pair_activiations',))
 
 
 def embed_weights_from_params(params, out_dir=None):
@@ -473,7 +544,7 @@ def embed_weights_from_params(params, out_dir=None):
         if not mod.startswith(_EMB):
             continue
         leaf = mod.split('/')[-1]
-        if leaf not in _EMB_LEAVES:
+        if leaf not in _EMB_LEAVES_ALL:
             continue
         for pname, v in d.items():
             flat[f'param/{leaf}/{pname}'] = np.asarray(v, np.float32)
@@ -578,7 +649,17 @@ def template_act_const(model_parameters, template_batch, multichain_mask_2d,
     from .alphafold.model import config as af_config
     from .alphafold.model import prng
 
+    if looks_monomer(model_parameters):
+        return jnp.zeros(query_shape[:2] + (64,), dtype=dtype)
+
+    scope = 'alphafold/alphafold_iteration/evoformer/template_embedding/'
     h = hashlib.sha1()
+    for k in sorted(model_parameters):
+        if k.startswith(scope):
+            h.update(k.encode())
+            for pk in sorted(model_parameters[k]):
+                h.update(np.ascontiguousarray(
+                    np.asarray(model_parameters[k][pk], np.float32)).tobytes()[:256])
     for k in sorted(template_batch):
         h.update(k.encode())
         h.update(np.ascontiguousarray(np.asarray(template_batch[k])).tobytes())
@@ -596,7 +677,6 @@ def template_act_const(model_parameters, template_batch, multichain_mask_2d,
     # the name itself.  Stripping that too asks haiku for
     # 'template_pair_embedding_0' where it created
     # 'single_template_embedding/template_pair_embedding_0'.
-    scope = 'alphafold/alphafold_iteration/evoformer/template_embedding/'
     params = {k[len(scope):]: v for k, v in model_parameters.items()
               if k.startswith(scope)}
 
@@ -1590,8 +1670,9 @@ def install_models(model_parameters: dict, depth: int = 48,
         if 'tplembed' not in _off:
             try:
                 ted = tplembed_weights_from_params(params)
-                _TPE_RUNNERS[name] = _make_tplembed_runner(ted, 2,
-                                                           bool(dropout))
+                if not looks_monomer(params):
+                    _TPE_RUNNERS[name] = _make_tplembed_runner(ted, 2,
+                                                               bool(dropout))
                 print(f'native: template EMBEDDING INSTALLED for {name} '
                       f'-> {ted}')
             except KeyError as e:
@@ -1650,7 +1731,8 @@ def install_models(model_parameters: dict, depth: int = 48,
         if 'embed' not in _off:
             try:
                 ed2 = embed_weights_from_params(params)
-                _EMB_RUNNERS[name] = _make_embed_runner(ed2)
+                if not looks_monomer(params):
+                    _EMB_RUNNERS[name] = _make_embed_runner(ed2)
                 print(f'native: embedder INSTALLED for {name} -> {ed2}')
             except KeyError as e:
                 print(f'native: embedder NOT installed for {name}: {e}')

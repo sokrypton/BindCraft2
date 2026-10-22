@@ -176,6 +176,7 @@ struct Plan {
   // every state and the desperation ladder moves the flexibility mid-run
   int cyclic_mode = 1;
   float flexibility = 0.f;
+  bool init_pos = false;
 };
 
 // ffi.cu keeps its own bf16ToF32OutK next to the custom calls; a header
@@ -646,9 +647,8 @@ struct DesignStep {
     if (!want_save) { predict(in, out); return; }
     // the recycled state starts at ZERO, and zero is not neutral -- see the
     // note at the top of recycle.cuh
-    rec.zeroPrev();
-    for (int r = 0; r < plan.recycles; ++r) runOnce(in, out, /*save=*/false);
-    runOnce(in, out, want_save);
+    for (int r = 0; r < plan.recycles; ++r) runOnce(in, out, /*save=*/false, r);
+    runOnce(in, out, want_save, plan.recycles);
   }
 
   // Each component keeps its own directory, exactly as the per-piece FFI
@@ -724,9 +724,8 @@ struct DesignStep {
   void predict(const Inputs& in, const Outputs& out) {
     predictBuffers();
     skip_trunk = false;
-    rec.zeroPrev();
-    for (int r = 0; r < plan.recycles; ++r) runOnce(in, out, /*save=*/false);
-    runOnce(in, out, /*save=*/false);
+    for (int r = 0; r < plan.recycles; ++r) runOnce(in, out, /*save=*/false, r);
+    runOnce(in, out, /*save=*/false, plan.recycles);
   }
 
   // THE SECOND KEEP GRANT, FOR THE FUSED STEP.
@@ -792,7 +791,7 @@ struct DesignStep {
     tables = t;
   }
 
-  void runOnce(const Inputs& in, const Outputs& out, bool save);
+  void runOnce(const Inputs& in, const Outputs& out, bool save, int pass = 0);
   void backward(const Inputs& in, const Cotangents& ct, float* d_sequence);
 };
 
@@ -820,7 +819,7 @@ __global__ void outAtomMaskK(const int32_t* __restrict__ aatype,
 }
 
 inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
-                                bool save) {
+                                bool save, int pass) {
   const int N = plan.nmax;
   const int g1 = (N + 127) / 128;
   const int gn = (int)(((size_t)N * N + 127) / 128);
@@ -900,7 +899,7 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   // 3a. the three recycle terms, added in place.  On the first pass they
   //     are the LayerNorms' offsets and the zero-distance distogram's
   //     column -- NOT zero.
-  rec.forward(aatype, in.n, emb.pair, emb.msa);
+  rec.forward(aatype, in.n, emb.pair, emb.msa, /*is_zero=*/(pass == 0));
 
   // 3b. THE COMPONENTS WANT A 2-D PAIR MASK, not seq_mask.  Passing the
   //     1-D one compiles wherever the type matches and silently masks the
@@ -967,6 +966,8 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   // bytes arrive at the Evoformer holding whatever the template stack left.
   if (envOn("NB_EVO_DIRTY"))
     nbrealloc::scribble(evo_ledger_first, evo_ledger_last, st);
+  extra.save_full = save;
+  trunk.save_full = save;
   extra.forward(pair_all, emb.msa, pair_mask, in.seq_mask);
   for (int r = 0; r < plan.msa_rows; ++r) {
     CU(cudaMemcpyAsync(trunk_msa + r * rowc, emb.msa + r * rowc, rowc * 4,
@@ -998,10 +999,18 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   //    produce a worse structure with no error anywhere.
   emb.singleFromTrunk(trunk.mout, emb.single);
   idxToFloatK<<<g1, 128, 0, st>>>(aatype, aatype_f, N);
+  const float* init_pos =
+      plan.init_pos ? (pass == 0 ? in.atoms : rec.prev_pos) : nullptr;
+  sm.forward(emb.single, trunk.pout, pair_mask, aatype_f, init_pos, in.n);
+  const int ga = (int)(((size_t)N * ATOM + 127) / 128);
+  if (pass < plan.recycles && !envOn("NB_DS_DUMP")) {
+    atom14To37K<<<ga, 128, 0, st>>>(sm.outAtom(), a37_14, a37e, in.n, atom37, N);
+    rec.save(atom37, trunk.pout, trunk.mout);
+    return;
+  }
   if (out.atom_mask)
     outAtomMaskK<<<(N * 37 + 255) / 256, 256, 0, st>>>(
         aatype, in.seq_mask, tables.atom37_mask, N, out.atom_mask);
-  sm.forward(emb.single, trunk.pout, pair_mask, aatype_f);
   hd.forward(trunk.pout, sm.outAct());
   //    and the experimentally-resolved head is a SEPARATE call reading the
   //    EVOFORMER single, not the structure module's act -- see heads.cuh,
@@ -1041,7 +1050,6 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
       hd.expres, in.n, out.expres_ca, N);
 
   // 8. and the atoms, superposed onto the target template
-  const int ga = (int)(((size_t)N * ATOM + 127) / 128);
   atom14To37K<<<ga, 128, 0, st>>>(sm.outAtom(), a37_14, a37e, in.n, atom37, N);
   kabsch::covK<<<1, 32, 0, st>>>(atom37, t_pos, t_mask, in.flags, in.n,
                                  kab, N);
@@ -1053,8 +1061,8 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
                      (size_t)N * N * DBINS * 4,
                      cudaMemcpyDeviceToDevice, st));
   // and what the next recycle pass reads
-  rec.save(atom37, trunk.pout, trunk.mout);
-  (void)save;
+  if (pass < plan.recycles)
+    rec.save(atom37, trunk.pout, trunk.mout);
 }
 
 // ---- the backward ------------------------------------------------------
@@ -1185,11 +1193,12 @@ inline void DesignStep::backward(const Inputs& in, const Cotangents& ct,
   // NO TEMPLATE BACKWARD UNDER ptm: its contribution does not depend on the
   // query or on anything the losses differentiate, so d_pair passes straight
   // through to the embedder.
-  if (!plan.monomer)
-  tpl.backward(d_pair, emb.pair, in.act_const, pair_mask,
-               tpl_save, d_tpl_query);
-  foldit::accK<<<(int)((nn_cz + 255) / 256), 256, 0, st>>>(
-      d_pair, d_tpl_query, nn_cz);
+  if (!plan.monomer) {
+    tpl.backward(d_pair, emb.pair, in.act_const, pair_mask,
+                 tpl_save, d_tpl_query);
+    foldit::accK<<<(int)((nn_cz + 255) / 256), 256, 0, st>>>(
+        d_pair, d_tpl_query, nn_cz);
+  }
 
   dsDump("b_after_tpl_dpair", d_pair, nn_cz * 4);
 

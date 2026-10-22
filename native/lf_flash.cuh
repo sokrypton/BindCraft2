@@ -167,7 +167,8 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     // would divide by a sigmoid that reaches 1e-5.  lseOut is the row's
     // log-sum-exp IN THE LOG2 DOMAIN the kernel works in (m + log2(l)), so the
     // backward recomputes P as exp2(S_log2 - lse) with the forward's own scores.
-    half* __restrict__ avOut = nullptr, float* __restrict__ lseOut = nullptr) {
+    half* __restrict__ avOut = nullptr, float* __restrict__ lseOut = nullptr,
+    __nv_bfloat16* __restrict__ outBf16 = nullptr) {
   constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
   static_assert(BK % 16 == 0, "a key tile is whole k16 steps of the PV product");
   constexpr size_t STAGE = faStage<D, WARPS, BK>();
@@ -428,10 +429,18 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   for (int et = 0; et < D / 8; ++et) {
     int e = et * 8 + tig * 2;
     float2 a = __half22float2(ga[et]), b2 = __half22float2(gb[et]);
-    if (i0 < n) *reinterpret_cast<half2*>(out + outAt(i0) + e) =
-        __floats2half2_rn(o[et][0] / l0 * sigm(a.x), o[et][1] / l0 * sigm(a.y));
-    if (i1 < n) *reinterpret_cast<half2*>(out + outAt(i1) + e) =
-        __floats2half2_rn(o[et][2] / l1 * sigm(b2.x), o[et][3] / l1 * sigm(b2.y));
+    half2 h0 = __floats2half2_rn(o[et][0] / l0 * sigm(a.x), o[et][1] / l0 * sigm(a.y));
+    half2 h1 = __floats2half2_rn(o[et][2] / l1 * sigm(b2.x), o[et][3] / l1 * sigm(b2.y));
+    if (out) {
+      if (i0 < n) *reinterpret_cast<half2*>(out + outAt(i0) + e) = h0;
+      if (i1 < n) *reinterpret_cast<half2*>(out + outAt(i1) + e) = h1;
+    }
+    if (outBf16) {
+      if (i0 < n) *reinterpret_cast<__nv_bfloat162*>(outBf16 + outAt(i0) + e) =
+          __floats2bfloat162_rn(__low2float(h0), __high2float(h0));
+      if (i1 < n) *reinterpret_cast<__nv_bfloat162*>(outBf16 + outAt(i1) + e) =
+          __floats2bfloat162_rn(__low2float(h1), __high2float(h1));
+    }
     if (avOut) {   // LOCAL ADDITION: the same thing ungated
       if (i0 < n) *reinterpret_cast<half2*>(avOut + outAt(i0) + e) =
           __floats2half2_rn(o[et][0] / l0, o[et][1] / l0);
@@ -947,36 +956,38 @@ void flashGridHalfRun(const half* qkvg, const half* bias, int stride, const floa
                       // rowStride and posStride swapped -- so the 16.8 MB
                       // transpose this module materialises may be expressible
                       // as two arguments.
-                      size_t rs = 0, size_t ps = 0, size_t ors = 0, size_t ops = 0) {
+                      size_t rs = 0, size_t ps = 0, size_t ors = 0, size_t ops = 0,
+                      __nv_bfloat16* outBf16 = nullptr) {
   dim3 grid((n + 16 * WARPS - 1) / (16 * WARPS), (unsigned)(rows * heads));
   const int bytes = (REG ? 1 : 2) * faStage<D, WARPS, BK>();
   if (mask && ps) {
     setFlashSmem<D, WARPS, true, BK, REG, MINB>();
     flashGridHalf<D, WARPS, true, BK, REG, MINB, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, rs, ps, ors, ops, avOut, lseOut);
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, rs, ps, ors, ops, avOut, lseOut, outBf16);
   } else if (mask) {                    // a null mask: every key real (see MASKED)
     setFlashSmem<D, WARPS, true, BK, REG, MINB>();
     flashGridHalf<D, WARPS, true, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, avOut, lseOut);
-  } else if (!avOut && !lseOut && FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, avOut, lseOut, outBf16);
+  } else if (!avOut && !lseOut && !outBf16 && FLASH_2R && !REG && D == 32 && WARPS == 4 && BK == 48) {   // (the unmasked kernel reads no r0)
     flashGrid2RRun<D, 2, BK, 2, 2>(qkvg, bias, stride, out, n, heads, rows, scale, qBias);
   } else if (FLASH_F16S) {
     setFlashSmem<D, WARPS, false, BK, REG, MINB, true>();
     flashGridHalf<D, WARPS, false, BK, REG, MINB, false, true><<<grid, 32 * WARPS, bytes, STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, avOut, lseOut);
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, avOut, lseOut, outBf16);
   } else {
     setFlashSmem<D, WARPS, false, BK, REG, MINB>();
     flashGridHalf<D, WARPS, false, BK, REG, MINB><<<grid, 32 * WARPS, bytes, STREAM>>>(
-      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, avOut, lseOut);
+      qkvg, bias, stride, mask, out, n, heads, r0, tr, scale, qBias, 0, 0, 0, 0, avOut, lseOut, outBf16);
   }
 }
 template <int D, int WARPS, int BK = FA_BK>
 void flashGridHalfAt(const half* qkvg, const half* bias, int stride, const float* mask, half* out,
                      int n, int heads, size_t r0, size_t rows, bool tr, float scale, const float* qBias,
                      half* avOut = nullptr, float* lseOut = nullptr,
-                     size_t rs = 0, size_t ps = 0, size_t ors = 0, size_t ops = 0) {
-  if (flashRegStaged()) flashGridHalfRun<D, WARPS, BK, true>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias, avOut, lseOut, rs, ps, ors, ops);
-  else flashGridHalfRun<D, WARPS, BK, false>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias, avOut, lseOut, rs, ps, ors, ops);
+                     size_t rs = 0, size_t ps = 0, size_t ors = 0, size_t ops = 0,
+                     __nv_bfloat16* outBf16 = nullptr) {
+  if (flashRegStaged()) flashGridHalfRun<D, WARPS, BK, true>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias, avOut, lseOut, rs, ps, ors, ops, outBf16);
+  else flashGridHalfRun<D, WARPS, BK, false>(qkvg, bias, stride, mask, out, n, heads, r0, rows, tr, scale, qBias, avOut, lseOut, rs, ps, ors, ops, outBf16);
 }
 template <int D>
 void flashGridHalfLaunch(const half* qkvg, const half* bias, int stride, const float* mask, half* out,

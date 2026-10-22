@@ -101,20 +101,24 @@ __global__ void lnFwdK(const __nv_bfloat16* __restrict__ pair,
 // ONE WARP A ROW: C is 128, so a lane holds four channels and both reductions
 // are shuffles -- no shared memory, no __syncthreads, where a block-per-row
 // paid two block-wide barriers for each of 50176 rows.
+template <bool TRANSPOSE = false>
 __global__ void lnFwdHalfK(const __nv_bfloat16* __restrict__ pair,
                            const float* __restrict__ scale,
                            const float* __restrict__ offset,
                            half* __restrict__ x, float* __restrict__ mu,
-                           float* __restrict__ rstd, int M) {
+                           float* __restrict__ rstd, int M, int N = 0, int cr0 = 0) {
   int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   if (row >= M) return;
   int lane = threadIdx.x & 31;
   const int K = C / 32;
   const size_t base = (size_t)row * C;
+  const size_t pbase = TRANSPOSE
+      ? ((size_t)(row % N) * N + (cr0 + row / N)) * C
+      : base;
   float v[K], s = 0.f;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    v[k] = __bfloat162float(pair[base + lane + k * 32]);
+    v[k] = __bfloat162float(pair[pbase + lane + k * 32]);
     s += v[k];
   }
 #pragma unroll
@@ -172,22 +176,24 @@ __global__ void f32ToHalfK(const float* __restrict__ src, half* __restrict__ dst
 // is already at ~83% of bandwidth, so the only way to get it is to not do it.
 // Aliasing with the incoming cotangent is safe: every backward in this
 // directory reads `dout` once, at the top, into a bf16 copy.
-template <bool ACC = false, class DT = float>
+template <bool ACC = false, class DT = float, bool TRANSPOSE = false>
 __global__ void lnBwdK(const __nv_bfloat16* __restrict__ dx,
                        const __nv_bfloat16* __restrict__ pair,
                        const float* __restrict__ scale, const float* __restrict__ mu,
-                       const float* __restrict__ rstd, DT* __restrict__ dpair, int M) {
+                       const float* __restrict__ rstd, DT* __restrict__ dpair,
+                       int M, int N = 0) {
   int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   if (row >= M) return;
   int lane = threadIdx.x & 31;
   const int K = C / 32;
   const size_t base = (size_t)row * C;
+  const size_t pbase = TRANSPOSE ? ((size_t)(row % N) * N + (row / N)) * C : base;
   float r = rstd[row], mu_ = mu[row];
   float xh[K], dxh[K], s1 = 0.f, s2 = 0.f;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
     int c = lane + k * 32;
-    xh[k] = (__bfloat162float(pair[base + c]) - mu_) * r;
+    xh[k] = (__bfloat162float(pair[pbase + c]) - mu_) * r;
     dxh[k] = __bfloat162float(dx[base + c]) * scale[c];
     s1 += dxh[k];
     s2 += dxh[k] * xh[k];
@@ -200,7 +206,7 @@ __global__ void lnBwdK(const __nv_bfloat16* __restrict__ dx,
   float mean_d = s1 / C, mean_dx = s2 / C;
 #pragma unroll
   for (int k = 0; k < K; ++k) {
-    size_t o = base + lane + k * 32;
+    size_t o = pbase + lane + k * 32;
     float v = r * (dxh[k] - mean_d - xh[k] * mean_dx);
     if (ACC) v += toF(dpair[o]);
     stF(dpair + o, v);
@@ -857,8 +863,8 @@ struct TriAttn {
       {(void**)&dnbbF, (size_t)H * M * 4},
       {(void**)&dnbbI, dnbbI ? (size_t)H * M * 8 : 0},
       {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
-      {(void**)&pairT, ending ? mc * 2 : 0},
-      {(void**)&outT, ending ? mc * 2 : 0},
+      {(void**)&pairT, 0},
+      {(void**)&outT, 0},
       {(void**)&maskT, ending ? (size_t)M * 4 : 0},
     };
   }
@@ -887,16 +893,7 @@ struct TriAttn {
 
   void allocOrientation() {
     if (!ending) return;
-    size_t mc = (size_t)M * C;
-    CU(cudaMalloc(&pairT, mc * 2)); CU(cudaMalloc(&outT, mc * 2));
     CU(cudaMalloc(&maskT, (size_t)M * 4));
-    // `doutT` IS ALLOCATED ON FIRST USE, and on the default path there is
-    // never one.  It stages the ENDING node's f32 cotangent transpose, which
-    // only the !narrow path does -- with the bf16 chain (BLK_BF16CHAIN, the
-    // default) the transpose goes straight into `dx` and this is 139 MB at
-    // N=522 that is allocated and never touched.  `dpairT` is used on BOTH
-    // paths and stays f32: lnBwd writes it and transposePairOut narrows it.
-    CU(cudaMalloc(&dpairT, mc * 4));
   }
 
   // Same argument as tri-mul's: every d* here is internal to backward(),
@@ -1021,14 +1018,18 @@ struct TriAttn {
 
 
   void forward(const __nv_bfloat16* pairIn, const float* maskIn,
-               bool haveFlash = false, bool haveBias = false) {
+               bool haveFlash = false, bool haveBias = false,
+               bool keepFlash = true, bool fusedTransposeOut = false,
+               bool haveMaskT = false) {
     const __nv_bfloat16* pair = pairIn;
     const float* mask = maskIn;
     if (ending) {
-      transposePairVec(pairIn, pairT, N, C * 2, st);
-      dim3 mg((N + 31) / 32, (N + 31) / 32);
-      transposeMaskK<<<mg, dim3(32, 32), 0, st>>>(maskIn, maskT, N);
-      pair = pairT; mask = maskT;
+      if (!fusedTransposeOut && !outT) CU(cudaMalloc(&outT, (size_t)M * C * 2));
+      if (!haveMaskT) {
+        dim3 mg((N + 31) / 32, (N + 31) / 32);
+        transposeMaskK<<<mg, dim3(32, 32), 0, st>>>(maskIn, maskT, N);
+      }
+      mask = maskT;
     }
     size_t mc = (size_t)M * C;
     LF_STREAM = st;
@@ -1049,8 +1050,12 @@ struct TriAttn {
         const int crows = (N - cr0 < taRows) ? (N - cr0) : taRows;
         const size_t Mc = (size_t)crows * N;
         PROF_STEP("ta.f lnFwd",
-          lnFwdHalfK<<<(Mc + 7) / 8, 256, 0, st>>>(pair + (size_t)cr0 * N * C,
-            ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
+          if (ending)
+            lnFwdHalfK<true><<<(Mc + 7) / 8, 256, 0, st>>>(pair,
+              ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc, N, cr0);
+          else
+            lnFwdHalfK<false><<<(Mc + 7) / 8, 256, 0, st>>>(pair + (size_t)cr0 * N * C,
+              ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
         PROF_STEP("ta.f gemm nbb",
           lt.matmul((int)Mc, H, C, xh, wnbbTh, nbbMH + (size_t)cr0 * N * H,
                     CUDA_R_16F, CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
@@ -1098,25 +1103,31 @@ struct TriAttn {
     for (int cr0 = 0; cr0 < N; cr0 += taRows) {
       const int crows = (N - cr0 < taRows) ? (N - cr0) : taRows;
       const size_t Mc = (size_t)crows * N, mcc = Mc * C;
-      PROF_STEP("ta.f lnFwd",
-        lnFwdHalfK<<<(Mc + 7) / 8, 256, 0, st>>>(pair + (size_t)cr0 * N * C,
-          ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
+      if (haveBias || taRows < N) {
+        PROF_STEP("ta.f lnFwd",
+          if (ending)
+            lnFwdHalfK<true><<<(Mc + 7) / 8, 256, 0, st>>>(pair,
+              ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc, N, cr0);
+          else
+            lnFwdHalfK<false><<<(Mc + 7) / 8, 256, 0, st>>>(pair + (size_t)cr0 * N * C,
+              ln_scale, ln_offset, xh, mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
+      }
       PROF_STEP("ta.f gemm qkvg",
         lt.matmul((int)Mc, QKVG, C, xh, wqkvgTh, qkvgAt(cr0),
                   CUDA_R_16F, CUBLASLT_EPILOGUE_BIAS, bqkvgH, nullptr, st));
       if (!haveFlash) {
+        half* av_dst = keepFlash ? (avH + (size_t)cr0 * N * C) : nullptr;
+        float* lse_dst = keepFlash ? (lseF + (size_t)cr0 * H * N) : nullptr;
         PROF_STEP("ta.f flash",
           TA_SWAP
-            ? flashGridHalfAt<D, 8, 48>(qkvgAt(cr0), biasH, N, mask, outH, N, H,
+            ? flashGridHalfAt<D, 8, 48>(qkvgAt(cr0), biasH, N, mask, /*out*/nullptr, N, H,
                                    cr0, crows, false, 1.f, nullptr,
-                                   avH + (size_t)cr0 * N * C, lseF + (size_t)cr0 * H * N,
+                                   av_dst, lse_dst,
                                    /*rs*/ (size_t)4 * H * 32, /*ps*/ (size_t)N * 4 * H * 32,
-                                   /*ors*/ (size_t)H * 32, /*ops*/ (size_t)N * H * 32)
-            : flashGridHalfAt<D, 8, 48>(qkvgAt(cr0), biasH, N, mask, outH, N, H,
+                                   /*ors*/ (size_t)H * 32, /*ops*/ (size_t)N * H * 32, ag)
+            : flashGridHalfAt<D, 8, 48>(qkvgAt(cr0), biasH, N, mask, /*out*/nullptr, N, H,
                                    cr0, crows, false, 1.f, nullptr,
-                                   avH + (size_t)cr0 * N * C, lseF + (size_t)cr0 * H * N));
-        PROF_STEP("ta.f widen",
-          halfToBf16K<<<(mcc + 255) / 256, 256, 0, st>>>(outH, ag, mcc));
+                                   av_dst, lse_dst, 0, 0, 0, 0, ag));
       } else {
         // outH was never written this pass, so rebuild the gated output from avH
         PROF_STEP("ta.f gateFromAv",
@@ -1125,10 +1136,10 @@ struct TriAttn {
       }
       PROF_STEP("ta.f gemm out",
         lt.matmul((int)Mc, C, C, ag, woT,
-                  (ending ? outT : out) + (size_t)cr0 * N * C, CUDA_R_16BF,
+                  ((ending && !fusedTransposeOut) ? outT : out) + (size_t)cr0 * N * C, CUDA_R_16BF,
                   CUBLASLT_EPILOGUE_BIAS, bo, nullptr, st));
     }
-    if (ending) transposePairVec(outT, out, N, C * 2, st);
+    if (ending && !fusedTransposeOut) transposePairVec(outT, out, N, C * 2, st);
   }
 
   // The backward against the flash forward: nothing but lse was kept, so P is
@@ -1145,25 +1156,28 @@ struct TriAttn {
   // un-transpose rather than in a pass of its own.
   template <class DT>
   void backward(const DT* doutIn, const __nv_bfloat16* pairIn, const float* maskIn,
-                DT* dpairOut, bool acc = false) {
+                DT* dpairOut, bool acc = false, bool alreadyTransposed = false) {
     const __nv_bfloat16* pair = pairIn;
     const float* mask = maskIn;
     const void* dout = doutIn;
-    float* dpair = nullptr;
     constexpr bool narrow = std::is_same<DT, __nv_bfloat16>::value;
     const __nv_bfloat16* dxin = nullptr;
     if (ending) {
       if constexpr (narrow) {
-        // transpose the bf16 cotangent straight into dx: half the bytes of the
-        // f32 transpose, and no narrowing pass at all
-        PROF_STEP("ta.b transpose", transposePairVec(doutIn, dx, N, C * 2, st));
-        dxin = dx;
+        if (alreadyTransposed) {
+          dxin = reinterpret_cast<const __nv_bfloat16*>(doutIn);
+        } else {
+          // transpose the bf16 cotangent straight into dx: half the bytes of the
+          // f32 transpose, and no narrowing pass at all
+          PROF_STEP("ta.b transpose", transposePairVec(doutIn, dx, N, C * 2, st));
+          dxin = dx;
+        }
       } else {
         if (!doutT) CU(cudaMalloc(&doutT, (size_t)M * C * 4));
         transposePairVec(doutIn, doutT, N, C * 4, st);
         dout = doutT;
       }
-      pair = pairT; mask = maskT; dpair = dpairT;
+      mask = maskT;
     } else if constexpr (narrow) {
       dxin = reinterpret_cast<const __nv_bfloat16*>(doutIn);
     }
@@ -1280,16 +1294,21 @@ struct TriAttn {
         // would be a whole second forward for nothing.
         if (qkvg_chunked) {
           PROF_STEP("ta.b replay lnFwd",
-            lnFwdHalfK<<<(Mc + 7) / 8, 256, 0, st>>>(
-                pair + (size_t)cr0 * N * C, ln_scale, ln_offset, xh,
-                mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
+            if (ending)
+              lnFwdHalfK<true><<<(Mc + 7) / 8, 256, 0, st>>>(
+                  pair, ln_scale, ln_offset, xh,
+                  mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc, N, cr0);
+            else
+              lnFwdHalfK<false><<<(Mc + 7) / 8, 256, 0, st>>>(
+                  pair + (size_t)cr0 * N * C, ln_scale, ln_offset, xh,
+                  mu + (size_t)cr0 * N, rstd + (size_t)cr0 * N, Mc));
           PROF_STEP("ta.b replay qkvg",
             lt.matmul((int)Mc, QKVG, C, xh, wqkvgTh,
                       qkvgAt(cr0), CUDA_R_16F,
                       CUBLASLT_EPILOGUE_BIAS, bqkvgH, nullptr, st));
           PROF_STEP("ta.b replay flash",
             flashGridHalfAt<D, 8, 48>(
-                qkvgAt(cr0), biasH, N, mask, outH, N, H,
+                qkvgAt(cr0), biasH, N, mask, /*out*/nullptr, N, H,
                 cr0, crows, false, 1.f, nullptr,
                 avH + (size_t)cr0 * N * C, lseF + (size_t)cr0 * H * N));
         }
@@ -1364,16 +1383,15 @@ struct TriAttn {
         CU(cudaGetLastError()));
     }
     PROF_STEP("ta.b lnBwd",
-      if (ending)
-        // into the module's own f32 dpairT; the un-transpose below delivers it
-        lnBwdK<false, float><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairT, M);
-      else if (acc)
-        lnBwdK<true, DT><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairOut, M);
+      if (ending) {
+        if (acc)
+          lnBwdK<true, DT, true><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairOut, M, N);
+        else
+          lnBwdK<false, DT, true><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairOut, M, N);
+      } else if (acc)
+        lnBwdK<true, DT, false><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairOut, M);
       else
-        lnBwdK<false, DT><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairOut, M));
-    // the ending node writes dpairT, so its accumulate has to happen in the
-    // un-transpose -- that is the kernel that reaches the caller's buffer
-    if (ending) transposePairOut<DT>(dpairT, dpairOut, N, acc, st);
+        lnBwdK<false, DT, false><<<(M + 7) / 8, 256, 0, st>>>(dx, pair, ln_scale, mu, rstd, dpairOut, M));
   }
 
 };

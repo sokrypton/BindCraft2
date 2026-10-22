@@ -131,7 +131,8 @@ struct TplEmbed {
 
   // `act_const` is the precomputed sum of the eight constant projections
   void forward(const float* query, const float* act_const,
-               const float* pair_mask, float* out, __nv_bfloat16* save) {
+               const float* pair_mask, float* out, __nv_bfloat16* save,
+               bool for_bwd = false) {
     const size_t nq = queryElems(), np = pairElems();
     const int gq = (int)((nq + 255) / 256), gp = (int)((np + 255) / 256);
     const int rows = (int)((size_t)N * N);
@@ -141,7 +142,7 @@ struct TplEmbed {
     addRowBiasK<<<gp, 256, 0, st>>>(act, b8, CT, np);
     foldit::accK<<<gp, 256, 0, st>>>(act, act_const, np);
     toBf16K<<<gp, 256, 0, st>>>(actb, act, np);
-    stack.forward(actb, pair_mask, save);
+    stack.forward(actb, pair_mask, save, for_bwd);
     bf16OutK<<<gp, 256, 0, st>>>(pre, stack.out(), np);
     // SingleTemplateEmbedding ends with this LayerNorm, and skipping it was
     // the gate's 1.75-vs-0.95: it is what puts the stack's output on the
@@ -150,8 +151,10 @@ struct TplEmbed {
                                                        rs2, rows);
     // num_templates is 1, so the mean is the identity; the relu is not
     foldit::reluK<<<gp, 256, 0, st>>>(emb, np);
-    gemm(rows, CQ, CT, emb, wo, out);
-    addRowBiasK<<<gq, 256, 0, st>>>(out, bo, CQ, nq);
+    if (!for_bwd) {
+      gemm(rows, CQ, CT, emb, wo, out);
+      addRowBiasK<<<gq, 256, 0, st>>>(out, bo, CQ, nq);
+    }
   }
 
   // cotangent on the embedding -> the query.  act_const is a constant, so no
@@ -181,13 +184,13 @@ struct TplEmbed {
     // the comment above says the backward reads emb, pre, mu2, rs2, mu and
     // rs, and that is a list of what it READS -- `act` is the DESTINATION of
     // the lnBwd three lines down, so it is live here too.
-    forward(query, act_const, pair_mask, dqn, const_cast<__nv_bfloat16*>(save));
+    forward(query, act_const, pair_mask, dqn, /*save*/nullptr, /*for_bwd*/true);
     gemmNT(rows, CT, CQ, dout, wo, dact);
     foldit::reluBwdK<<<gp, 256, 0, st>>>(dact, emb, np);
     foldit::lnBwdK<CT><<<(rows + 7) / 8, 256, 0, st>>>(dact, pre, oS, mu2, rs2,
                                                       act, rows);
     toBf16K<<<gp, 256, 0, st>>>(dactb, act, np);
-    stack.backward(dactb, pair_mask, save);
+    stack.backward(dactb, pair_mask, save, /*already_forwarded*/true);
     bf16OutK<<<gp, 256, 0, st>>>(dact, stack.dpair(), np);
     gemmNT(rows, CQ, CT, dact, w8, dqn);
     foldit::lnBwdK<CQ><<<(rows + 7) / 8, 256, 0, st>>>(dqn, query, lnS, mu,

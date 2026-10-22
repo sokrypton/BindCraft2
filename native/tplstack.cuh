@@ -72,7 +72,6 @@ struct TplStack {
     p1store.resize(depth, nullptr);
     for (int b = 0; b < depth; ++b)
       CU(cudaMalloc(&p1store[b], pairElems() * 2));
-    CU(cudaMalloc(&ctmp, pairElems() * 2));
   }
 
   // the depth's weights, and its own dropout masks
@@ -116,14 +115,16 @@ struct TplStack {
   }
 
   __nv_bfloat16* out() { return blk.p6b; }
-  __nv_bfloat16* dpair() { return ctmp; }   // block 0's dp, relayed
+  __nv_bfloat16* dpair() { return blk.dp; }   // block 0's dp
 
   // save may be null, for a forward whose gradient is not wanted
   void forward(const __nv_bfloat16* pair, const float* pair_mask,
-               __nv_bfloat16* save) {
+               __nv_bfloat16* save, bool for_bwd = false) {
     const size_t np = pairElems();
     if (save)
       CU(cudaMemcpyAsync(save, pair, np * 2, cudaMemcpyDeviceToDevice, st));
+    if (for_bwd)
+      CU(cudaMemcpyAsync(p1store[0], pair, np * 2, cudaMemcpyDeviceToDevice, st));
     // CHAIN THROUGH p1store, NOT THROUGH p6b.  With one block, p6b is both
     // this depth's output and the next depth's input, and forward() only
     // points p1b at what it is handed -- so the next block would overwrite
@@ -135,44 +136,47 @@ struct TplStack {
         CU(cudaMemcpyAsync(p1store[b], blk.p6b, np * 2,
                            cudaMemcpyDeviceToDevice, st));
         in = p1store[b];
+      } else if (for_bwd) {
+        in = p1store[0];
       }
       use(b);
-      blk.forward(in, pair_mask);
+      const bool last_bwd = for_bwd && (b == depth - 1);
+      blk.forward(in, pair_mask, /*keepBwd=*/last_bwd, /*tail=*/true, /*haveMaskT=*/(b > 0));
     }
   }
 
   void backward(const __nv_bfloat16* ct, const float* pair_mask,
-                const __nv_bfloat16* save) {
+                const __nv_bfloat16* save, bool already_forwarded = false) {
     const size_t np = pairElems();
-    // REPLAY FIRST, from the input this backward belongs to.  p1store[0] is
-    // where it lands, because the first block borrows its input pointer and
-    // `save` is the caller's buffer, which must not be aliased by the chain.
-    CU(cudaMemcpyAsync(p1store[0], save, np * 2, cudaMemcpyDeviceToDevice, st));
-    // PASS 1 recovers every depth's INPUT.  It used to leave every depth's
-    // intermediates live at once, which is exactly what cost a module scratch
-    // set per depth; here only the last block's survive, and p1store holds
-    // what is needed to regenerate the rest.
-    for (int b = 0; b < depth; ++b) {
-      use(b);
-      blk.forward(p1store[b], pair_mask);
-      if (b + 1 < depth)
-        CU(cudaMemcpyAsync(p1store[b + 1], blk.p6b, np * 2,
-                           cudaMemcpyDeviceToDevice, st));
+    if (!already_forwarded) {
+      // REPLAY FIRST, from the input this backward belongs to.  p1store[0] is
+      // where it lands, because the first block borrows its input pointer and
+      // `save` is the caller's buffer, which must not be aliased by the chain.
+      CU(cudaMemcpyAsync(p1store[0], save, np * 2, cudaMemcpyDeviceToDevice, st));
+      // PASS 1 recovers every depth's INPUT.  It used to leave every depth's
+      // intermediates live at once, which is exactly what cost a module scratch
+      // set per depth; here only the last block's survive, and p1store holds
+      // what is needed to regenerate the rest.
+      for (int b = 0; b < depth; ++b) {
+        use(b);
+        const bool last = (b == depth - 1);
+        blk.forward(p1store[b], pair_mask, /*keepBwd=*/last, /*tail=*/!last, /*haveMaskT=*/(b > 0));
+        if (b + 1 < depth)
+          CU(cudaMemcpyAsync(p1store[b + 1], blk.p6b, np * 2,
+                             cudaMemcpyDeviceToDevice, st));
+      }
     }
     // PASS 2 walks back, replaying each block immediately before its own
     // backward -- stack.cuh's pattern.  The block that pass 1 finished on is
-    // already current, so it is not replayed twice.  dp must be relayed
-    // through ctmp: it is ONE buffer now, and the next replay would clobber
-    // the cotangent in flight.
+    // already current, so it is not replayed twice.
     const __nv_bfloat16* c = ct;
     for (int b = depth - 1; b >= 0; --b) {
       if (b != depth - 1) {
         use(b);
-        blk.forward(p1store[b], pair_mask);
+        blk.forward(p1store[b], pair_mask, /*keepBwd=*/true, /*tail=*/false, /*haveMaskT=*/true);
       }
       blk.backward(c, pair_mask);
-      CU(cudaMemcpyAsync(ctmp, blk.dp, np * 2, cudaMemcpyDeviceToDevice, st));
-      c = ctmp;
+      c = blk.dp;
     }
   }
 };

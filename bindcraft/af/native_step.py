@@ -331,7 +331,8 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                 entity_id, interface_asym_id, seq_mask, act_const, length,
                 seed, *, softmax_weight, one_hot_weight, temperature,
                 logit_scale, recycles, msa_rows, weight_dirs, dropout=True,
-                cyclic_mode=1, flexibility=0.0) -> DesignStepOutputs:
+                cyclic_mode=1, flexibility=0.0,
+                init_pos=False) -> DesignStepOutputs:
     """One call, sequence to the nine arrays boundary.py lists.
 
     `length` is a VALUE -- a device buffer holding one int32 -- and not a
@@ -354,7 +355,8 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     # back through it to f16 on its own.
     sequence = jnp.asarray(sequence, F32)
     cfg = (recycles, msa_rows, int(bool(dropout)),
-           tuple(sorted(weight_dirs.items())), int(cyclic_mode),
+           tuple(sorted(weight_dirs.items())),
+           (int(cyclic_mode) & 3) | (4 if init_pos else 0),
            float(flexibility))
     scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
                          jnp.asarray(one_hot_weight, F32),
@@ -405,7 +407,8 @@ def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                  entity_id, interface_asym_id, seq_mask, act_const, length,
                  seed, *, softmax_weight, one_hot_weight, temperature,
                  logit_scale, recycles, msa_rows, weight_dirs, dropout=False,
-                 cyclic_mode=1, flexibility=0.0) -> DesignStepOutputs:
+                 cyclic_mode=1, flexibility=0.0,
+                 init_pos=False) -> DesignStepOutputs:
     """One call, sequence to the same nine arrays -- with no gradient.
 
     The operand contract is the design step's, exactly: the two handlers
@@ -418,7 +421,8 @@ def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                           weight_dirs)
     sequence = jnp.asarray(sequence, F32)
     cfg = (recycles, msa_rows, int(bool(dropout)),
-           tuple(sorted(weight_dirs.items())), int(cyclic_mode),
+           tuple(sorted(weight_dirs.items())),
+           (int(cyclic_mode) & 3) | (4 if init_pos else 0),
            float(flexibility))
     scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
                          jnp.asarray(one_hot_weight, F32),

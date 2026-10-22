@@ -98,13 +98,18 @@ __global__ void unsplitK(const float* __restrict__ dL, const __nv_bfloat16* __re
 
 // norm[i,j] = sum_s mask[s,i] mask[s,j]; the output is divided by eps + norm
 __global__ void normDivK(__nv_bfloat16* __restrict__ out, const float* __restrict__ mask,
-                         int N, int S, bool fwd, const __nv_bfloat16* __restrict__ src) {
+                         int N, int S, bool fwd, const __nv_bfloat16* __restrict__ src,
+                         const float* __restrict__ nzbuf = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (t >= (size_t)N * N * CZ) return;
   size_t ij = t / CZ;
-  int i = (int)(ij / N), j = (int)(ij % N);
   float nz = 0.f;
-  for (int s = 0; s < S; ++s) nz += mask[(size_t)s * N + i] * mask[(size_t)s * N + j];
+  if (nzbuf) {
+    nz = nzbuf[ij];
+  } else {
+    int i = (int)(ij / N), j = (int)(ij % N);
+    for (int s = 0; s < S; ++s) nz += mask[(size_t)s * N + i] * mask[(size_t)s * N + j];
+  }
   float v = __bfloat162float(fwd ? out[t] : src[t]) / (OPM_EPS + nz);
   out[t] = __float2bfloat16(v);
 }
@@ -266,15 +271,15 @@ struct Opm {
   // mean's own output is the pair) and writes the msa gradient, which is f32.
   template <class DT>
   void backward(const DT* dout, const __nv_bfloat16* msa, const float* mask,
-                float* dmsa) {
+                float* dmsa, const float* nzbuf = nullptr) {
     // normDivK already takes a separate source for the backward direction, so a
     // bf16 cotangent goes straight in -- no copy and no narrowing pass, just
     // the divide reading dp and writing dT.
     if constexpr (std::is_same<DT, __nv_bfloat16>::value) {
-      normDivK<<<(Mp * CZ + 255) / 256, 256, 0, st>>>(dT, mask, N, S, false, dout);
+      normDivK<<<(Mp * CZ + 255) / 256, 256, 0, st>>>(dT, mask, N, S, false, dout, nzbuf);
     } else {
       f32ToBf16K<<<(Mp * CZ + 255) / 256, 256, 0, st>>>(dout, dT, Mp * CZ);
-      normDivK<<<(Mp * CZ + 255) / 256, 256, 0, st>>>(dT, mask, N, S, false, dT);
+      normDivK<<<(Mp * CZ + 255) / 256, 256, 0, st>>>(dT, mask, N, S, false, dT, nzbuf);
     }
     bmm(cub, false, true, N, S * O, (int)((size_t)N * CZ), dT,
         (int)((size_t)N * CZ), 0, T, (int)((size_t)N * CZ), 0, dLb, S * O, 0, 1);

@@ -183,9 +183,10 @@ struct Recycle {
 
   // adds all three terms in place
   void forward(const int32_t* aatype, const int32_t* n,
-               float* pair, float* msa) {
+               float* pair, float* msa, bool is_zero = false) {
+    const bool zero = prev_zero || is_zero;
     const size_t nn = (size_t)N * N, np = nn * 128;
-    if (prev_zero) {
+    if (zero) {
       // prev_pos is zero -> the distogram is zero -> the gemm is zero and
       // the Linear's bias is the whole term.  See the header.
       accBroadcastRoundedK<<<(int)((np + 255) / 256), 256, 0, st>>>(
@@ -206,7 +207,7 @@ struct Recycle {
     (void)one;
     }
 
-    if (prev_zero) {
+    if (zero) {
       accBroadcastRoundedK<<<(int)((np + 255) / 256), 256, 0, st>>>(
           pair, o_pair, 128, np);
     } else {
@@ -218,7 +219,7 @@ struct Recycle {
     roundBf16K<<<(int)((np + 255) / 256), 256, 0, st>>>(pair, np);
 
     const size_t nm = (size_t)N * 256;
-    if (prev_zero) {
+    if (zero) {
       accBroadcastRoundedK<<<(int)((nm + 255) / 256), 256, 0, st>>>(
           msa, o_msa, 256, nm);
     } else {

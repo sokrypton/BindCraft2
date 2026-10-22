@@ -71,6 +71,7 @@ struct TplBlock {
     for (auto q : {&p2b, &p3b, &p4b, &p5b, &p6b, &dp})
       CU(cudaMalloc(q, np * 2));
     CU(cudaMalloc(&ddrop, np * 2));
+    tmo.need_out = tmi.need_out = false;
     tmo.alloc(N, true);
     tmi.alloc(N, false);
     tas.alloc(N, false); tas.allocOrientation();
@@ -184,37 +185,42 @@ struct TplBlock {
   // running the wrong one.
   bool attn_first = false;
 
-  void forward(const __nv_bfloat16* pair, const float* pair_mask) {
+  void forward(const __nv_bfloat16* pair, const float* pair_mask,
+               bool keepBwd = true, bool tail = true, bool haveMaskT = false) {
     size_t np = (size_t)N * N * CZ;
     int gp = (int)((np + 255) / 256);
     p1b = pair;
-    if (attn_first) { forwardAttnFirst(pair_mask, np, gp); return; }
-    tmo.forward(p1b, pair_mask);
+    if (attn_first) { forwardAttnFirst(pair_mask, np, gp, haveMaskT); return; }
+    tmo.forward(p1b, pair_mask, /*haveStats*/false, /*fuseOutGate*/true,
+                /*keepGates*/keepBwd);
     if (use_dropout)
-      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p2b, p1b, tmo.out, N, CZ,
+      addDropGateNarrowBK<true><<<gp, 256, 0, st>>>(p2b, p1b, tmo.o, tmo.t2, N, CZ,
           drop_seed, drop_depth, DM_TMO, DROP, np);
     else
-      addNarrowBK<<<gp, 256, 0, st>>>(p2b, p1b, tmo.out, np);
-    tmi.forward(p2b, pair_mask);
+      addGateNarrowBK<<<gp, 256, 0, st>>>(p2b, p1b, tmo.o, tmo.t2, np);
+    tmi.forward(p2b, pair_mask, /*haveStats*/false, /*fuseOutGate*/true,
+                /*keepGates*/keepBwd);
     if (use_dropout)
-      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p3b, p2b, tmi.out, N, CZ,
+      addDropGateNarrowBK<true><<<gp, 256, 0, st>>>(p3b, p2b, tmi.o, tmi.t2, N, CZ,
           drop_seed, drop_depth, DM_TMI, DROP, np);
     else
-      addNarrowBK<<<gp, 256, 0, st>>>(p3b, p2b, tmi.out, np);
-    tas.forward(p3b, pair_mask);
+      addGateNarrowBK<<<gp, 256, 0, st>>>(p3b, p2b, tmi.o, tmi.t2, np);
+    tas.forward(p3b, pair_mask, /*haveFlash*/false, /*haveBias*/false,
+                /*keepFlash*/keepBwd);
     if (use_dropout)
       addDropNarrowBK<true><<<gp, 256, 0, st>>>(p4b, p3b, tas.out, N, CZ,
           drop_seed, drop_depth, DM_TAS, DROP, np);
     else
       addNarrowBK<<<gp, 256, 0, st>>>(p4b, p3b, tas.out, np);
-    tae.forward(p4b, pair_mask);
+    tae.forward(p4b, pair_mask, /*haveFlash*/false, /*haveBias*/false,
+                /*keepFlash*/keepBwd, /*fusedTransposeOut*/true, haveMaskT);
     if (use_dropout)
-      addDropNarrowBK<false><<<gp, 256, 0, st>>>(p5b, p4b, tae.out, N, CZ,
+      addDropNarrowBK<false, true><<<gp, 256, 0, st>>>(p5b, p4b, tae.out, N, CZ,
           drop_seed, drop_depth, DM_TAE, DROP, np);
     else
-      addNarrowBK<<<gp, 256, 0, st>>>(p5b, p4b, tae.out, np);
-    ptr.forward(p5b);
-    addNarrowBK<<<gp, 256, 0, st>>>(p6b, p5b, ptr.out, np);
+      addNarrowBK<true><<<gp, 256, 0, st>>>(p5b, p4b, tae.out, np, N, CZ);
+    ptr.forward(p5b, tail);
+    if (tail) addNarrowBK<<<gp, 256, 0, st>>>(p6b, p5b, ptr.out, np);
   }
 
   // `ct` is the cotangent on p6; `dp` ends up holding the one on p1.  Must
@@ -226,31 +232,35 @@ struct TplBlock {
   // bf16 copy -- which is what makes the aliasing safe.  See block.cuh.
   // the monomer order, forward.  The four modules are the same objects and
   // each reads whatever precedes it; only the chain is rewired.
-  void forwardAttnFirst(const float* pair_mask, size_t np, int gp) {
-    tas.forward(p1b, pair_mask);
+  void forwardAttnFirst(const float* pair_mask, size_t np, int gp, bool haveMaskT = false) {
+    tas.forward(p1b, pair_mask, /*haveFlash*/false, /*haveBias*/false,
+                /*keepFlash*/false);
     if (use_dropout)
       addDropNarrowBK<true><<<gp, 256, 0, st>>>(p2b, p1b, tas.out, N, CZ,
           drop_seed, drop_depth, DM_TAS, DROP, np);
     else
       addNarrowBK<<<gp, 256, 0, st>>>(p2b, p1b, tas.out, np);
-    tae.forward(p2b, pair_mask);
+    tae.forward(p2b, pair_mask, /*haveFlash*/false, /*haveBias*/false,
+                /*keepFlash*/false, /*fusedTransposeOut*/true, haveMaskT);
     if (use_dropout)
-      addDropNarrowBK<false><<<gp, 256, 0, st>>>(p3b, p2b, tae.out, N, CZ,
+      addDropNarrowBK<false, true><<<gp, 256, 0, st>>>(p3b, p2b, tae.out, N, CZ,
           drop_seed, drop_depth, DM_TAE, DROP, np);
     else
-      addNarrowBK<<<gp, 256, 0, st>>>(p3b, p2b, tae.out, np);
-    tmo.forward(p3b, pair_mask);
+      addNarrowBK<true><<<gp, 256, 0, st>>>(p3b, p2b, tae.out, np, N, CZ);
+    tmo.forward(p3b, pair_mask, /*haveStats*/false, /*fuseOutGate*/true,
+                /*keepGates*/false);
     if (use_dropout)
-      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p4b, p3b, tmo.out, N, CZ,
+      addDropGateNarrowBK<true><<<gp, 256, 0, st>>>(p4b, p3b, tmo.o, tmo.t2, N, CZ,
           drop_seed, drop_depth, DM_TMO, DROP, np);
     else
-      addNarrowBK<<<gp, 256, 0, st>>>(p4b, p3b, tmo.out, np);
-    tmi.forward(p4b, pair_mask);
+      addGateNarrowBK<<<gp, 256, 0, st>>>(p4b, p3b, tmo.o, tmo.t2, np);
+    tmi.forward(p4b, pair_mask, /*haveStats*/false, /*fuseOutGate*/true,
+                /*keepGates*/false);
     if (use_dropout)
-      addDropNarrowBK<true><<<gp, 256, 0, st>>>(p5b, p4b, tmi.out, N, CZ,
+      addDropGateNarrowBK<true><<<gp, 256, 0, st>>>(p5b, p4b, tmi.o, tmi.t2, N, CZ,
           drop_seed, drop_depth, DM_TMI, DROP, np);
     else
-      addNarrowBK<<<gp, 256, 0, st>>>(p5b, p4b, tmi.out, np);
+      addGateNarrowBK<<<gp, 256, 0, st>>>(p5b, p4b, tmi.o, tmi.t2, np);
     ptr.forward(p5b);
     addNarrowBK<<<gp, 256, 0, st>>>(p6b, p5b, ptr.out, np);
   }
@@ -263,28 +273,22 @@ struct TplBlock {
       abort();
     }
     size_t np = (size_t)N * N * CZ;
-    CU(cudaMemcpyAsync(dp, ct, np * 2, cudaMemcpyDeviceToDevice, st));
+    if (ct != dp) CU(cudaMemcpyAsync(dp, ct, np * 2, cudaMemcpyDeviceToDevice, st));
     ptr.backward(dp, p5b, dp, /*acc*/true);
     if (use_dropout) {
-      dropScaleBK<false><<<(np + 255) / 256, 256, 0, st>>>(ddrop, dp, N, CZ,
+      dropScaleBK<false, true><<<(np + 255) / 256, 256, 0, st>>>(ddrop, dp, N, CZ,
           drop_seed, drop_depth, DM_TAE, DROP, np);
-      tae.backward(ddrop, p4b, pair_mask, dp, /*acc*/true);
+      tae.backward(ddrop, p4b, pair_mask, dp, /*acc*/true, /*alreadyTransposed*/true);
     } else tae.backward(dp, p4b, pair_mask, dp, /*acc*/true);
     if (use_dropout) {
       dropScaleBK<true><<<(np + 255) / 256, 256, 0, st>>>(ddrop, dp, N, CZ,
           drop_seed, drop_depth, DM_TAS, DROP, np);
       tas.backward(ddrop, p3b, pair_mask, dp, /*acc*/true);
     } else tas.backward(dp, p3b, pair_mask, dp, /*acc*/true);
-    if (use_dropout) {
-      dropScaleBK<true><<<(np + 255) / 256, 256, 0, st>>>(ddrop, dp, N, CZ,
-          drop_seed, drop_depth, DM_TMI, DROP, np);
-      tmi.backward(ddrop, p2b, pair_mask, dp, /*acc*/true);
-    } else tmi.backward(dp, p2b, pair_mask, dp, /*acc*/true);
-    if (use_dropout) {
-      dropScaleBK<true><<<(np + 255) / 256, 256, 0, st>>>(ddrop, dp, N, CZ,
-          drop_seed, drop_depth, DM_TMO, DROP, np);
-      tmo.backward(ddrop, p1b, pair_mask, dp, /*acc*/true);
-    } else tmo.backward(dp, p1b, pair_mask, dp, /*acc*/true);
+    tmi.backward(dp, p2b, pair_mask, dp, /*acc*/true,
+                 use_dropout ? drop_seed : nullptr, drop_depth, DM_TMI, DROP);
+    tmo.backward(dp, p1b, pair_mask, dp, /*acc*/true,
+                 use_dropout ? drop_seed : nullptr, drop_depth, DM_TMO, DROP);
   }
 };
 

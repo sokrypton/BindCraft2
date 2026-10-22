@@ -986,10 +986,21 @@ __global__ void dOutGateK(const __nv_bfloat16* __restrict__ dout,
                           const __nv_bfloat16* __restrict__ o,
                           const gt2_t* __restrict__ t2,
                           __nv_bfloat16* __restrict__ dO,
-                          __nv_bfloat16* __restrict__ dt2pre, size_t n) {
+                          __nv_bfloat16* __restrict__ dt2pre, size_t n,
+                          const uint32_t* __restrict__ seedp = nullptr,
+                          uint32_t depth = 0, uint32_t mod = 0,
+                          float rate = 0.f, int N = 0, size_t p0 = 0) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  float g = __bfloat162float(dout[i]), s = gt2Load(t2[i]);
+  float g = __bfloat162float(dout[i]);
+  if (seedp) {
+    size_t gi = p0 * C + i;
+    int c = (int)(gi % C);
+    int col = (int)((gi / C) % N);
+    uint32_t idx = (uint32_t)(col * C + c);
+    g = __bfloat162float(__float2bfloat16(g * dropScale(seedp, depth, mod, idx, rate)));
+  }
+  float s = gt2Load(t2[i]);
   dO[i] = __float2bfloat16(g * s);
   // d/d(pre_gl) of out = o * sigmoid(pre_gl)
   dt2pre[i] = __float2bfloat16(g * __bfloat162float(o[i]) * s * (1.f - s));
@@ -1515,7 +1526,9 @@ struct TriMul {
   // for the next one.  Both optional -- a standalone gate passes neither.
   template <class DT>
   void backward(const DT* dout, const __nv_bfloat16* pair, const float* mask,
-                DT* dpair, bool acc = false) {
+                DT* dpair, bool acc = false,
+                const uint32_t* drop_seed = nullptr, uint32_t drop_depth = 0,
+                uint32_t drop_mod = 0, float drop_rate = 0.f) {
     dim3 bt(TILE, 8);
     // LOOP ONE, mirroring the forward's: the output gate's backward, the
     // output projection's, and the centre LayerNorm's.  `dO`, `dcnT`/`dcn`
@@ -1536,7 +1549,9 @@ struct TriMul {
     }
     PROF_STEP("tm.b dOutGate",
       dOutGateK<<<(pc + 255) / 256, 256, 0, st>>>(dxin, o + p0 * C, t2 + p0 * C,
-                                                  dO, dt2pre + p0 * C, pc));
+                                                  dO, dt2pre + p0 * C, pc,
+                                                  drop_seed, drop_depth,
+                                                  drop_mod, drop_rate, N, p0));
     // CHANNEL-MAJOR STRAIGHT OUT OF THE GEMM.  centerLnBwdK reads its
     // cotangent as [I][M], to match `t`, and that used to be arranged by
     // writing dcn [M][I] and transposing it through HBM -- 33.6 MB each way,
