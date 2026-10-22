@@ -196,9 +196,11 @@ struct StructureModule {
     int gc = (int)((nc + 255) / 256);
     stack.backward(dact, drout, dtout, act0, pairN, dact0, dpairN, drot0,
                    dtrans0, datom, initial, aatype, dinitial);
-    // THE IDENTITY FRAME IS A CONSTANT, so drot0/dtrans0 stop here -- they are
+    // THE STARTING FRAME IS A CONSTANT, so drot0/dtrans0 stop here -- they are
     // computed and discarded, which is the one place in this port where a
-    // gradient is deliberately dropped rather than propagated.
+    // gradient is deliberately dropped rather than propagated.  That holds
+    // for refFrameK's frames too: pass 0 reads the input atoms, and later
+    // passes read prev_pos, which bc2 stop-gradients between recycles.
     // initial_act IS READ TWICE: by the initial projection and by the
     // sidechain.  The stack's backward has already put the sidechain's share
     // in dinitial (or left it untouched when the atoms are off), so the

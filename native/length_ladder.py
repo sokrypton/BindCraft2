@@ -65,10 +65,13 @@ def one(backend, pdb, binder_len, reps=6):
         t = time.perf_counter()
         r = af.sequence_gradients(states, losses, model=MODEL); wait(r)
         ts.append((time.perf_counter() - t) * 1e3)
-    g = jax.tree_util.tree_leaves(r[-1])
+    # sequence_gradients returns (predictions, gradients, loss): [1] is the
+    # gradient.  This read [-1] -- the LOSS -- and printed it as |grad|.
+    g = jax.tree_util.tree_leaves(r[1])
     gn = float(sum((np.asarray(v, np.float64) ** 2).sum() for v in g) ** 0.5)
+    loss = float(np.asarray(r[2]))
     print(f'  {backend:<7} {pdb:<24} binder {binder_len:<4} complex {len(tgt)+binder_len:<5} '
-          f'compile {compile_s:6.2f} s  step {np.median(ts):8.1f} ms  |grad| {gn:.6g}', flush=True)
+          f'compile {compile_s:6.2f} s  step {np.median(ts):8.1f} ms  |grad| {gn:.6g}  loss {loss:.6g}', flush=True)
 
 if __name__ == '__main__':
     backend = sys.argv[1] if len(sys.argv) > 1 else 'native'

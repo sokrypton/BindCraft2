@@ -54,10 +54,12 @@ struct Structure {
   int size() const { return (int)res.size(); }
 };
 
-// one float32 -> float16 -> float32 round trip, round-to-nearest-even,
-// which is what numpy's astype(float16) does
+// one float64 -> float16 -> float32 round trip, round-to-nearest-even and
+// rounded ONCE, which is what numpy's astype(float16) and jnp.asarray(...,
+// float16) do -- going through float32 first can flip a value that sits
+// within a float ulp of a half midpoint
 inline float half2f(double v) {
-  return __half2float(__float2half((float)v));
+  return __half2float(__double2half(v));
 }
 
 inline int atomIndex(const std::string& name) {
