@@ -49,7 +49,11 @@ __global__ void perResidueK(const float* __restrict__ seq,      // [NMAX, A]
                             float* __restrict__ t_mask,         // [NMAX, 37]
                             float* __restrict__ pbeta,          // [NMAX, 3]
                             float* __restrict__ pbeta_mask,     // [NMAX]
-                            int NMAX) {
+                            int NMAX,
+                            // target_flexibility, with the residue index it
+                            // selects by; 0 leaves every template residue whole
+                            const int32_t* __restrict__ ridx = nullptr,
+                            float flex = 0.f) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= NMAX) return;
   const int n = *np;                       // runtime, from device memory
@@ -78,10 +82,23 @@ __global__ void perResidueK(const float* __restrict__ seq,      // [NMAX, A]
 
   // the template side: a residue not flagged TEMPLATE contributes nothing
   const bool is_t = real && (flags[i] & F_TEMPLATE);
-  const int ta = is_t ? am : UNK_TEMPLATE;
+  // TARGET FLEXIBILITY, as bc2's target_template_features builds it: a
+  // template residue that is not designed and that
+  // floor((idx+1)*f) > floor(idx*f) selects -- every 1/f-th by RESIDUE INDEX,
+  // float32 arithmetic as JAX does it -- reads as a GAP (template aatype 21)
+  // and loses its side chain (everything past N, CA, C, CB, O) in the
+  // template mask, while its positions stay.  It used to be applied only on
+  // the C++ driver's host, by PDB number and to the mask alone, and bc2's
+  // fused native call did not apply it here at all: the pair template
+  // constant saw it, the torsion row did not.
+  const bool flexible =
+      is_t && flex > 0.f && ridx && !(flags[i] & F_DESIGN) &&
+      floorf((float)(ridx[i] + 1) * flex) > floorf((float)ridx[i] * flex);
+  const int ta = (is_t && !flexible) ? am : UNK_TEMPLATE;
   t_aatype[i] = ta;
   for (int k = 0; k < ATOM; ++k) {
-    const float mk = is_t ? amask[(size_t)i * ATOM + k] : 0.f;
+    const float mk = (is_t && !(flexible && k > 4)) ? amask[(size_t)i * ATOM + k]
+                                                     : 0.f;
     t_mask[(size_t)i * ATOM + k] = mk;
     for (int c = 0; c < 3; ++c) {
       const size_t o = ((size_t)i * ATOM + k) * 3 + c;
@@ -120,7 +137,8 @@ __global__ void offsetK(const int32_t* __restrict__ ridx,
                         const float* __restrict__ smask,
                         const float* __restrict__ chain_len,
                         const int32_t* __restrict__ np,
-                        int32_t* __restrict__ out, int NMAX) {
+                        int32_t* __restrict__ out, int NMAX,
+                        int mode = 1) {
   const size_t p = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (p >= (size_t)NMAX * NMAX) return;
   const int i = (int)(p / NMAX), j = (int)(p % NMAX);
@@ -133,9 +151,14 @@ __global__ void offsetK(const int32_t* __restrict__ ridx,
   const float cj = ((flags[j] & F_CYCLIC) != 0) * smask[j];
   if (!(same && ci > 0.f && cj > 0.f)) { out[p] = off; return; }
 
+  // bc2's cyclic_sequence_offsets, all three CYCLIC_OFFSET_MODES:
+  //   0 'distance'    the ring distance, signed by the offset
+  //   1 'direction'   ...negated where the short way round is the other way
+  //   2 'neighbours'  direction, and anything past 2 saturates at +-32
   const int ao = off < 0 ? -off : off;
   float cd = fminf((float)ao, chain_len[i] - (float)ao);
-  if (cd < (float)ao) cd = -cd;                     // 'direction'
+  if (mode >= 1 && cd < (float)ao) cd = -cd;
+  if (mode == 2 && fabsf(cd) > 2.f) cd = 32.f * (float)((cd > 0.f) - (cd < 0.f));
   const int sgn = (off > 0) - (off < 0);
   out[p] = (int32_t)lrintf(cd * sgn);
 }

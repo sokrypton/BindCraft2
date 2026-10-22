@@ -1725,6 +1725,7 @@ ffi::Error DesignStepPredictImpl(
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
     std::string_view emb_dir,
+    int64_t cyclic_mode, float flexibility,
     ffi::Result<ffi::Buffer<ffi::F32>> out_atoms,
     ffi::Result<ffi::Buffer<ffi::F32>> out_plddt,
     ffi::Result<ffi::Buffer<ffi::F32>> out_pae,
@@ -1743,6 +1744,10 @@ ffi::Error DesignStepPredictImpl(
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
+  // bc2's cyclic_offset_mode and target_flexibility, this call's -- one
+  // object serves every state, so they are set per call, not per object
+  m->plan.cyclic_mode = (int)cyclic_mode;
+  m->plan.flexibility = flexibility;
 
   design_step::Inputs in{};
   in.sequence = sequence.typed_data();
@@ -1804,6 +1809,7 @@ ffi::Error DesignStepImpl(
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
     std::string_view emb_dir,
+    int64_t cyclic_mode, float flexibility,
     ffi::Result<ffi::Buffer<ffi::F32>> out_atoms,
     ffi::Result<ffi::Buffer<ffi::F32>> out_plddt,
     ffi::Result<ffi::Buffer<ffi::F32>> out_pae,
@@ -1827,6 +1833,10 @@ ffi::Error DesignStepImpl(
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
+  // bc2's cyclic_offset_mode and target_flexibility, this call's -- one
+  // object serves every state, so they are set per call, not per object
+  m->plan.cyclic_mode = (int)cyclic_mode;
+  m->plan.flexibility = flexibility;
 
   design_step::Inputs in{};
   in.sequence = sequence.typed_data();
@@ -1926,6 +1936,7 @@ ffi::Error DesignStepBwdImpl(
     std::string_view trunk_dir, std::string_view extra_dir,
     std::string_view tpl_dir, std::string_view post_dir,
     std::string_view emb_dir,
+    int64_t cyclic_mode, float flexibility,
     ffi::Result<ffi::Buffer<ffi::F32>> d_sequence) {
   const int NMAX = (int)sequence.dimensions()[0];
   inputfeat::Tables t{t14m.typed_data(), t37m.typed_data(),
@@ -1937,6 +1948,10 @@ ffi::Error DesignStepBwdImpl(
           std::string(emb_dir)};
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
+  // bc2's cyclic_offset_mode and target_flexibility, this call's -- one
+  // object serves every state, so they are set per call, not per object
+  m->plan.cyclic_mode = (int)cyclic_mode;
+  m->plan.flexibility = flexibility;
 
   design_step::Inputs in{};
   in.sequence = sequence.typed_data();
@@ -2034,6 +2049,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("tpl_dir")
         .Attr<std::string_view>("post_dir")
         .Attr<std::string_view>("emb_dir")
+        .Attr<int64_t>("cyclic_mode").Attr<float>("flexibility")
         .Ret<ffi::Buffer<ffi::F32>>());
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
@@ -2056,6 +2072,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("tpl_dir")
         .Attr<std::string_view>("post_dir")
         .Attr<std::string_view>("emb_dir")
+        .Attr<int64_t>("cyclic_mode").Attr<float>("flexibility")
         // EIGHT results, not twelve: no carry.
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
@@ -2082,6 +2099,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<std::string_view>("tpl_dir")
         .Attr<std::string_view>("post_dir")
         .Attr<std::string_view>("emb_dir")
+        .Attr<int64_t>("cyclic_mode").Attr<float>("flexibility")
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()
         .Ret<ffi::Buffer<ffi::F32>>().Ret<ffi::Buffer<ffi::F32>>()

@@ -169,6 +169,13 @@ struct Plan {
   // What is NOT covered: the monomer TEMPLATE embedder, which really is a
   // different module, so a monomer step must run with templates off.
   bool monomer = false;
+  // APPENDED, as DsKey's fields are: an aggregate initialiser that names
+  // members in order would shift past an insertion without a word.
+  // bc2's cyclic_offset_mode (0 distance, 1 direction, 2 neighbours) and
+  // target_flexibility -- per CALL, set by whoever calls: one object serves
+  // every state and the desperation ladder moves the flexibility mid-run
+  int cyclic_mode = 1;
+  float flexibility = 0.f;
 };
 
 // ffi.cu keeps its own bf16ToF32OutK next to the custom calls; a header
@@ -853,12 +860,12 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   inputfeat::perResidueK<<<g1, 128, 0, st>>>(
       feat, in.atoms, in.atom_mask, in.flags, in.seq_mask, tables, in.n,
       aatype, a14e, a37e, a14_37, a37_14, t_aatype, t_pos, t_mask,
-      pbeta, pbeta_m, N);
+      pbeta, pbeta_m, N, in.residue_index, plan.flexibility);
   inputfeat::chainLenK<<<N, 32, 0, st>>>(
       in.asym_id, in.seq_mask, in.n, chain_len, N);
   inputfeat::offsetK<<<gn, 128, 0, st>>>(
       in.residue_index, in.asym_id, in.flags, in.seq_mask, chain_len, in.n,
-      offset, N);
+      offset, N, plan.cyclic_mode);
   inputfeat::msaFeatK<<<(int)(((size_t)N * inputfeat::MSA + 127) / 128),
                         128, 0, st>>>(feat, prof, in.n, msa_feat, N);
 

@@ -306,6 +306,12 @@ def _native_one_object() -> bool:
     return os.environ.get('NB_ONE_OBJECT', '1') not in ('0', '')
 
 
+def _native_cyclic_mode(mode: str) -> int:
+    """bc2's cyclic_offset_mode as the native step numbers it."""
+    from .af.native_step import CYCLIC_MODES
+    return CYCLIC_MODES[mode]
+
+
 def _native_step_off() -> bool:
     """BC2_NATIVE_DISABLE=step: run the staged native path, not the fused one."""
     from .af import native as _bcn
@@ -510,7 +516,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         # first in dict order and kill the process on the next longer one:
         # `design_step: setN(544) past the allocation's 512`, exit(1).
         # States iterate in dict order, which says nothing about length.
-        if self.native_installed and not _native_step_off() and _native_predict_on():
+        if self.native_installed and not _native_step_off() and _native_predict_on() and not self.large_complex_initialization:
             from .af.native_step import pad_to_tile as _pad_to, set_alloc_floor
             # AND THE FLOOR IS THE DESIGN PATH'S LENGTH, not this one's.
             # The two pad differently: sequence_gradients pads each DESIGN
@@ -554,7 +560,7 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             entity_id = jnp.pad(entity_id, [0, padding_length], constant_values=len(chain_names))
             interface_asym_id = jnp.pad(interface_asym_id, [0, padding_length], constant_values=len(chain_names))
             seq_mask = jnp.pad(seq_mask, [0, padding_length])
-        native_predict = self.native_installed and not _native_step_off() and _native_predict_on()
+        native_predict = self.native_installed and not _native_step_off() and _native_predict_on() and not self.large_complex_initialization
         if native_predict:
             # upstream's `compile_only` warms a shape for the XLA path; the
             # native step has no such shape to warm, so a warm-up call here
@@ -610,7 +616,11 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                 # that a campaign's predict is free would be false.  It
                 # takes self.dropout, exactly as the gradient path does, and
                 # seed[1] = 0 above is what actually keeps the masks away.
-                dropout=bool(self.dropout))
+                dropout=bool(self.dropout),
+                # the two model inputs the call computes itself from its
+                # arguments -- see native_step._call
+                cyclic_mode=_native_cyclic_mode(self.cyclic_offset_mode),
+                flexibility=float(self.target_flexibility))
             positions, mask = _out.atoms, _out.atom_mask
             metrics = {'plddt': _out.plddt, 'pae': _out.pae, 'ptm': _out.ptm, 'iptm': _out.iptm, 'iptm_per_residue': _out.iptm_per_residue, 'experimentally_resolved_ca': _out.experimentally_resolved_ca, 'distogram': _out.distogram}
         else:
@@ -690,7 +700,13 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
             # weights_from_params writes a manifest to disk and must not
             # run under a trace.
             native_step_dirs = None
-            if self.native_installed and not _native_step_off():
+            # NOT WITH INITIAL POSITIONS.  large_complex_initialization hands
+            # the structure module `initial_atom_pos`, and the one-call step
+            # has no such input: it ran without them, silently, and the
+            # prediction did not move at all (the stock path moves ~11 A on
+            # hPDL1).  The staged path keeps the stock structure module.
+            if (self.native_installed and not _native_step_off()
+                    and not self.large_complex_initialization):
                 from .af import native as _bcn
                 _p = self.model_parameters[model]
                 native_step_dirs = {
@@ -874,7 +890,9 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
                         weight_dirs=native_step_dirs,
                         # CAN it drop: whether the stacks reserve their mask
                         # scratches, decided once when the step is built.
-                        dropout=bool(self.dropout))
+                        dropout=bool(self.dropout),
+                        cyclic_mode=_native_cyclic_mode(self.cyclic_offset_mode),
+                        flexibility=float(self.target_flexibility))
                     predicted_atom_positions = _out.atoms[:_n]
                     predicted_atom_mask = _out.atom_mask[:_n]
                     metrics = {'plddt': _out.plddt[:_n],

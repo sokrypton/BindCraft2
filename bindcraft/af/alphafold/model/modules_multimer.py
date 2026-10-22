@@ -110,6 +110,12 @@ def _native_post_trunk(representations, batch, config, safe_key):
   import jax.numpy as jnp
   from . import all_atom_multimer
 
+  # INITIAL POSITIONS (large_complex_initialization) start the structure
+  # module from the given frames; the native module starts from identity.
+  # It used to run anyway -- the prediction did not move at all where the
+  # stock module moves ~11 A on hPDL1.
+  if 'initial_atom_pos' in batch:
+    return None
   single, pair = representations['single'], representations['pair']
   aatype, seq_mask = batch['aatype'], batch['seq_mask']
   heads_cfg = config.heads

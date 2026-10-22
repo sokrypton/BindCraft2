@@ -116,7 +116,7 @@ def _step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
 
 
 def _call(name, result, args, cfg, **extra):
-    recycles, msa_rows, dropout, dirs = cfg
+    recycles, msa_rows, dropout, dirs, cyclic_mode, flexibility = cfg
     d = dict(dirs)
     return jax.ffi.ffi_call(name, result)(
         *args, **extra,
@@ -130,7 +130,13 @@ def _call(name, result, args, cfg, **extra):
         # buffers is not.
         dropout=np.int64(dropout),
         trunk_dir=d['trunk'], extra_dir=d['extra'],
-        tpl_dir=d['tpl'], post_dir=d['post'], emb_dir=d['emb'])
+        tpl_dir=d['tpl'], post_dir=d['post'], emb_dir=d['emb'],
+        # bc2's cyclic_offset_mode and target_flexibility, which the step
+        # applies itself: the offsets the embedder reads, and the template
+        # aatype and mask of the torsion row.  The call used to take
+        # neither, so a 'neighbours' campaign got 'direction' and a flexible
+        # target kept its side chains in the torsion row -- silently.
+        cyclic_mode=np.int64(cyclic_mode), flexibility=np.float32(flexibility))
 
 
 def _step_fwd(sequence, atoms, atom_mask, flags, residue_index, asym_id,
@@ -139,7 +145,7 @@ def _step_fwd(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     nmax = sequence.shape[0]
     args = (sequence, atoms, atom_mask, flags, residue_index, asym_id,
             entity_id, interface_asym_id, seq_mask, act_const, length, seed)
-    recycles, msa_rows, _, _ = cfg
+    recycles, msa_rows = cfg[0], cfg[1]
     out = _call('native_design_step', _out_shapes(nmax, msa_rows),
                 args + _tables() + (scalars,), cfg)
     # THE RESIDUAL IS THE INPUT, never the forward's device-side state.  A
@@ -324,8 +330,8 @@ def pad_to_tile(n):
 def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                 entity_id, interface_asym_id, seq_mask, act_const, length,
                 seed, *, softmax_weight, one_hot_weight, temperature,
-                logit_scale, recycles, msa_rows, weight_dirs, dropout=True
-                ) -> DesignStepOutputs:
+                logit_scale, recycles, msa_rows, weight_dirs, dropout=True,
+                cyclic_mode=1, flexibility=0.0) -> DesignStepOutputs:
     """One call, sequence to the nine arrays boundary.py lists.
 
     `length` is a VALUE -- a device buffer holding one int32 -- and not a
@@ -348,7 +354,8 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
     # back through it to f16 on its own.
     sequence = jnp.asarray(sequence, F32)
     cfg = (recycles, msa_rows, int(bool(dropout)),
-           tuple(sorted(weight_dirs.items())))
+           tuple(sorted(weight_dirs.items())), int(cyclic_mode),
+           float(flexibility))
     scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
                          jnp.asarray(one_hot_weight, F32),
                          jnp.asarray(temperature, F32),
@@ -397,8 +404,8 @@ def design_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
 def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                  entity_id, interface_asym_id, seq_mask, act_const, length,
                  seed, *, softmax_weight, one_hot_weight, temperature,
-                 logit_scale, recycles, msa_rows, weight_dirs, dropout=False
-                 ) -> DesignStepOutputs:
+                 logit_scale, recycles, msa_rows, weight_dirs, dropout=False,
+                 cyclic_mode=1, flexibility=0.0) -> DesignStepOutputs:
     """One call, sequence to the same nine arrays -- with no gradient.
 
     The operand contract is the design step's, exactly: the two handlers
@@ -411,7 +418,8 @@ def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
                           weight_dirs)
     sequence = jnp.asarray(sequence, F32)
     cfg = (recycles, msa_rows, int(bool(dropout)),
-           tuple(sorted(weight_dirs.items())))
+           tuple(sorted(weight_dirs.items())), int(cyclic_mode),
+           float(flexibility))
     scalars = jnp.stack([jnp.asarray(softmax_weight, F32),
                          jnp.asarray(one_hot_weight, F32),
                          jnp.asarray(temperature, F32),
@@ -432,3 +440,7 @@ def predict_step(sequence, atoms, atom_mask, flags, residue_index, asym_id,
         atoms=pos.astype(jnp.float16), atom_mask=mask37 > 0,
         plddt=plddt, pae=pae, ptm=ptm, iptm=iptm, iptm_per_residue=iptm_pr,
         experimentally_resolved_ca=expres, distogram=dgram)
+
+
+# bc2's CYCLIC_OFFSET_MODES as the step numbers them (inputfeat::offsetK)
+CYCLIC_MODES = {'distance': 0, 'direction': 1, 'neighbours': 2}
