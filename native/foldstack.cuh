@@ -47,16 +47,20 @@ struct FoldStack {
     // sidechain and the atom builder get buffers at all
     if (do_atoms) it[depth - 1].do_atoms = true;
     for (auto& f : it) f.pos_scale = pos_scale;
-    for (auto& f : it) f.alloc(N, s);
+    for (int i = 0; i < depth; ++i) it[i].alloc(N, s, i ? &it[0] : nullptr);
     rot.resize(depth + 1); trans.resize(depth + 1);
     // rot[0]/trans[0] are the caller's and are never written
     for (int i = 1; i <= depth; ++i) {
       CU(cudaMalloc(&rot[i], (size_t)N * 9 * 4));
       CU(cudaMalloc(&trans[i], (size_t)N * 3 * 4));
     }
-    CU(cudaMalloc(&dact, (size_t)N * C * 4));
-    CU(cudaMalloc(&drotS, (size_t)N * 9 * 4));
-    CU(cudaMalloc(&dtransS, (size_t)N * 3 * 4));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dact, (size_t)N * C * 4));
+      CU(cudaMalloc(&drotS, (size_t)N * 9 * 4));
+      CU(cudaMalloc(&dtransS, (size_t)N * 3 * 4));
+    } else {
+      dact = drotS = dtransS = nullptr;
+    }
   }
 
   void setStream(cudaStream_t s) {
@@ -100,7 +104,7 @@ struct FoldStack {
     trans[0] = const_cast<float*>(trans0);
     for (int i = 0; i < depth; ++i)
       it[i].forward(actIn(i, act), pair, mask, rot[i], trans[i], rot[i + 1],
-                    trans[i + 1], initial, aatype);
+                    trans[i + 1], initial, aatype, /*reuse_a2d=*/i > 0);
   }
 
   float* outAtom() { return it[depth - 1].at.out; }

@@ -269,11 +269,18 @@ __global__ void dGateK(const __nv_bfloat16* __restrict__ dag,
 __global__ void gateFromAvK(const half* __restrict__ avH,
                             const half* __restrict__ qkvg,
                             __nv_bfloat16* __restrict__ ag, size_t M) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= M * C) return;
-  size_t ij = i / C; int c = i % C;
-  float g = sigmoidf(__half2float(qkvg[ij * QKVG + 3 * C + c]));
-  ag[i] = __float2bfloat16(__half2float(avH[i]) * g);
+  size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i2 >= M * (C / 2)) return;
+  size_t ij = i2 / (C / 2);
+  int c = (int)(i2 % (C / 2)) * 2;
+  size_t i = i2 * 2;
+  half2 g2 = *(const half2*)(qkvg + ij * QKVG + 3 * C + c);
+  half2 av2 = *(const half2*)(avH + i);
+  float g0 = sigmoidf(__half2float(g2.x));
+  float g1 = sigmoidf(__half2float(g2.y));
+  *(__nv_bfloat162*)(ag + i) =
+      __floats2bfloat162_rn(__half2float(av2.x) * g0,
+                            __half2float(av2.y) * g1);
 }
 
 // ------------------------------------------------- the ending node's transpose
@@ -445,6 +452,7 @@ static const int LDS = C + 8;
 __global__ void TA_LB(32 * WS) scatterDxK(
     const __nv_bfloat16* __restrict__ dcomb, const float* __restrict__ dK,
     const float* __restrict__ dV, const float* __restrict__ dnbb,
+    const long long* __restrict__ dnbbI,
     const __nv_bfloat16* __restrict__ wcatT, __nv_bfloat16* __restrict__ dx,
     size_t M) {
   extern __shared__ char smem[];
@@ -493,11 +501,7 @@ __global__ void TA_LB(32 * WS) scatterDxK(
       int row = i / (C / 4), c = (i % (C / 4)) * 4;
       const __nv_bfloat16* src = dcomb + (size_t)(r0 + row) * TOT + off + c;
       __nv_bfloat16* dst = tile + (size_t)row * LDS + c;
-#pragma unroll
-      for (int w = 0; w < 2; ++w)
-        *(__nv_bfloat162*)(dst + 2 * w) =
-            row < nrow ? *(const __nv_bfloat162*)(src + 2 * w)
-                       : __floats2bfloat162_rn(0.f, 0.f);
+      *(uint2*)dst = row < nrow ? *(const uint2*)src : make_uint2(0u, 0u);
     }
   };
   auto fromF32 = [&](const float* src, __nv_bfloat16* tile, bool wait) {
@@ -506,11 +510,9 @@ __global__ void TA_LB(32 * WS) scatterDxK(
       int row = i / (C / 4), c = (i % (C / 4)) * 4;
       const float* sp = src + (size_t)(r0 + row) * C + c;
       __nv_bfloat16* dst = tile + (size_t)row * LDS + c;
-#pragma unroll
-      for (int w = 0; w < 2; ++w) {
-        float2 v = row < nrow ? *(const float2*)(sp + 2 * w) : make_float2(0.f, 0.f);
-        *(__nv_bfloat162*)(dst + 2 * w) = __floats2bfloat162_rn(v.x, v.y);
-      }
+      float4 v = row < nrow ? *(const float4*)sp : make_float4(0.f, 0.f, 0.f, 0.f);
+      *(__nv_bfloat162*)(dst) = __floats2bfloat162_rn(v.x, v.y);
+      *(__nv_bfloat162*)(dst + 2) = __floats2bfloat162_rn(v.z, v.w);
     }
   };
 
@@ -525,7 +527,7 @@ __global__ void TA_LB(32 * WS) scatterDxK(
     TA_CONTRACT(tile, 0, C);  TA_CONTRACT(t1, C, C);
     TA_CONTRACT(t2, 2 * C, C); TA_CONTRACT(t3, 3 * C, C);
   } else {
-    fromComb(0, tile, true);     TA_CONTRACT(tile, 0, C);
+    fromComb(0, tile, false);    TA_CONTRACT(tile, 0, C);
     fromF32(dK, tile, true);     TA_CONTRACT(tile, C, C);
     fromF32(dV, tile, true);     TA_CONTRACT(tile, 2 * C, C);
     fromComb(3 * C, tile, true); TA_CONTRACT(tile, 3 * C, C);
@@ -535,9 +537,12 @@ __global__ void TA_LB(32 * WS) scatterDxK(
   __syncthreads();
   for (int i = tid; i < BMS * 16; i += 32 * WS) {
     int row = i / 16, c = i % 16;
-    tile[(size_t)row * LDS + c] =
-        (row < nrow && c < H) ? __float2bfloat16(dnbb[(size_t)c * M + r0 + row])
-                              : __float2bfloat16(0.f);
+    float v = 0.f;
+    if (row < nrow && c < H) {
+      size_t idx = (size_t)c * M + r0 + row;
+      v = dnbbI ? (float)dnbbI[idx] * (1.0f / 1099511627776.0f) : dnbb[idx];
+    }
+    tile[(size_t)row * LDS + c] = __float2bfloat16(v);
   }
   TA_CONTRACT(tile, QKVG, 16);
 #undef TA_CONTRACT
@@ -847,8 +852,8 @@ struct TriAttn {
     const size_t mcChunk = (size_t)taRows * N * C;
     return {
       {(void**)&ag, chunkRows * N * C * 2}, {(void**)&out, mc * 2},
-      {(void**)&dcomb, chunkRows * N * TOT * 2}, {(void**)&dx, mc * 2},
-      {(void**)&dag, chunkRows * N * C * 2},
+      {(void**)&dcomb, dcomb ? chunkRows * N * TOT * 2 : 0}, {(void**)&dx, dx ? mc * 2 : 0},
+      {(void**)&dag, dag ? chunkRows * N * C * 2 : 0},
       {(void**)&xh, mcChunk * sizeof(half)},
       {(void**)&nbbMH, (size_t)M * H * sizeof(half)},
       {(void**)&qkvgH, (size_t)(qkvg_chunked ? taRows : N) * N * 4 * C * sizeof(half)},
@@ -856,16 +861,16 @@ struct TriAttn {
       {(void**)&outH, mcChunk * sizeof(half)},
       {(void**)&avH, mc * sizeof(half)},
       {(void**)&lseF, (size_t)N * H * N * sizeof(float)},
-      {(void**)&davH, chunkRows * N * C * sizeof(half)},
-      {(void**)&dKf, (size_t)taRows * N * C * 4},
-      {(void**)&dVf, (size_t)taRows * N * C * 4},
-      {(void**)&lseD, (size_t)N * H * N * 4},
-      {(void**)&dnbbF, (size_t)H * M * 4},
+      {(void**)&davH, davH ? chunkRows * N * C * sizeof(half) : 0},
+      {(void**)&dKf, dKf ? (size_t)taRows * N * C * 4 : 0},
+      {(void**)&dVf, dVf ? (size_t)taRows * N * C * 4 : 0},
+      {(void**)&lseD, lseD ? (size_t)N * H * N * 4 : 0},
+      {(void**)&dnbbF, dnbbF ? (size_t)H * M * 4 : 0},
       {(void**)&dnbbI, dnbbI ? (size_t)H * M * 8 : 0},
       {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
       {(void**)&pairT, 0},
       {(void**)&outT, 0},
-      {(void**)&maskT, ending ? (size_t)M * 4 : 0},
+      {(void**)&maskT, (ending && maskT) ? (size_t)M * 4 : 0},
     };
   }
 
@@ -881,11 +886,7 @@ struct TriAttn {
     }
     for (size_t i = 0; i < mine.size(); ++i) {
       if (!mine[i].second || !theirs[i].second) continue;
-      if (theirs[i].second < mine[i].second) {
-        fprintf(stderr, "%s: scratch[%zu] donor has %zu bytes, needs %zu\n",
-                who, i, theirs[i].second, mine[i].second);
-        exit(1);
-      }
+      if (theirs[i].second < mine[i].second) continue;
       if (*mine[i].first) CU(cudaFree(*mine[i].first));
       *mine[i].first = *theirs[i].first;
     }
@@ -904,7 +905,7 @@ struct TriAttn {
   // ending instance has it.  186 MB at N=256.
   void adoptBackwardScratch(const TriAttn& o) {
     for (void* p : {(void*)dcomb, (void*)dag, (void*)dx, (void*)davH,
-                    (void*)dKf, (void*)dVf, (void*)dnbbF})
+                    (void*)dKf, (void*)dVf, (void*)dnbbF, (void*)dnbbI})
       if (p) CU(cudaFree(p));
     dcomb = o.dcomb; dag = o.dag; dx = o.dx; davH = o.davH;
     dKf = o.dKf; dVf = o.dVf; dnbbF = o.dnbbF; dnbbI = o.dnbbI;
@@ -1131,7 +1132,7 @@ struct TriAttn {
       } else {
         // outH was never written this pass, so rebuild the gated output from avH
         PROF_STEP("ta.f gateFromAv",
-          gateFromAvK<<<(mcc + 255) / 256, 256, 0, st>>>(
+          gateFromAvK<<<(mcc / 2 + 255) / 256, 256, 0, st>>>(
               avH + (size_t)cr0 * N * C, qkvgAt(cr0), ag, Mc));
       }
       PROF_STEP("ta.f gemm out",
@@ -1196,12 +1197,11 @@ struct TriAttn {
     // 26.3 ms.  A float4 zeroing kernel (TA_ZEROK=1, zeroFast in common.cuh)
     // is 3.6 ms FASTER standalone and 3.4 ms SLOWER in the model -- see the
     // README.  The model is what ships.
+    const bool probe = envOn("NO_DKV") || envOn("NO_DNBB") || envOn("TA_ZEROK");
     if (!envOn("PROBE_NOZERO")) {
       if (!envOn("TA_ZEROK")) {
-        // dKf/dVf are zeroed per chunk inside the loop now; dnbb is not --
-        // it sums over every row and must survive the whole loop.
-        CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * M * 4, st));
         if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
+        else       CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * M * 4, st));
       } else {
         zeroFast(dnbbF, (size_t)H * M * 4, st);
         if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
@@ -1345,7 +1345,8 @@ struct TriAttn {
         }
       }
     // fixed point -> float, once, in a kernel nothing else races with
-    if (dnbbI)
+    // (when scatterDxK runs below, it reads and zeros dnbbI directly)
+    if (dnbbI && (taRows < N || envOn("TA_SPLIT") || probe))
       TA_FB::nbbFromFixedK<<<(int)(((size_t)H * M + 255) / 256), 256, 0, st>>>(
           dnbbI, dnbbF, (size_t)H * M);
     }
@@ -1356,6 +1357,8 @@ struct TriAttn {
       PROF_STEP("ta.b nbbAddDx",
         nbbAddDxK<<<(size_t)(mc + 255) / 256, 256, 0, st>>>(
             dnbbF, wcat, dx, M, H, C, TOT, QKVG));
+      if (!dnbbI && !envOn("PROBE_NOZERO"))
+        CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * M * 4, st));
     } else
     // TA_SPLIT runs the old scatter-then-GEMM pair, which is the A/B this was
     // decided on and the fallback if a card ever disagrees.
@@ -1379,7 +1382,8 @@ struct TriAttn {
       }
       PROF_STEP("ta.b scatterDx",
         scatterDxK<<<(size_t)(M + BMS - 1) / BMS, 32 * WS, scatterDxSmem(), st>>>(
-            dcomb, dKf, dVf, dnbbF, TA_FRAGPERM ? wcatS : wcatT, dx, M);
+            dcomb, dKf, dVf, dnbbF, probe ? nullptr : dnbbI,
+            TA_FRAGPERM ? wcatS : wcatT, dx, M);
         CU(cudaGetLastError()));
     }
     PROF_STEP("ta.b lnBwd",

@@ -512,7 +512,7 @@ struct IPA {
   float *drotS = nullptr, *dtransS = nullptr;
   float *wcat = nullptr, *bcat = nullptr, *projbuf = nullptr;
 
-  void alloc(int N_, cudaStream_t s = nullptr) {
+  void alloc(int N_, cudaStream_t s = nullptr, IPA* donor = nullptr) {
     N = N_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
@@ -521,42 +521,66 @@ struct IPA {
     // whose output feeds a squared distance.
     CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
     size_t n = N;
-    CU(cudaMalloc(&qs, n * H * QK * 4));
-    CU(cudaMalloc(&ks, n * H * QK * 4));
-    CU(cudaMalloc(&vs, n * H * SV * 4));
-    CU(cudaMalloc(&qpl, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&kpl, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&vpl, n * H * PV * 3 * 4));
-    CU(cudaMalloc(&qpg, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&kpg, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&vpg, n * H * PV * 3 * 4));
+    if (donor && nblean::on()) {
+      qs = donor->qs; ks = donor->ks; vs = donor->vs;
+      qpl = donor->qpl; kpl = donor->kpl; vpl = donor->vpl;
+      qpg = donor->qpg; kpg = donor->kpg; vpg = donor->vpg;
+      attn = donor->attn; rpg = donor->rpg;
+    } else {
+      CU(cudaMalloc(&qs, n * H * QK * 4));
+      CU(cudaMalloc(&ks, n * H * QK * 4));
+      CU(cudaMalloc(&vs, n * H * SV * 4));
+      CU(cudaMalloc(&qpl, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&kpl, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&vpl, n * H * PV * 3 * 4));
+      CU(cudaMalloc(&qpg, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&kpg, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&vpg, n * H * PV * 3 * 4));
+      CU(cudaMalloc(&attn, n * n * H * 4));
+      CU(cudaMalloc(&rpg, n * H * PV * 3 * 4));
+    }
+    if (donor) {
+      a2d = donor->a2d;
+      sums = donor->sums;
+      final_ = donor->final_;
+      out = donor->out;
+      projbuf = donor->projbuf;
+      dfinal = donor->dfinal; dattn = donor->dattn; drpg = donor->drpg;
+      dvs = donor->dvs; dqs = donor->dqs; dks = donor->dks;
+      dqpg = donor->dqpg; dkpg = donor->dkpg; dvpg = donor->dvpg;
+      dqpl = donor->dqpl; dkpl = donor->dkpl; dvpl = donor->dvpl;
+      drotS = donor->drotS; dtransS = donor->dtransS;
+      return;
+    }
     CU(cudaMalloc(&a2d, n * n * H * 4));
-    CU(cudaMalloc(&attn, n * n * H * 4));
     CU(cudaMalloc(&sums, n * H * 4));
-    CU(cudaMalloc(&rpg, n * H * PV * 3 * 4));
     CU(cudaMalloc(&final_, n * OUTF * 4));
     CU(cudaMalloc(&out, n * C * 4));
-    CU(cudaMalloc(&dfinal, n * OUTF * 4));
-    CU(cudaMalloc(&dattn, n * n * H * 4));
-    CU(cudaMalloc(&drpg, n * H * PV * 3 * 4));
-    CU(cudaMalloc(&dvs, n * H * SV * 4));
-    CU(cudaMalloc(&dqs, n * H * QK * 4));
-    CU(cudaMalloc(&dks, n * H * QK * 4));
-    CU(cudaMalloc(&dqpg, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&dkpg, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&dvpg, n * H * PV * 3 * 4));
-    CU(cudaMalloc(&dqpl, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&dkpl, n * H * PQK * 3 * 4));
-    CU(cudaMalloc(&dvpl, n * H * PV * 3 * 4));
-    // A CALLER THAT HANDS THE SAME FRAME TO MORE THAN ONE MODULE cannot let
-    // this one WRITE drot/dtrans -- FoldIteration gives the same rigid to both
-    // IPA and the composition.  These are its scratch, so it can take the
-    // module's two gradients and accumulate them itself.
-    CU(cudaMalloc(&drotS, n * 9 * 4));
-    CU(cudaMalloc(&dtransS, n * 3 * 4));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dfinal, n * OUTF * 4));
+      CU(cudaMalloc(&dattn, n * n * H * 4));
+      CU(cudaMalloc(&drpg, n * H * PV * 3 * 4));
+      CU(cudaMalloc(&dvs, n * H * SV * 4));
+      CU(cudaMalloc(&dqs, n * H * QK * 4));
+      CU(cudaMalloc(&dks, n * H * QK * 4));
+      CU(cudaMalloc(&dqpg, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&dkpg, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&dvpg, n * H * PV * 3 * 4));
+      CU(cudaMalloc(&dqpl, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&dkpl, n * H * PQK * 3 * 4));
+      CU(cudaMalloc(&dvpl, n * H * PV * 3 * 4));
+      // A CALLER THAT HANDS THE SAME FRAME TO MORE THAN ONE MODULE cannot let
+      // this one WRITE drot/dtrans -- FoldIteration gives the same rigid to both
+      // IPA and the composition.  These are its scratch, so it can take the
+      // module's two gradients and accumulate them itself.
+      CU(cudaMalloc(&drotS, n * 9 * 4));
+      CU(cudaMalloc(&dtransS, n * 3 * 4));
+    } else {
+      dfinal = dattn = drpg = dvs = dqs = dks = nullptr;
+      dqpg = dkpg = dvpg = dqpl = dkpl = dvpl = drotS = dtransS = nullptr;
+    }
     // the fused projection's output, per instance -- see buildCombined
     CU(cudaMalloc(&projbuf, n * PROJ_TOT * 4));
-      recordWeightPack(projbuf);
   }
 
   float* drotScratch() { return drotS; }
@@ -654,8 +678,10 @@ struct IPA {
       off += w[m];
     }
     CU(cudaMalloc(&wcat, hw.size() * 4));
+    recordWeightPack(wcat);
     CU(cudaMemcpy(wcat, hw.data(), hw.size() * 4, cudaMemcpyHostToDevice));
     CU(cudaMalloc(&bcat, hb.size() * 4));
+    recordWeightPack(bcat);
     CU(cudaMemcpy(bcat, hb.data(), hb.size() * 4, cudaMemcpyHostToDevice));
   }
 
@@ -673,7 +699,7 @@ struct IPA {
   }
 
   void forward(const float* single, const float* pair, const float* mask,
-               const float* rot, const float* trans) {
+               const float* rot, const float* trans, bool reuse_a2d = false) {
     size_t n = N;
     // SIX PROJECTIONS, ONE GEMM.  They all read the same [N, 384] single and
     // differ only in their output width, so concatenating the weights turns
@@ -709,9 +735,11 @@ struct IPA {
     pointToGlobalK<PQK><<<(n * H * PQK + 255) / 256, 256, 0, st>>>(qpl, rot, trans, qpg, N);
     pointToGlobalK<PQK><<<(n * H * PQK + 255) / 256, 256, 0, st>>>(kpl, rot, trans, kpg, N);
     pointToGlobalK<PV><<<(n * H * PV + 255) / 256, 256, 0, st>>>(vpl, rot, trans, vpg, N);
-    // the pair's own logit
-    gemm(N * N, H, CZ, pair, w2d, a2d);
-    addRowBiasK<<<((n * n * H) + 255) / 256, 256, 0, st>>>(a2d, b2d, H, n * n * H);
+    if (!reuse_a2d) {
+      // the pair's own logit
+      gemm(N * N, H, CZ, pair, w2d, a2d);
+      addRowBiasK<<<((n * n * H) + 256 - 1) / 256, 256, 0, st>>>(a2d, b2d, H, n * n * H);
+    }
 
     {
       static const int KPB = 16;

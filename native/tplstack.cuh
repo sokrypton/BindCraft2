@@ -70,7 +70,7 @@ struct TplStack {
     // it is given, so input and output would alias.  stack.cuh solves it the
     // same way, with pin[i].
     p1store.resize(depth, nullptr);
-    for (int b = 0; b < depth; ++b)
+    for (int b = nblean::on() ? 1 : 0; b < depth; ++b)
       CU(cudaMalloc(&p1store[b], pairElems() * 2));
   }
 

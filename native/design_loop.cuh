@@ -121,13 +121,13 @@ struct DeviceState {
     c.distogram = c_dgram;
     return c;
   }
-  void zeroCotangents() {
+  void zeroCotangents(cudaStream_t st = nullptr) {
     const size_t n1 = nmax, nn = (size_t)nmax * nmax;
-    CU(cudaMemset(c_atoms, 0, n1 * 37 * 3 * 4)); CU(cudaMemset(c_plddt, 0, n1 * 4));
-    CU(cudaMemset(c_pae, 0, nn * 4)); CU(cudaMemset(c_ptm, 0, 4));
-    CU(cudaMemset(c_iptm, 0, 4)); CU(cudaMemset(c_iptm_res, 0, n1 * 4));
-    CU(cudaMemset(c_expres, 0, n1 * 4));
-    CU(cudaMemset(c_dgram, 0, nn * (size_t)design_step::DBINS * 4));
+    CU(cudaMemsetAsync(c_atoms, 0, n1 * 37 * 3 * 4, st)); CU(cudaMemsetAsync(c_plddt, 0, n1 * 4, st));
+    CU(cudaMemsetAsync(c_pae, 0, nn * 4, st)); CU(cudaMemsetAsync(c_ptm, 0, 4, st));
+    CU(cudaMemsetAsync(c_iptm, 0, 4, st)); CU(cudaMemsetAsync(c_iptm_res, 0, n1 * 4, st));
+    CU(cudaMemsetAsync(c_expres, 0, n1 * 4, st));
+    CU(cudaMemsetAsync(c_dgram, 0, nn * (size_t)design_step::DBINS * 4, st));
   }
 };
 

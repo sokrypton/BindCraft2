@@ -131,12 +131,26 @@ __global__ void nbbToHalfK(const __nv_bfloat16* __restrict__ src, half* __restri
 // P * (dP - D) is already dL/dS in the NATURAL domain, because the ln2 from
 // differentiating exp2 cancels the log2(e) in u = log2(e)*S.  Applying the
 // factor here as well put grad/pair at relL2 3.1e-01.
-__global__ void dnbbToRowK(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst,
+__global__ void dnbbToRowK(const float* __restrict__ dnbbF,
+                           const long long* __restrict__ dnbbI,
+                           const float* __restrict__ lscale,
+                           __nv_bfloat16* __restrict__ dst,
                            size_t M) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= M) return;
-  for (int h = 0; h < H; ++h)
-    dst[ij * H + h] = __float2bfloat16(src[(size_t)h * M + ij]);
+  const float sc = lscale[1];
+  if (dnbbI) {
+    for (int h = 0; h < H; ++h) {
+      size_t idx = (size_t)h * M + ij;
+      float v = (float)dnbbI[idx] * (1.0f / 1099511627776.0f);
+      dst[ij * H + h] = __float2bfloat16(v * sc);
+    }
+  } else {
+    for (int h = 0; h < H; ++h) {
+      size_t idx = (size_t)h * M + ij;
+      dst[ij * H + h] = __float2bfloat16(dnbbF[idx] * sc);
+    }
+  }
 }
 
 __global__ void combToHalfK(const __nv_bfloat16* __restrict__ comb, half* __restrict__ q,
@@ -155,14 +169,16 @@ __global__ void transposeWK(const float* __restrict__ a, __nv_bfloat16* __restri
   if (i < R * Cc) b[(size_t)(i % Cc) * R + i / Cc] = __float2bfloat16(a[i]);
 }
 __global__ void scatterQKVK(const float* __restrict__ dQ, const float* __restrict__ dK,
-                            const float* __restrict__ dV, __nv_bfloat16* __restrict__ dcomb,
+                            const float* __restrict__ dV, const float* __restrict__ lscale,
+                            __nv_bfloat16* __restrict__ dcomb,
                             size_t M) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= M * (size_t)W) return;
   size_t r = i / W; int c = i % W;
-  dcomb[r * TOT + c] = __float2bfloat16(dQ[i]);
-  dcomb[r * TOT + W + c] = __float2bfloat16(dK[i]);
-  dcomb[r * TOT + 2 * W + c] = __float2bfloat16(dV[i]);
+  const float sc = lscale[1];
+  dcomb[r * TOT + c] = __float2bfloat16(dQ[i] * sc);
+  dcomb[r * TOT + W + c] = __float2bfloat16(dK[i] * sc);
+  dcomb[r * TOT + 2 * W + c] = __float2bfloat16(dV[i] * sc);
 }
 __global__ void gateK(const half* __restrict__ av, const __nv_bfloat16* __restrict__ comb,
                       __nv_bfloat16* __restrict__ ag, size_t M) {
@@ -237,22 +253,31 @@ struct MsaRow {
     lt.init(); LF_STREAM = st;
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
     B(&x, Mm * CM); B(&pn, Mp * CZ); B(&comb, Mm * TOT); B(&nbb, (size_t)H * Mp);
-    B(&ag, Mm * W); B(&out, Mm * CM); B(&dcomb, Mm * TOT); B(&dag, Mm * W);
-    B(&dnbbB, Mp * H); B(&dx, Mm * CM); B(&dpn, Mp * CZ);
+    B(&ag, Mm * W); B(&out, Mm * CM);
     CU(cudaMalloc(&qkvgH, Mm * TOT * sizeof(half)));
     CU(cudaMalloc(&biasH, (size_t)H * Mp * sizeof(half)));
     CU(cudaMalloc(&avH, Mm * W * sizeof(half)));
-    CU(cudaMalloc(&davH, Mm * W * sizeof(half)));
     CU(cudaMalloc(&outH, Mm * W * sizeof(half)));
     CU(cudaMalloc(&mu, Mm * 4)); CU(cudaMalloc(&rstd, Mm * 4));
     CU(cudaMalloc(&pmu, Mp * 4)); CU(cudaMalloc(&prstd, Mp * 4));
     CU(cudaMalloc(&lseF, (size_t)S * H * N * 4));
     CU(cudaMalloc(&Dv, (size_t)S * H * N * 4));
-    CU(cudaMalloc(&dQf, Mm * W * 4)); CU(cudaMalloc(&dKf, Mm * W * 4));
-    CU(cudaMalloc(&dVf, Mm * W * 4)); CU(cudaMalloc(&dnbbF, (size_t)H * Mp * 4));
-    if (!envOn("NE_NONDET_NBB"))
-      CU(cudaMalloc(&dnbbI, (size_t)H * Mp * 8));
-    CU(cudaMalloc(&lscale, 2 * 4)); CU(cudaMalloc(&lmax, 4));
+    if (!nblean::on()) {
+      B(&dcomb, Mm * TOT); B(&dag, Mm * W);
+      B(&dnbbB, Mp * H); B(&dx, Mm * CM); B(&dpn, Mp * CZ);
+      CU(cudaMalloc(&davH, Mm * W * sizeof(half)));
+      CU(cudaMalloc(&dQf, Mm * W * 4)); CU(cudaMalloc(&dKf, Mm * W * 4));
+      CU(cudaMalloc(&dVf, Mm * W * 4)); CU(cudaMalloc(&dnbbF, (size_t)H * Mp * 4));
+      if (!envOn("NE_NONDET_NBB"))
+        CU(cudaMalloc(&dnbbI, (size_t)H * Mp * 8));
+      CU(cudaMalloc(&lscale, 2 * 4)); CU(cudaMalloc(&lmax, 4));
+    } else {
+      dcomb = dag = dnbbB = dx = dpn = nullptr;
+      davH = nullptr;
+      dQf = dKf = dVf = dnbbF = nullptr;
+      dnbbI = nullptr;
+      lscale = nullptr; lmax = nullptr;
+    }
   }
 
 
@@ -335,7 +360,6 @@ struct MsaRow {
     f32ToBf16K<<<(Mm * CM + 255) / 256, 256, 0, st>>>(dout, dx, Mm * CM);
     lt.matmul(Mm, W, CM, dx, wo, doutB, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
               nullptr, nullptr, st);
-    CU(cudaMemsetAsync(dcomb, 0, Mm * TOT * 2, st));
     dGateK<<<(Mm * W + 255) / 256, 256, 0, st>>>(doutB, avH, comb, davH, dcomb, Mm);
     // SCALE THE COTANGENT INTO f16's RANGE, and only it: dGateK also wrote the
     // gate gradient into `dcomb`, which must not move.  Dv is computed from
@@ -345,12 +369,12 @@ struct MsaRow {
     CU(cudaMemsetAsync(lmax, 0, 4, st));
     maxAbsHalfK<<<256, 256, 0, st>>>(davH, lmax, nmw);
     pickScaleK<<<1, 1, 0, st>>>(lmax, lscale, 1024.f);
-    scaleHalfByK<<<(nmw + 255) / 256, 256, 0, st>>>(davH, lscale, nmw);
-    fb::rowDotK<<<((size_t)S * N * H + 255) / 256, 256, 0, st>>>(davH, avH, Dv, N, H, D, S);
+    fb::rowDotK<<<((size_t)S * N * H + 255) / 256, 256, 0, st>>>(
+        davH, avH, Dv, N, H, D, S, lscale);
     CU(cudaMemsetAsync(dKf, 0, Mm * W * 4, st));
     CU(cudaMemsetAsync(dVf, 0, Mm * W * 4, st));
-    CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * Mp * 4, st));
     if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * Mp * 8, st));
+    else       CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * Mp * 4, st));
     static bool once = false;
     if (!once) {
       CU(cudaFuncSetAttribute((const void*)fb::flashBwdK<true, true, false, true>,
@@ -362,22 +386,12 @@ struct MsaRow {
     fb::flashBwdK<true, true, false, true><<<g, 32 * fb::WARPS, fb::bwdSmem(), st>>>(
         qkvgH, TOT, biasH, davH, lseF, Dv, mask, nullptr, dQf, dKf, dVf, N, H,
         dnbbF, dnbbI);
-    if (dnbbI)
-      fb::nbbFromFixedK<<<(int)(((size_t)H * Mp + 255) / 256), 256, 0, st>>>(
-          dnbbI, dnbbF, (size_t)H * Mp);
-    // and unscale the three gradients the kernel produced, before anything
-    // reads them
-    scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dQf, lscale, 1, nmw);
-    scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dKf, lscale, 1, nmw);
-    scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dVf, lscale, 1, nmw);
-    scaleFloatByK<<<((size_t)H * Mp + 255) / 256, 256, 0, st>>>(
-        dnbbF, lscale, 1, (size_t)H * Mp);
-    scatterQKVK<<<(Mm * W + 255) / 256, 256, 0, st>>>(dQf, dKf, dVf, dcomb, Mm);
+    scatterQKVK<<<(Mm * W + 255) / 256, 256, 0, st>>>(dQf, dKf, dVf, lscale, dcomb, Mm);
     lt.matmul(Mm, CM, TOT, dcomb, wcat, dx, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
               nullptr, nullptr, st);
     lnBwdK<CM><<<(Mm + 7) / 8, 256, 0, st>>>(dx, msa, qn_s, mu, rstd, dmsa, Mm);
     // the bias gradient belongs to the PAIR, through feat_2d_weights and its norm
-    dnbbToRowK<<<(Mp + 255) / 256, 256, 0, st>>>(dnbbF, dnbbB, Mp);
+    dnbbToRowK<<<(Mp + 255) / 256, 256, 0, st>>>(dnbbF, dnbbI, lscale, dnbbB, Mp);
     lt.matmul(Mp, CZ, H, dnbbB, w2d, dpn, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
               nullptr, nullptr, st);
     if (accPair) lnBwdK<CZ, true, DP><<<(Mp + 7) / 8, 256, 0, st>>>(dpn, pair, f2_s, pmu, prstd, dpair, Mp);

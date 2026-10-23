@@ -456,18 +456,25 @@ static_assert(BM % 16 == 0 && BN % 16 == 0, "whole wmma tiles");
 // MSA row attention.  Deriving it as N here read 128x past the end of a
 // 2-row MSA's arrays and still produced a plausible-looking answer -- forward
 // cos 0.991.
-__global__ void rowDotK(const half* __restrict__ dO, const half* __restrict__ O,
-                        float* __restrict__ Dv, int N, int H, int Dh, int B) {
+__global__ void rowDotK(half* __restrict__ dO, const half* __restrict__ O,
+                        float* __restrict__ Dv, int N, int H, int Dh, int B,
+                        const float* __restrict__ lscale = nullptr) {
   size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   size_t rows = (size_t)B * N * H;
   if (t >= rows) return;
   int h = (int)(t % H);
   size_t bi = t / H;              // b*N + i
   const int W = H * Dh;
+  const float sc = lscale ? lscale[0] : 1.f;
   float s = 0.f;
   for (int d = 0; d < Dh; ++d) {
     size_t o = bi * W + h * Dh + d;
-    s += __half2float(dO[o]) * __half2float(O[o]);
+    half dv = dO[o];
+    if (lscale) {
+      dv = __float2half(__half2float(dv) * sc);
+      dO[o] = dv;
+    }
+    s += __half2float(dv) * __half2float(O[o]);
   }
   int b = (int)(bi / N), i = (int)(bi % N);
   Dv[((size_t)b * H + h) * N + i] = s;
@@ -484,11 +491,11 @@ __global__ void rowDotK(const half* __restrict__ dO, const half* __restrict__ O,
 // finite gradient does not reach.  `nbbSat` counts any term that would have
 // overflowed, so the choice cannot fail silently -- it is read and reported
 // rather than assumed.
-__device__ __forceinline__ long long nbbFixed(float v, unsigned* sat) {
-  const double scaled = (double)v * 1099511627776.0;   // 2^40
-  if (!(scaled > -9.0e18 && scaled < 9.0e18)) {
-    if (sat) atomicAdd(sat, 1u);
-    return scaled > 0 ? 9000000000000000000LL : -9000000000000000000LL;
+__device__ __forceinline__ long long nbbFixed(float v, unsigned* sat = nullptr) {
+  const float scaled = v * 1099511627776.0f;   // 2^40
+  if (sat && !(scaled > -9.0e18f && scaled < 9.0e18f)) {
+    atomicAdd(sat, 1u);
+    return scaled > 0.f ? 9000000000000000000LL : -9000000000000000000LL;
   }
   return (long long)scaled;
 }
@@ -496,7 +503,7 @@ __device__ __forceinline__ long long nbbFixed(float v, unsigned* sat) {
 __global__ void nbbFromFixedK(const long long* __restrict__ src,
                               float* __restrict__ dst, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < n) dst[i] = (float)((double)src[i] / 1099511627776.0);
+  if (i < n) dst[i] = (float)src[i] * (1.0f / 1099511627776.0f);
 }
 
 template <bool DO_DV = true, bool DO_DK = true, bool DO_DS = true,
@@ -543,17 +550,28 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
   const int W = H * FD, W4 = 4 * W;
   size_t M = (size_t)N * N;
 
-  for (int r = tid / FD; r < BM; r += (32 * WARPS) / FD) {
-    int d = tid % FD, i = i0 + r;
+  const int FD8 = FD / 8;
+  for (int u = tid; u < BM * FD8; u += 32 * WARPS) {
+    int r = u / FD8, d = (u % FD8) * 8, i = i0 + r;
     bool ok = i < N;
-    Qs[r * LDH + d] = ok ? qkvg[((size_t)b * N + i) * projLD + h * FD + d] : __float2half(0.f);
-    dOs[r * LDH + d] = ok ? dO[((size_t)b * N + i) * W + h * FD + d] : __float2half(0.f);
+    *(uint4*)(Qs + r * LDH + d) =
+        ok ? *(const uint4*)(qkvg + ((size_t)b * N + i) * projLD + h * FD + d)
+           : make_uint4(0, 0, 0, 0);
+    *(uint4*)(dOs + r * LDH + d) =
+        ok ? *(const uint4*)(dO + ((size_t)b * N + i) * W + h * FD + d)
+           : make_uint4(0, 0, 0, 0);
   }
   for (int r = tid; r < BM; r += 32 * WARPS) {
     int i = i0 + r;
-    lseS[r] = i < N ? lse[((size_t)b * H + h) * N + i] : 0.f;
+    if (!FB_REGSM) lseS[r] = i < N ? lse[((size_t)b * H + h) * N + i] : 0.f;
     DS[r] = i < N ? Dv[((size_t)b * H + h) * N + i] : 0.f;
   }
+  const int row_e0 = warp * 16 + (lane >> 2), row_e2 = row_e0 + 8;
+  const int i_e0 = i0 + row_e0, i_e2 = i0 + row_e2;
+  const float lse_e0 = (FB_REGSM && i_e0 < N) ? lse[((size_t)b * H + h) * N + i_e0] : 0.f;
+  const float lse_e2 = (FB_REGSM && i_e2 < N) ? lse[((size_t)b * H + h) * N + i_e2] : 0.f;
+  const half* bias_e0 = bias + ((size_t)h * N + i_e0) * N;
+  const half* bias_e2 = bias + ((size_t)h * N + i_e2) * N;
   // dQ stays in registers: lane == channel, 16 rows a warp (the forward's lesson
   // -- shared memory is what caps occupancy in these kernels)
 #if FB_REGDQ
@@ -596,12 +614,17 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
         if (r < BN) { Ks[r * LDH + d] = rk[u]; Vs[r * LDH + d] = rv[u]; }
       }
     } else {
-      for (int r = tid / FD; r < BN; r += RSW) {
-        int d = tid % FD, j = j0 + r;
+#pragma unroll
+      for (int u = tid; u < BN * FD8; u += 32 * WARPS) {
+        int r = u / FD8, d = (u % FD8) * 8, j = j0 + r;
         if (PROBE_KV) j = r;
         bool ok = j < N;
-        Ks[r * LDH + d] = ok ? qkvg[((size_t)b * N + j) * projLD + W + h * FD + d] : __float2half(0.f);
-        Vs[r * LDH + d] = ok ? qkvg[((size_t)b * N + j) * projLD + 2 * W + h * FD + d] : __float2half(0.f);
+        *(uint4*)(Ks + r * LDH + d) =
+            ok ? *(const uint4*)(qkvg + ((size_t)b * N + j) * projLD + W + h * FD + d)
+               : make_uint4(0, 0, 0, 0);
+        *(uint4*)(Vs + r * LDH + d) =
+            ok ? *(const uint4*)(qkvg + ((size_t)b * N + j) * projLD + 2 * W + h * FD + d)
+               : make_uint4(0, 0, 0, 0);
       }
     }
     FB_BAR();
@@ -630,27 +653,48 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
         // P = exp2(S*log2e + bias - lse), in the accumulator's own layout.
         // Two elements a step: e and e+1 are adjacent columns, so this is a
         // half2 store and four of them cover the lane's eight values.
+        // e=0 and e=2 share cc=(lane&3)*2; e=4 and e=6 share cc=(lane&3)*2+8.
+        const bool evenN = (N & 1) == 0;
 #pragma unroll
-        for (int e = 0; e < 8; e += 2) {
-          int rr = fragRow(lane, e), cc = fragCol(lane, e);
-          int row = warp * 16 + rr, i = i0 + row, j = j0 + nt * 16 + cc;
-          float p0 = 0.f, p1 = 0.f;
-          if (i < N) {
-            if (j < N) {
-              float sv = c.x[e] * LOG2E_ +
-                         __half2float(bias[((size_t)h * N + i) * N + j]) +
-                         1e9f * (mask[(size_t)b * N + j] - 1.f) * LOG2E_;
-              p0 = exp2f(sv - lseS[row]);
-            }
-            if (j + 1 < N) {
-              float sv = c.x[e + 1] * LOG2E_ +
-                         __half2float(bias[((size_t)h * N + i) * N + j + 1]) +
-                         1e9f * (mask[(size_t)b * N + j + 1] - 1.f) * LOG2E_;
-              p1 = exp2f(sv - lseS[row]);
-            }
+        for (int ebase = 0; ebase < 8; ebase += 4) {
+          int cc = fragCol(lane, ebase);
+          int j = j0 + nt * 16 + cc;
+          float mk0 = 0.f, mk1 = 0.f;
+          if (evenN && j < N) {
+            float2 m2 = *(const float2*)&mask[(size_t)b * N + j];
+            mk0 = 1e9f * (m2.x - 1.f);
+            mk1 = 1e9f * (m2.y - 1.f);
+          } else {
+            if (j < N) mk0 = 1e9f * (mask[(size_t)b * N + j] - 1.f);
+            if (j + 1 < N) mk1 = 1e9f * (mask[(size_t)b * N + j + 1] - 1.f);
           }
-          *(half2*)(Ps + (size_t)row * LDH + nt * 16 + cc) =
-              __floats2half2_rn(p0, p1);
+#pragma unroll
+          for (int ed = 0; ed < 4; ed += 2) {
+            int e = ebase + ed;
+            int row = ed ? row_e2 : row_e0;
+            int i = ed ? i_e2 : i_e0;
+            float lse_r = ed ? lse_e2 : lse_e0;
+            const half* bias_r = ed ? bias_e2 : bias_e0;
+            float p0 = 0.f, p1 = 0.f;
+            if (i < N && j < N) {
+              if (evenN) {
+                half2 b2 = *(const half2*)(bias_r + j);
+                float sv0 = c.x[e] * LOG2E_ + __low2float(b2) + mk0 * LOG2E_;
+                p0 = exp2f(sv0 - lse_r);
+                float sv1 = c.x[e + 1] * LOG2E_ + __high2float(b2) + mk1 * LOG2E_;
+                p1 = exp2f(sv1 - lse_r);
+              } else {
+                float sv0 = c.x[e] * LOG2E_ + __half2float(bias_r[j]) + mk0 * LOG2E_;
+                p0 = exp2f(sv0 - lse_r);
+                if (j + 1 < N) {
+                  float sv1 = c.x[e + 1] * LOG2E_ + __half2float(bias_r[j + 1]) + mk1 * LOG2E_;
+                  p1 = exp2f(sv1 - lse_r);
+                }
+              }
+            }
+            *(half2*)(Ps + (size_t)row * LDH + nt * 16 + cc) =
+                __floats2half2_rn(p0, p1);
+          }
         }
       } else {
         FB_STORE(Ss + (size_t)warp * 16 * LDF + nt * 16, c, LDF, mem_row_major);
@@ -709,7 +753,7 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
                 atomicAdd((__nv_bfloat162*)&dcomb[((size_t)b * N + j) * tot +
                                                   2 * W + h * FD + dt * 16 + cc], v);
               }
-            } else {
+            } else if (g != 0.f) {
               atomicAdd(&dV[((size_t)b * N + j) * W + h * FD + dt * 16 + cc], g);
             }
           }
@@ -772,15 +816,17 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
             if (NBB_ATOMIC) {
               size_t o = ((size_t)h * N + i) * N + j;
               if (dnbbI) {
-                if (j < N)
-                  atomicAdd((unsigned long long*)&dnbbI[o],
-                            (unsigned long long)nbbFixed(v0, nullptr));
-                if (j + 1 < N)
-                  atomicAdd((unsigned long long*)&dnbbI[o + 1],
-                            (unsigned long long)nbbFixed(v1, nullptr));
+                if (j < N) {
+                  unsigned long long fx0 = (unsigned long long)nbbFixed(v0, nullptr);
+                  if (fx0) atomicAdd((unsigned long long*)&dnbbI[o], fx0);
+                }
+                if (j + 1 < N) {
+                  unsigned long long fx1 = (unsigned long long)nbbFixed(v1, nullptr);
+                  if (fx1) atomicAdd((unsigned long long*)&dnbbI[o + 1], fx1);
+                }
               } else {
-              if (j < N) atomicAdd(&dnbb[o], v0);
-              if (j + 1 < N) atomicAdd(&dnbb[o + 1], v1);
+                if (j < N && v0 != 0.f) atomicAdd(&dnbb[o], v0);
+                if (j + 1 < N && v1 != 0.f) atomicAdd(&dnbb[o + 1], v1);
               }
             }
           }
@@ -803,28 +849,32 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
             if (DO_DS) dS[(((size_t)b * H + h) * N + i) * N + j] = __float2bfloat16(v);
             if (NBB_ATOMIC) {
               const size_t o = ((size_t)h * N + i) * N + j;
-              if (dnbbI) atomicAdd((unsigned long long*)&dnbbI[o],
-                                   (unsigned long long)nbbFixed(v, nullptr));
-              else atomicAdd(&dnbb[o], v);
+              if (dnbbI) {
+                unsigned long long fx = (unsigned long long)nbbFixed(v, nullptr);
+                if (fx) atomicAdd((unsigned long long*)&dnbbI[o], fx);
+              } else if (v != 0.f) atomicAdd(&dnbb[o], v);
             }
           }
         }
       }
     } else if (!FB_REGDS) {
       // dS = P * (dP - D).  P's slot is reused: it is not read again.
+      const int j = j0 + lane;
+      const bool j_ok = j < N;
 #pragma unroll
       for (int r = 0; r < 16; ++r) {
-        int row = warp * 16 + r, i = i0 + row, j = j0 + lane;
+        int row = warp * 16 + r, i = i0 + row;
         float v = 0.f;
-        if (i < N && j < N) {
+        if (j_ok && i < N) {
           float p = __half2float(Ps[(size_t)row * LDH + lane]);
           v = p * (Ss[(size_t)row * LDF + lane] - DS[row]);
           if (DO_DS) dS[(((size_t)b * H + h) * N + i) * N + j] = __float2bfloat16(v);
           if (NBB_ATOMIC) {
             const size_t o = ((size_t)h * N + i) * N + j;
-            if (dnbbI) atomicAdd((unsigned long long*)&dnbbI[o],
-                                 (unsigned long long)nbbFixed(v, nullptr));
-            else atomicAdd(&dnbb[o], v);
+            if (dnbbI) {
+              unsigned long long fx = (unsigned long long)nbbFixed(v, nullptr);
+              if (fx) atomicAdd((unsigned long long*)&dnbbI[o], fx);
+            } else if (v != 0.f) atomicAdd(&dnbb[o], v);
           }
         }
         Ps[(size_t)row * LDH + lane] = __float2half(v);
@@ -891,7 +941,7 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
                 atomicAdd((__nv_bfloat162*)&dcomb[((size_t)b * N + j) * tot +
                                                   W + h * FD + dt * 16 + cc], v);
               }
-            } else {
+            } else if (g != 0.f) {
               atomicAdd(&dK[((size_t)b * N + j) * W + h * FD + dt * 16 + cc], g);
             }
           }

@@ -5788,3 +5788,30 @@ work as well.  **The model is what ships**, so the default is the memset and
 That is the fourth time today standalone and in-model have disagreed, and
 the second where standalone had the wrong sign.  Nothing here is believed
 until it is measured in the model, paired.
+
+---
+
+## 2026-10-23: Memory unlock, `flashBwdK` FP64 elimination & vectorised smem loads, and TriAttn/MsaRow/TriMul fusions
+
+Measured paired in the full model (`bindcraft` with `BC2_BENCH=1 BC2_BENCH_ONLY=1`) on NVIDIA A10 (`sm_86`) at both **binder 109** (complex 224, `recycles=1`) and **binder 250** (complex 365, `NMAX=384`, `recycles=1`):
+
+| Metric | Binder 109 (complex 224) Baseline | Binder 109 Now | Delta | Binder 250 (complex 365) Baseline | Binder 250 Now | Delta |
+|---|---|---|---|---|---|---|
+| `forward(save)` | 423 ms | **417–419 ms** | **-5 ms** | 1246 ms | **1227–1230 ms** | **-18 ms** |
+| `forward(no save)` | 414 ms | **407–409 ms** | **-6 ms** | 1229 ms | **1210–1213 ms** | **-18 ms** |
+| `forward+backward` | 1003 ms | **871–874 ms** | **-130 ms (-13.0%)** | 3393 ms | **2792–2800 ms** | **-597 ms (-17.6%)** |
+| Backward alone | 580 ms | **455 ms** | **-125 ms (-21.6%)** | 2147 ms | **1565–1570 ms** | **-580 ms (-26.9%)** |
+| Free VRAM after `regrant()` | 17.81 GB | **18.98 GB** | **+1.17 GB** | 10.81 GB | **14.40 GB** | **+3.59 GB** |
+| Kept block activations (`acts`) | 48/48 | **48/48** | — | 17/48 | **25/48** | **+8 blocks kept** |
+
+1. **`flashBwdK` (`flash_bwd_body.cuh`):**
+   - **Eliminated 1:64 rate FP64 (`double`) arithmetic on `sm_86`:** `nbbFixed` and `nbbFromFixedK` multiplied/divided by `double(1LL << 40)` (`1099511627776.0`), forcing FP64 conversions and FP64 FMAs inside the inner KV-tile loop of `flashBwdK`. Because $2^{40}$ and $2^{-40}$ are exact powers of two in IEEE-754 FP32 (`1099511627776.0f` and `1.0f / 1099511627776.0f`), replacing `double` with `float` is bit-identical on the mantissa and removes all FP64 instructions from `flashBwdK`. Also elided the dead saturation check when `sat == nullptr`.
+   - **Vectorised global-to-shared tile loads (`uint4`) and register hoisting:** Replaced scalar 2-byte `half` loops for `Qs`, `dOs`, `Ks`, `Vs` with 16-byte `uint4` loads/stores (8x fewer instructions per KV tile), hoisted `lse_e0`, `lse_e2`, `bias_e0`, `bias_e2` outside the `j0` loop in `FB_REGSM`, hoisted `mask` loads across `e` and `e+2` with `float2` / `half2` vectorised loads when `(N & 1) == 0`, hoisted `j_ok` in `!FB_REGDS`, and guarded zero-valued global `atomicAdd`s (`if (fx) atomicAdd` for `dnbbI`, `if (g != 0.f) atomicAdd` for `dV`, `dK`, `dnbb`).
+   - **CUPTI result (binder 250):** `fb::flashBwdK` dropped from **1173.48 ms → 523.17 ms (-55.4%, 2.24x faster)**; `fb16::flashBwdK` dropped from **40.53 ms → 16.26 ms (-59.9%, 2.49x faster)**.
+
+2. **`TriAttn`, `MsaRow`, and `TriMul` (`triattn_body.cuh`, `msarow.cuh`, `trimul_body.cuh`):**
+   - Fixed `dnbbI` leak in `TriAttn::adoptBackwardScratch`, removed dead `cudaMemsetAsync(dnbbF, 0, ...)`, fused `dnbbI` fixed-point-to-float conversion into `tattn::scatterDxK` (and vectorised `fromComb` to `uint2` and `fromF32` to `float4`), vectorised `tattn::gateFromAvK` (`half2` / `__nv_bfloat162`), fused `scaleHalfByK` into `fb::rowDotK`, fused `3x scaleFloatByK` into `mrow::scatterQKVK`, and fused `nbbFromFixedK` + `scaleFloatByK` into `mrow::dnbbToRowK`.
+   - Changed `TM_PROJ_MINB` from `4` to `3` in `trimul_body.cuh`, eliminating `STACK:16` local memory spills in `tmul::projGateK` (`REG:80 STACK:0`), and vectorised global-to-shared loads (`uint4`) and `emitT2` (`uchar4` / `__nv_bfloat162`) in `projGateK` and `combineDxK`.
+
+3. **Memory & keep-tier unlock (`stack.cuh`, `foldstack.cuh`, `tplembed*.cuh`, `bindcraft_cli.cu`, `design_step.cuh`):**
+   - Elided backward-only buffers under `nblean::on()`, shared intra-iteration scratch across `it[1..7]` in `FoldStack`, hoisted invariant `a2d = pair @ w2d + b2d` in `FoldStack::forward` (`reuse_a2d = (i > 0)`), adopted `TplEmbed`/`TplEmbedPtm` pair scratch from `b.p1`/`b.p1b`, shared Evoformer pair scratch across `step`, `stepb`, `vstep`, `vstepb` via `g_root_donor` and `Stack::regrantWith`, made `zeroCotangents` stream-async (`cudaMemsetAsync`), moved `regrant()` in `bindcraft_cli.cu` after `dgsum` allocation, guarded `interface_contacts` / `interface_pae` backward and `c_iptm` copy on `if (want_grad)`, and made `DesignStep::setWeights` / `stepb` weight syncing lazy (`cur_w_[5]`).

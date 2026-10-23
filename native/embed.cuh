@@ -222,12 +222,16 @@ struct Embed {
     CU(cudaMalloc(&pre1d, (size_t)N * CM * 4));
     CU(cudaMalloc(&premsa, (size_t)S * N * CM * 4));
     CU(cudaMalloc(&msa, (size_t)S * N * CM * 4));
-    CU(cudaMalloc(&dmsaact, (size_t)S * N * CM * 4));
     CU(cudaMalloc(&left, (size_t)N * CZ * 4));
     CU(cudaMalloc(&right, (size_t)N * CZ * 4));
-    CU(cudaMalloc(&dleft, (size_t)N * CZ * 4));
-    CU(cudaMalloc(&dright, (size_t)N * CZ * 4));
-    CU(cudaMalloc(&dpre1d, (size_t)N * CM * 4));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dmsaact, (size_t)S * N * CM * 4));
+      CU(cudaMalloc(&dleft, (size_t)N * CZ * 4));
+      CU(cudaMalloc(&dright, (size_t)N * CZ * 4));
+      CU(cudaMalloc(&dpre1d, (size_t)N * CM * 4));
+    } else {
+      dmsaact = dleft = dright = dpre1d = nullptr;
+    }
     CU(cudaMalloc(&pair, (size_t)N * N * CZ * 4));
     CU(cudaMalloc(&single, (size_t)N * CS * 4));
   }

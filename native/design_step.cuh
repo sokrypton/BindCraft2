@@ -500,7 +500,13 @@ struct DesignStep {
     // the card to XLA (17.89 GB taken, 4.44 left, XLA takes it) and a ~0.5 GB
     // request mid-step has nowhere to go: `stack.cuh:540 cuda: out of memory`
     // at complex 687.  Same bytes, asked for where there is room.
-    extra.ensureSaveSet();  dstook("extra saveset");
+    if (nblean::on()) {
+      extra.allocOneSave(nmax_alloc);
+      extra.setSaveBuffers(extra.p1save, extra.m1save, /*single*/true);
+      extra.save_full = false;
+    } else {
+      extra.ensureSaveSet();  dstook("extra saveset");
+    }
     extra.useOwnOut();  dstook("extra out");
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     dstook("trunk stack");
@@ -572,48 +578,57 @@ struct DesignStep {
     // read from anywhere else -- and because a re-derive at a shorter length
     // may not ask for more than the first call took.
     CU(cudaMalloc(&tf21, n1 * embed::NAA_MAX * 4));
-    CU(cudaMalloc(&d_tf21, n1 * embed::NAA_MAX * 4));
     CU(cudaMalloc(&atom37, n1 * ATOM * 3 * 4));
     CU(cudaMalloc(&trunk_msa, (size_t)(p.msa_rows + 1) * n1 * embed::CM * 4));
     CU(cudaMalloc(&trunk_msa_mask, (size_t)(p.msa_rows + 1) * n1 * 4));
-    CU(cudaMalloc(&d_atom37, n1 * ATOM * 3 * 4));
-    CU(cudaMalloc(&d_atom14, n1 * 14 * 3 * 4));
-    // THE BACKWARD'S BUFFERS.  They were declared and never allocated, which
-    // a forward-only gate cannot see: every one of these is a null pointer a
-    // kernel writes through the first time a gradient is asked for.
-    CU(cudaMalloc(&d_plddt_logits, n1 * heads::PL_BINS * 4));
-    CU(cudaMalloc(&d_pae_logits, nn * heads::NPAE * 4));
-    CU(cudaMalloc(&d_expres_logits, n1 * heads::NER * 4));
-    CU(cudaMalloc(&d_pair, nn * (size_t)embed::CZ * 4));
-    CU(cudaMalloc(&d_pair_sm, nn * (size_t)embed::CZ * 4));
-    // AND `d_tpl_query` IS THAT SAME BUFFER.  Both are "a module's pair
-    // cotangent, written to its own buffer and then added into d_pair"
-    // -- the structure module's at the top of the backward, the template
-    // embedder's at the bottom -- and the two are never live together:
-    // d_pair_sm is consumed into d_pair some forty lines before
-    // tpl.backward writes d_tpl_query, and neither is read again after its
-    // accumulate.  N*N*CZ*4 is 277 MB at N=608 and 443 at 768.
-    d_tpl_query = d_pair_sm;
-    CU(cudaMalloc(&tpl_save, nn * (size_t)tplembed::CT * 2));
-    CU(cudaMalloc(&d_rot, n1 * 9 * 4));
-    CU(cudaMalloc(&d_trans, n1 * 3 * 4));
-    CU(cudaMalloc(&d_single, n1 * heads::CS * 4));
-    CU(cudaMalloc(&d_sm_act, n1 * structmod::C * 4));
-    CU(cudaMalloc(&d_msa, (size_t)(p.msa_rows + 1) * n1 * embed::CM * 4));
-    CU(cudaMalloc(&d_msa_feat, (size_t)p.msa_rows * n1 * inputfeat::MSA * 4));
-    CU(cudaMalloc(&d_feat, n1 * inputfeat::A * 4));
-    CU(cudaMalloc(&d_seqfeat, n1 * inputfeat::A * 4));
-    CU(cudaMalloc(&d_proffeat, n1 * inputfeat::A * 4));
     CU(cudaMalloc(&out_iptm_per_residue, n1 * 4));
-    CU(cudaMalloc(&scratch.atoms, n1 * ATOM * 3 * 4));
-    CU(cudaMalloc(&scratch.plddt, n1 * 4));
-    dstook("step buffers");
-    CU(cudaMalloc(&scratch.pae, nn * 4));
-    CU(cudaMalloc(&scratch.ptm, 4));
-    CU(cudaMalloc(&scratch.iptm, 4));
-    CU(cudaMalloc(&scratch.iptm_per_residue, n1 * 4));
-    CU(cudaMalloc(&scratch.expres_ca, n1 * 4));
-    CU(cudaMalloc(&scratch.distogram, nn * DBINS * 4));
+    tpl_save = nullptr;
+    if (!nblean::on()) {
+      CU(cudaMalloc(&d_tf21, n1 * embed::NAA_MAX * 4));
+      CU(cudaMalloc(&d_atom37, n1 * ATOM * 3 * 4));
+      CU(cudaMalloc(&d_atom14, n1 * 14 * 3 * 4));
+      // THE BACKWARD'S BUFFERS.  They were declared and never allocated, which
+      // a forward-only gate cannot see: every one of these is a null pointer a
+      // kernel writes through the first time a gradient is asked for.
+      CU(cudaMalloc(&d_plddt_logits, n1 * heads::PL_BINS * 4));
+      CU(cudaMalloc(&d_pae_logits, nn * heads::NPAE * 4));
+      CU(cudaMalloc(&d_expres_logits, n1 * heads::NER * 4));
+      CU(cudaMalloc(&d_pair, nn * (size_t)embed::CZ * 4));
+      CU(cudaMalloc(&d_pair_sm, nn * (size_t)embed::CZ * 4));
+      // AND `d_tpl_query` IS THAT SAME BUFFER.  Both are "a module's pair
+      // cotangent, written to its own buffer and then added into d_pair"
+      // -- the structure module's at the top of the backward, the template
+      // embedder's at the bottom -- and the two are never live together:
+      // d_pair_sm is consumed into d_pair some forty lines before
+      // tpl.backward writes d_tpl_query, and neither is read again after its
+      // accumulate.  N*N*CZ*4 is 277 MB at N=608 and 443 at 768.
+      d_tpl_query = d_pair_sm;
+      CU(cudaMalloc(&d_rot, n1 * 9 * 4));
+      CU(cudaMalloc(&d_trans, n1 * 3 * 4));
+      CU(cudaMalloc(&d_single, n1 * heads::CS * 4));
+      CU(cudaMalloc(&d_sm_act, n1 * structmod::C * 4));
+      CU(cudaMalloc(&d_msa, (size_t)(p.msa_rows + 1) * n1 * embed::CM * 4));
+      CU(cudaMalloc(&d_msa_feat, (size_t)p.msa_rows * n1 * inputfeat::MSA * 4));
+      CU(cudaMalloc(&d_feat, n1 * inputfeat::A * 4));
+      CU(cudaMalloc(&d_seqfeat, n1 * inputfeat::A * 4));
+      CU(cudaMalloc(&d_proffeat, n1 * inputfeat::A * 4));
+      CU(cudaMalloc(&scratch.atoms, n1 * ATOM * 3 * 4));
+      CU(cudaMalloc(&scratch.plddt, n1 * 4));
+      dstook("step buffers");
+      CU(cudaMalloc(&scratch.pae, nn * 4));
+      CU(cudaMalloc(&scratch.ptm, 4));
+      CU(cudaMalloc(&scratch.iptm, 4));
+      CU(cudaMalloc(&scratch.iptm_per_residue, n1 * 4));
+      CU(cudaMalloc(&scratch.expres_ca, n1 * 4));
+      scratch.distogram = hd.dgram;
+    } else {
+      d_tf21 = d_atom37 = d_atom14 = d_plddt_logits = d_pae_logits = nullptr;
+      d_expres_logits = d_pair = d_pair_sm = d_tpl_query = nullptr;
+      d_rot = d_trans = d_single = d_sm_act = d_msa = d_msa_feat = nullptr;
+      d_feat = d_seqfeat = d_proffeat = nullptr;
+      scratch = Outputs{};
+      dstook("step buffers");
+    }
     CU(cudaMalloc(&pae_centres, confidence::PBINS * 4));
     CU(cudaMalloc(&tm_bins, confidence::PBINS * 4));
   }
@@ -750,8 +765,7 @@ struct DesignStep {
   // is the one moment when no kept buffer is live, because the backward that
   // reads them has not run yet.
   void regrant() {
-    extra.regrant();
-    trunk.regrant();
+    trunk.regrantWith(extra);
   }
 
   void setStream(cudaStream_t s) {
@@ -765,10 +779,20 @@ struct DesignStep {
   // what THIS step's modules packed for the model it is currently holding;
   // see the note on weightPackCollector in common.cuh
   std::vector<void*> packs_;
+  std::string cur_w_[5];
 
   void setWeights(Oracle& trunk_w, Oracle& extra_w, Oracle& tpl_w,
                   Oracle& post_w, Oracle& emb_w, inputfeat::Tables t,
                   tpl1d::Tables t1) {
+    if (!packs_.empty() && cur_w_[0] == trunk_w.dir &&
+        cur_w_[1] == extra_w.dir && cur_w_[2] == tpl_w.dir &&
+        cur_w_[3] == post_w.dir && cur_w_[4] == emb_w.dir) {
+      t1d_tab = t1;
+      tables = t;
+      return;
+    }
+    cur_w_[0] = trunk_w.dir; cur_w_[1] = extra_w.dir; cur_w_[2] = tpl_w.dir;
+    cur_w_[3] = post_w.dir;  cur_w_[4] = emb_w.dir;
     // THE LAST MODEL'S PACK GOES FIRST.  Not the modules' own doing: a
     // stack packs once per depth out of one instance, so only the thing
     // whose whole weight set is being replaced can free it.
@@ -1057,9 +1081,10 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
   kabsch::applyK<<<ga, 128, 0, st>>>(
       atom37, a37e, kab, kab + 15, in.n, out.atoms, N);
   // the distogram is the head's logits unchanged
-  CU(cudaMemcpyAsync(out.distogram, hd.dgram,
-                     (size_t)N * N * DBINS * 4,
-                     cudaMemcpyDeviceToDevice, st));
+  if (out.distogram && out.distogram != hd.dgram)
+    CU(cudaMemcpyAsync(out.distogram, hd.dgram,
+                       (size_t)N * N * DBINS * 4,
+                       cudaMemcpyDeviceToDevice, st));
   // and what the next recycle pass reads
   if (pass < plan.recycles)
     rec.save(atom37, trunk.pout, trunk.mout);

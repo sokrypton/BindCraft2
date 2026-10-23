@@ -191,28 +191,52 @@ struct FoldIteration {
   float *mu1 = nullptr, *rs1 = nullptr, *mu2 = nullptr, *rs2 = nullptr;
   float *d1 = nullptr, *d2 = nullptr, *d3 = nullptr, *dh = nullptr;
 
-  void alloc(int N_, cudaStream_t s = nullptr) {
+  void alloc(int N_, cudaStream_t s = nullptr, FoldIteration* donor = nullptr) {
     N = N_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
     CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
-    attn.alloc(N, s);
-    rig.alloc(N, s);
+    attn.alloc(N, s, donor ? &donor->attn : nullptr);
+    rig.alloc(N, s, donor ? &donor->rig : nullptr);
     if (do_atoms) {
       sc.alloc(N, s);
       at.alloc(N, s);
       CU(cudaMalloc(&tscaled, (size_t)N * 3 * 4));
-      CU(cudaMalloc(&dang, (size_t)N * sidechain::NANG * 4));
-      CU(cudaMalloc(&drotA, (size_t)N * 9 * 4));
-      CU(cudaMalloc(&dtransA, (size_t)N * 3 * 4));
-      CU(cudaMalloc(&drotSum, (size_t)N * 9 * 4));
-      CU(cudaMalloc(&dtransSum, (size_t)N * 3 * 4));
-      CU(cudaMalloc(&dscAct, (size_t)N * C * 4));
+      if (!nblean::on()) {
+        CU(cudaMalloc(&dang, (size_t)N * sidechain::NANG * 4));
+        CU(cudaMalloc(&drotA, (size_t)N * 9 * 4));
+        CU(cudaMalloc(&dtransA, (size_t)N * 3 * 4));
+        CU(cudaMalloc(&drotSum, (size_t)N * 9 * 4));
+        CU(cudaMalloc(&dtransSum, (size_t)N * 3 * 4));
+        CU(cudaMalloc(&dscAct, (size_t)N * C * 4));
+      } else {
+        dang = drotA = dtransA = drotSum = dtransSum = dscAct = nullptr;
+      }
     }
     size_t n = (size_t)N * C;
-    for (auto q : {&a1, &a2, &a3, &a4, &h1, &h2, &tr, &d1, &d2, &d3, &dh})
+    CU(cudaMalloc(&a4, n * 4));
+    if (donor && nblean::on()) {
+      a1 = donor->a1; a2 = donor->a2; a3 = donor->a3;
+      h1 = donor->h1; h2 = donor->h2; tr = donor->tr;
+      mu1 = donor->mu1; rs1 = donor->rs1; mu2 = donor->mu2; rs2 = donor->rs2;
+      d1 = d2 = d3 = dh = nullptr;
+      return;
+    }
+    for (auto q : {&a1, &a3, &h1, &h2})
       CU(cudaMalloc(q, n * 4));
     for (auto q : {&mu1, &rs1, &mu2, &rs2}) CU(cudaMalloc(q, (size_t)N * 4));
+    if (donor) {
+      a2 = donor->a2; tr = donor->tr;
+      d1 = donor->d1; d2 = donor->d2; d3 = donor->d3; dh = donor->dh;
+      return;
+    }
+    for (auto q : {&a2, &tr})
+      CU(cudaMalloc(q, n * 4));
+    if (!nblean::on()) {
+      for (auto q : {&d1, &d2, &d3, &dh}) CU(cudaMalloc(q, n * 4));
+    } else {
+      d1 = d2 = d3 = dh = nullptr;
+    }
   }
 
   void setStream(cudaStream_t s) {
@@ -272,10 +296,11 @@ struct FoldIteration {
 
   void forward(const float* act, const float* pair, const float* mask,
                const float* rot, const float* trans, float* rout, float* tout,
-               const float* initial = nullptr, const float* aatype = nullptr) {
+               const float* initial = nullptr, const float* aatype = nullptr,
+               bool reuse_a2d = false) {
     size_t n = (size_t)N * C;
     int g = (int)((n + 255) / 256), gw = (N + 7) / 8;
-    attn.forward(act, pair, mask, rot, trans);
+    attn.forward(act, pair, mask, rot, trans, reuse_a2d);
     addK<<<g, 256, 0, st>>>(a1, act, attn.out, n);
     // IN PLACE, so a1 holds what the LayerNorm actually saw -- the backward
     // reads a1 as the LayerNorm's saved input and must get the dropped value

@@ -281,8 +281,13 @@ struct MsaCol {
     lt.init();
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
     B(&x, M * CM); B(&comb, M * TOT); B(&av, M * W); B(&ag, M * W);
-    B(&ot, M * CM); B(&out, M * CM); B(&dcomb, M * TOT); B(&dag, M * W);
-    B(&dx, M * CM); B(&dot_, M * CM);
+    B(&ot, M * CM); B(&out, M * CM);
+    if (!nblean::on()) {
+      B(&dcomb, M * TOT); B(&dag, M * W);
+      B(&dx, M * CM); B(&dot_, M * CM);
+    } else {
+      dcomb = dag = dx = dot_ = nullptr;
+    }
     CU(cudaMalloc(&mu, M * 4)); CU(cudaMalloc(&rstd, M * 4));
     blocks = (N * H * 32 + thr - 1) / thr;
   }

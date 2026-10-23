@@ -337,8 +337,11 @@ inline cudaError_t mallocReusing(void** p, size_t n) {
 // with something else.  If it is not identical, the sharing is unsound and
 // one cheap run said so.
 inline void scribble(size_t first, size_t last, cudaStream_t st) {
-  for (size_t i = first; i < last && i < ledger().size(); ++i)
+  for (size_t i = first; i < last && i < ledger().size(); ++i) {
+    if (!ledger()[i].p || !ledger()[i].n) continue;
+    if (neverLend().count(ledger()[i].p)) continue;
     CU(cudaMemsetAsync(ledger()[i].p, 0x5A, ledger()[i].n, st));
+  }
 }
 
 // Streams and cuBLAS handles are NOT sized by N, so a second alloc() must
@@ -376,6 +379,9 @@ inline cublasStatus_t cublasCreateOnce(cublasHandle_t* h) {
 inline cudaError_t freeUnlessReusing(void* p) {
   if (active()) return cudaSuccess;
   if (donated().count(p)) return cudaSuccess;   // not ours to free
+  neverLend().erase(p);
+  for (Slot& s : ledger())
+    if (s.p == p) { s.p = nullptr; s.n = 0; }
   return ::cudaFree(p);
 }
 

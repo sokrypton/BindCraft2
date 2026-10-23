@@ -157,7 +157,19 @@ struct TplEmbedPtm {
   tplstack::TplStack stack;
 
   template <class EvoBlock>
-  void adoptScratch(EvoBlock& b) { stack.adoptScratch(b); }
+  void adoptScratch(EvoBlock& b) {
+    stack.adoptScratch(b);
+    if (b.p1 && b.chainBytes() * 2 >= pairElems() * 8) {
+      if (pre && pre != b.p1) CU(cudaFree(pre));
+      if (emb && emb != b.p1 + pairElems()) CU(cudaFree(emb));
+      pre = b.p1;
+      emb = b.p1 + pairElems();
+    }
+    if (b.p1b && b.chainBytes() >= pairElems() * 2) {
+      if (actb && actb != b.p1b) CU(cudaFree(actb));
+      actb = b.p1b;
+    }
+  }
 
   float *w2d = nullptr, *b2d = nullptr;     // embedding2d
   float *oS = nullptr, *oO = nullptr;       // output_layer_norm

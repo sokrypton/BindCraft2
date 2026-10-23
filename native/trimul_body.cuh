@@ -416,7 +416,7 @@ static const int LDXF = C + 8;
 // 160 registers, so the registers held it to ONE... __launch_bounds__(256, 2)
 // holds it to 128 with LOCAL 0: -11% to -13%, byte-identical".
 #ifndef TM_PROJ_MINB
-#define TM_PROJ_MINB 4
+#define TM_PROJ_MINB 3
 #endif
 template <bool KEEPG>
 __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
@@ -441,9 +441,12 @@ __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
   // gates run whatever a dump holds, so the tail is guarded rather than assumed.
   const int nrow = (int)min((size_t)BMF, (size_t)M - r0);
   for (int i = tid; i < BMF; i += 32 * WF) mk[i] = i < nrow ? mask[r0 + i] : 0.f;
-  for (int i = tid; i < BMF * C; i += 32 * WF)
-    xs[(i / C) * LDXF + (i % C)] =
-        (i / C) < nrow ? x[(r0 + i / C) * C + (i % C)] : __float2bfloat16(0.f);
+  for (int i = tid; i < BMF * (C / 8); i += 32 * WF) {
+    int row = i / (C / 8), c8 = (i % (C / 8)) * 8;
+    *(uint4*)(xs + row * LDXF + c8) =
+        row < nrow ? *(const uint4*)(x + (r0 + row) * C + c8)
+                   : make_uint4(0u, 0u, 0u, 0u);
+  }
   __syncthreads();
 
   nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> acc[RTF], gat[RTF];
@@ -621,17 +624,23 @@ __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
     for (int r = 0; r < RTF; ++r) {
       nvcuda::wmma::store_matrix_sync(st, acc[r], 16, nvcuda::wmma::mem_row_major);
       __syncwarp();
-      for (int i = lane; i < 256; i += 32) {
-        int row = r * 16 + i / 16, c = i % 16;
+      for (int i = lane; i < 64; i += 32) {
+        int row = r * 16 + i / 4, c = (i % 4) * 4, e = (i / 4) * 16 + c;
         if (row >= nrow) continue;
-        {
-          float q = sigmoidf(st[i] + __bfloat162float(bcat[4 * I + c0 + c]));
+        float q[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u)
+          q[u] = sigmoidf(st[e + u] + __bfloat162float(bcat[4 * I + c0 + c + u]));
+        gt2_t* d = t2 + (r0 + row) * C + c0 + c;
 #if TM_GATE8T
-          t2[(r0 + row) * C + c0 + c] = (gt2_t)__float2uint_rn(__saturatef(q) * 255.f);
+        *(uchar4*)d = make_uchar4((gt2_t)__float2uint_rn(__saturatef(q[0]) * 255.f),
+                                  (gt2_t)__float2uint_rn(__saturatef(q[1]) * 255.f),
+                                  (gt2_t)__float2uint_rn(__saturatef(q[2]) * 255.f),
+                                  (gt2_t)__float2uint_rn(__saturatef(q[3]) * 255.f));
 #else
-          t2[(r0 + row) * C + c0 + c] = __float2bfloat16(q);
+        *(__nv_bfloat162*)(d) = __floats2bfloat162_rn(q[0], q[1]);
+        *(__nv_bfloat162*)(d + 2) = __floats2bfloat162_rn(q[2], q[3]);
 #endif
-        }
       }
       __syncwarp();
     }
@@ -939,15 +948,16 @@ __global__ void TM_LB(32 * WG) combineDxK(
     TM_CONTRACT(dp0, 0); TM_CONTRACT(dp1, 2);
     TM_CONTRACT(dq0, 1); TM_CONTRACT(dq1, 3);
   } else {
-    build(da, a, gl, dp0, dp1, true);  TM_CONTRACT(dp0, 0);  TM_CONTRACT(dp1, 2);
-    build(db, bb, gr, dp0, dp1, true); TM_CONTRACT(dp0, 1);  TM_CONTRACT(dp1, 3);
+    build(da, a, gl, dp0, dp1, false); TM_CONTRACT(dp0, 0);  TM_CONTRACT(dp1, 2);
+    build(db, bb, gr, dp0, dp1, true);  TM_CONTRACT(dp0, 1);  TM_CONTRACT(dp1, 3);
   }
   // group 4 is the output gate, already row-major and already a gradient
   __syncthreads();   // the group-1/3 contraction is still reading dp0
-  for (int i = tid; i < BMG * C; i += 32 * WG) {
-    int row = i / C, c = i % C;
-    dp0[(size_t)row * LDG + c] =
-        row < nrow ? dt2pre[(r0 + row) * C + c] : __float2bfloat16(0.f);
+  for (int i = tid; i < BMG * (C / 8); i += 32 * WG) {
+    int row = i / (C / 8), c8 = (i % (C / 8)) * 8;
+    *(uint4*)(dp0 + (size_t)row * LDG + c8) =
+        row < nrow ? *(const uint4*)(dt2pre + (r0 + row) * C + c8)
+                   : make_uint4(0u, 0u, 0u, 0u);
   }
   TM_CONTRACT(dp0, 4);
 #undef TM_CONTRACT
@@ -1074,13 +1084,13 @@ struct TriMul {
       {(void**)&t, mi * 2}, {(void**)&cn, ri * 2}, {(void**)&o, mc * 2},
       {(void**)&gl, mi * sizeof(gate_t)}, {(void**)&gr, mi * sizeof(gate_t)},
       {(void**)&t2, mc * sizeof(gt2_t)},
-      {(void**)&dpre, split_cdx ? mp * 2 : 0},
-      {(void**)&da, mi * 2}, {(void**)&db, mi * 2}, {(void**)&dt, mi * 2},
-      {(void**)&dcn, transpose_dcn ? ri * 2 : 0}, {(void**)&dcnT, ri * 2},
-      {(void**)&dO, rc * 2}, {(void**)&dt2pre, mc * 2}, {(void**)&dx, rc * 2},
+      {(void**)&dpre, (split_cdx && dpre) ? mp * 2 : 0},
+      {(void**)&da, da ? mi * 2 : 0}, {(void**)&db, db ? mi * 2 : 0}, {(void**)&dt, dt ? mi * 2 : 0},
+      {(void**)&dcn, (transpose_dcn && dcn) ? ri * 2 : 0}, {(void**)&dcnT, dcnT ? ri * 2 : 0},
+      {(void**)&dO, dO ? rc * 2 : 0}, {(void**)&dt2pre, dt2pre ? mc * 2 : 0}, {(void**)&dx, dx ? rc * 2 : 0},
       {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
       {(void**)&cmu, (size_t)M * 4}, {(void**)&crstd, (size_t)M * 4},
-      {(void**)&out, need_out ? mc * 2 : 0},
+      {(void**)&out, (need_out && out) ? mc * 2 : 0},
     };
   }
 
@@ -1105,14 +1115,9 @@ struct TriMul {
       // Evoformer fuses the output gate into its residual add and so sets
       // need_out = false, while the template pair block reads `out`.  A
       // buffer the donor does not own is simply kept, and the saving is the
-      // rest.  A donor buffer that exists but is TOO SMALL is a different
-      // thing entirely and still aborts.
-      if (!theirs[i].second) continue;
-      if (theirs[i].second < mine[i].second) {
-        fprintf(stderr, "%s: scratch[%zu] donor has %zu bytes, needs %zu\n",
-                who, i, theirs[i].second, mine[i].second);
-        exit(1);
-      }
+      // rest.  A donor buffer that is smaller (e.g. a chunked donor buffer
+      // vs an unchunked shorter recipient) is likewise kept.
+      if (!theirs[i].second || theirs[i].second < mine[i].second) continue;
       if (*mine[i].first) CU(cudaFree(*mine[i].first));
       *mine[i].first = *theirs[i].first;
     }

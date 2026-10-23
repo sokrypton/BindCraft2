@@ -143,7 +143,7 @@ struct Block {
   // block's own, because a module captures S at alloc time -- the first
   // attempt inflated S instead and the gate read grad/pair 0.12.
   void alloc(int N_, int S_, cudaStream_t s = nullptr,
-             const Block* donor = nullptr) {
+             Block* donor = nullptr) {
     // PAIR_ONLY COLLAPSES THE TWO BLOCK ORDERS.  The extra-MSA stack runs
     // with its whole msa track dead and its outer product mean replaced by a
     // constant (output_b / eps, because the extra alignment is entirely
@@ -156,6 +156,7 @@ struct Block {
     // rather than branched twice below.
     if (pair_only) opm_first = true;
     N = N_; S = S_; st = s;
+    const bool lean = nblean::on();
     size_t fb0 = 0, tb0 = 0;
     const bool mem = envOn("BLK_MEM");
     if (mem) { CU(cudaMemGetInfo(&fb0, &tb0)); fprintf(stderr, "BLK_MEM N=%d S=%d\n", N, S); }
@@ -175,7 +176,7 @@ struct Block {
       p4 = donor->p4; p5 = donor->p5; p6 = donor->p6;
       p1b = donor->p1b; p2b = donor->p2b; p3b = donor->p3b;
       p4b = donor->p4b; p5b = donor->p5b;
-      dp = donor->dp;
+      dp = lean ? nullptr : donor->dp;
     } else if (BLK_BF16CHAIN) {
       p1 = p2 = p3 = p4 = p5 = p6 = nullptr;
     } else if (BLK_ONEPF) {
@@ -188,23 +189,32 @@ struct Block {
       for (auto q : {&p1b, &p2b, &p3b, &p4b, &p5b}) CU(cudaMalloc(q, np * 2));
     for (auto q : {&m0b, &m1b, &m2b}) CU(cudaMalloc(q, nm * 2));
     if (!opm_first) {
-      if (donor) p0b = donor->p0b; else CU(cudaMalloc(&p0b, np * 2));
+      p0b = nullptr;
       CU(cudaMalloc(&m3b, nm * 2));
     }
     if (!donor) CU(cudaMalloc(&p6b, np * 2)); else p6b = donor->p6b;
     // the OPM's per-(r,c) normaliser, built once a call instead of once an
     // element -- see opmNzK in common.cuh
     if (!donor) CU(cudaMalloc(&opmNz, (size_t)N * N * 4)); else opmNz = donor->opmNz;
-    if (!donor) CU(cudaMalloc(&dp, np * 2));
-    CU(cudaMalloc(&dm, nm * 4)); CU(cudaMalloc(&sm, nm * 4));
+    if (!lean) {
+      if (!donor || !dp) CU(cudaMalloc(&dp, np * 2));
+      CU(cudaMalloc(&dm, nm * 4)); CU(cudaMalloc(&sm, nm * 4));
+    } else {
+      dp = nullptr; dm = sm = nullptr;
+    }
     // THE MASKED COTANGENT NEEDS ITS OWN BUFFER.  Forward is
     // out = in + mask * delta, so on the way back the DELTA's cotangent is
     // mask * dp while the residual's passthrough is dp unscaled -- the two
     // differ, and the aliased dp-as-both form cannot express that.  The
     // module still ACCUMULATES into dp, so the 57.6 ms the scratch-then-accK
     // form used to cost is not reintroduced; only the scaling is new.
-    if (use_dropout) CU(cudaMalloc(&ddrop, np * 2));   // bf16, as dp is
-    if (use_dropout) CU(cudaMalloc(&mdrop, nm * 4));
+    if (use_dropout && !lean) {
+      if (donor && donor->ddrop) ddrop = donor->ddrop;
+      else CU(cudaMalloc(&ddrop, np * 2));   // bf16, as dp is
+      CU(cudaMalloc(&mdrop, nm * 4));
+    } else {
+      ddrop = nullptr; mdrop = nullptr;
+    }
     if (use_dropout) { CU(cudaMalloc(&drop_seed, 8)); CU(cudaMemset(drop_seed, 0, 8)); }
 
     // BLK_MEM reports what each module's scratch costs.  The stack holds ONE
@@ -232,7 +242,7 @@ struct Block {
       col.alloc(N, S, st);                                  took("msa_col");
       mtr.alloc(S * N, CM, st);                             took("msa_trans");
     }
-    if (donor) {
+    if (donor && donor->N == N) {
       // the five pair modules are N-only, so a memberwise copy IS "use the
       // same buffers"; their weight pointers are overwritten per depth by
       // the stack's own use(), and keepSlots()/weightSlots() hand out
@@ -247,12 +257,12 @@ struct Block {
     // not; the decision has to be made HERE because the buffer is allocated at
     // alloc() time now, not on first use.  See trimul_body.cuh.
     tmo.need_out = tmi.need_out = envOn("NO_FUSE_OUTGATE");
-    tmo.alloc(N, true);                                     took("trimul_out");
-    tmi.alloc(N, false);                                    took("trimul_in");
-    tas.alloc(N, false); tas.allocOrientation();            took("triattn_start");
-    tae.alloc(N, true);  tae.allocOrientation();            took("triattn_end");
+    tmo.alloc(N, true);  if (donor) tmo.adoptScratchFrom(donor->tmo, "block.tmo"); took("trimul_out");
+    tmi.alloc(N, false); if (donor) tmi.adoptScratchFrom(donor->tmi, "block.tmi"); took("trimul_in");
+    tas.alloc(N, false); tas.allocOrientation(); if (donor) tas.adoptScratchFrom(donor->tas, "block.tas"); took("triattn_start");
+    tae.alloc(N, true);  tae.allocOrientation(); if (donor) tae.adoptScratchFrom(donor->tae, "block.tae"); took("triattn_end");
     ptr.is_pair = true;                       // KEEP_RELU, see transition.cuh
-    ptr.alloc(N * N, CZ, st);                               took("pair_trans");
+    ptr.alloc(N * N, CZ, st); if (donor) ptr.adoptScratchFrom(donor->ptr, "block.ptr"); took("pair_trans");
     }
     // THE PAIRS SHARE THEIR BACKWARD SCRATCH.  backward() runs
     // d:pair_trans, d:triattn_end, d:triattn_start, d:trimul_in, d:trimul_out
@@ -263,7 +273,7 @@ struct Block {
     // are built from keepSlots() below, which this does not touch.
     // ...and a donated block has already had this done to it, so doing it
     // again would free the donor's buffers a second time.
-    if (BLK_SHARE_DSCRATCH && !donor) {
+    if (BLK_SHARE_DSCRATCH && (!donor || donor->N < N)) {
       tmi.adoptBackwardScratch(tmo);
       tae.adoptBackwardScratch(tas);
       took("shared d-scratch (negative = freed)");

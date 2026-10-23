@@ -100,8 +100,12 @@ struct Heads {
     CU(cudaMalloc(&plddt, (size_t)N * PL_BINS * 4));
     CU(cudaMalloc(&muS, (size_t)N * 4));
     CU(cudaMalloc(&rsS, (size_t)N * 4));
-    CU(cudaMalloc(&dtmp, (size_t)N * PL_C * 4));
-    CU(cudaMalloc(&dtmp2, (size_t)N * CS * 4));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dtmp, (size_t)N * PL_C * 4));
+      CU(cudaMalloc(&dtmp2, (size_t)N * CS * 4));
+    } else {
+      dtmp = dtmp2 = nullptr;
+    }
     CU(cudaMalloc(&expres, (size_t)N * NER * 4));
   }
 

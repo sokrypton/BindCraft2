@@ -188,13 +188,18 @@ struct Opm {
     auto B = [&](__nv_bfloat16** p, size_t n) { CU(cudaMalloc(p, n * 2)); };
     B(&a, Mm * CM); B(&lr, Mm * 2 * O); B(&left, Mm * O); B(&right, Mm * O);
     B(&L, (size_t)N * S * O); B(&T, (size_t)S * O * N * CZ); B(&out, Mp * CZ);
-    // dT doubles as the narrowed incoming gradient, which is [N][N][Cz] --
-    // bigger than the [S*O][N*Cz] it holds later, so size it for the larger
-    B(&dT, Mp * CZ); B(&dTt, (size_t)S * O * N * CZ);
-    B(&dright, Mm * O); B(&dlr, Mm * 2 * O); B(&da, Mm * CM);
-    B(&dLb, (size_t)N * S * O);
+    if (!nblean::on()) {
+      // dT doubles as the narrowed incoming gradient, which is [N][N][Cz] --
+      // bigger than the [S*O][N*Cz] it holds later, so size it for the larger
+      B(&dT, Mp * CZ); B(&dTt, (size_t)S * O * N * CZ);
+      B(&dright, Mm * O); B(&dlr, Mm * 2 * O); B(&da, Mm * CM);
+      B(&dLb, (size_t)N * S * O);
+      CU(cudaMalloc(&dL, (size_t)N * S * O * 4));
+    } else {
+      dT = dTt = dright = dlr = da = dLb = nullptr;
+      dL = nullptr;
+    }
     CU(cudaMalloc(&mu, Mm * 4)); CU(cudaMalloc(&rstd, Mm * 4));
-    CU(cudaMalloc(&dL, (size_t)N * S * O * 4));
   }
 
 

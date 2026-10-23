@@ -418,10 +418,15 @@ struct Trans {
     h_chunked = trRows < (size_t)M && is_pair && C_ == 128 && !split_mask;
     CU(cudaMalloc(&h, (h_chunked ? trRows * I : mi) * 2));
     CU(cudaMalloc(&out, mc * 2));
-    CU(cudaMalloc(&dy, cc * 2));
-    CU(cudaMalloc(&dr, ci * 2));
-    CU(cudaMalloc(&dxn, cc * 2));
-    if (is_pair) CU(cudaMalloc(&hbit, mi / 8));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dy, cc * 2));
+      CU(cudaMalloc(&dr, ci * 2));
+      CU(cudaMalloc(&dxn, cc * 2));
+      if (is_pair) CU(cudaMalloc(&hbit, mi / 8));
+    } else {
+      dy = dr = dxn = nullptr;
+      hbit = nullptr;
+    }
     CU(cudaMalloc(&mu, (size_t)M * 4));
     CU(cudaMalloc(&rstd, (size_t)M * 4));
   }
@@ -443,8 +448,8 @@ struct Trans {
       {(void**)&xn, cc * 2},
       {(void**)&h, (h_chunked ? trRows * I : mi) * 2},
       {(void**)&out, mc * 2},
-      {(void**)&dy, cc * 2}, {(void**)&dr, ci * 2}, {(void**)&dxn, cc * 2},
-      {(void**)&hbit, is_pair ? mi / 8 : 0},
+      {(void**)&dy, dy ? cc * 2 : 0}, {(void**)&dr, dr ? ci * 2 : 0}, {(void**)&dxn, dxn ? cc * 2 : 0},
+      {(void**)&hbit, (is_pair && hbit) ? mi / 8 : 0},
       {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
     };
   }

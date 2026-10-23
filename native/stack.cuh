@@ -44,7 +44,10 @@ namespace stack {
 // it allocates, so a block told S=8 cannot then be run at S=1.
 static block::Block* g_donor = nullptr;
 static int g_donor_N = 0;
-static bool g_donor_opm = false;
+static bool g_donor_lean = false;
+static block::Block* g_root_donor = nullptr;
+static int g_root_donor_N = 0;
+static bool g_root_donor_lean = false;
 
 struct Stack {
   block::Block b;
@@ -127,15 +130,32 @@ struct Stack {
               "is already in use\n", (tb0 - fb0) / 1e9, tb0 / 1e9);
     }
     // THE DONOR, OR A FRESH SET.  NE_SHARE_BLOCK=0 opts out.
+    for (size_t k = 0; k < fslots.size(); ++k)
+      if (forig[k]) *fslots[k] = forig[k];
     const bool share = envOnDef("NE_SHARE_BLOCK", true);
-    const bool take = share && g_donor && g_donor_N == N &&
-                      g_donor_opm == b.opm_first;
-    b.alloc(N, S, st, take ? g_donor : nullptr);
+    const bool lean = nblean::on();
+    block::Block* donor = nullptr;
+    if (share) {
+      if (g_donor && g_donor_N == N && (!g_donor_lean || lean))
+        donor = g_donor;
+      else if (!nbrealloc::active() && g_root_donor && g_root_donor_N >= N &&
+               (!g_root_donor_lean || lean))
+        donor = g_root_donor;
+    }
+    const bool take = donor != nullptr;
+    b.alloc(N, S, st, donor);
     shared_scratch = take;
-    if (share && !take) {
+    if (share && (!take || donor->N != N)) {
       g_donor = new block::Block(b);
-      g_donor_N = N; g_donor_opm = b.opm_first;
+      g_donor_N = N; g_donor_lean = lean;
       // the DONOR's own forig buffers must outlive it too
+      shared_scratch = true;
+    }
+    if (share && !take && !nbrealloc::active() &&
+        (!g_root_donor || N > g_root_donor_N ||
+         (N == g_root_donor_N && g_root_donor_lean && !lean))) {
+      g_root_donor = new block::Block(b);
+      g_root_donor_N = N; g_root_donor_lean = lean;
       shared_scratch = true;
     }
     if (getenv("BLK_MEM") && take)
@@ -147,6 +167,8 @@ struct Stack {
               (fb0 - fb1) / 1e9);
     }
     slots = b.weightSlots();
+    fslots.clear(); fsize.clear(); ftier.clear(); forig.clear();
+    for (int t = 0; t < KEEP_NTIER; ++t) tstride[t] = 0;
     for (auto& k : b.keepSlots()) {
       fslots.push_back(k.slot); fsize.push_back(k.bytes); ftier.push_back(k.tier);
       forig.push_back(*k.slot);          // the module's own buffer, to restore
@@ -313,7 +335,7 @@ struct Stack {
         tdepth[t] = (tbase[t] && tstride[t])
                       ? (int)std::min((size_t)depth, tbytes[t] / tstride[t]) : 0;
     }
-    const bool no_keep = envOn("NO_FLASH_KEEP") || defer_keep;
+    const bool no_keep = envOn("NO_FLASH_KEEP") || defer_keep || nblean::on();
     // NO_FLASH_KEEP keeps its old meaning -- drop EVERYTHING -- because it is
     // what the scaling sweep and the L=384 fallback measurement used, and a
     // flag that silently started meaning "drop one tier" would make those
@@ -505,6 +527,85 @@ struct Stack {
     if (!took)
       fprintf(stderr, "stack: regrant found nothing it could take "
               "(%.2f GB free, %.2f GB held back)\n", freeb / 1e9, margin / 1e9);
+  }
+
+  // Re-plan two stacks (`other` = extra, `*this` = trunk) tier-by-tier from a
+  // single shared budget so high-value tiers (e.g. trunk's KEEP_FLASH at
+  // 22 ms/GB and KEEP_ACTS at 9.3 ms/GB) are funded before either stack spends
+  // budget on lower-value tiers (e.g. extra's KEEP_TMUL_T at 8.5 ms/GB).
+  void regrantWith(Stack& other) {
+    if (regranted || graph_on || envOn("NO_REGRANT") || nblean::on()) return;
+    if (const char* a = getenv("REGRANT_AFTER")) {
+      regrant_after = atoi(a);
+      other.regrant_after = regrant_after;
+    }
+    ++other.save_fwds;
+    if (++save_fwds <= regrant_after) return;
+    regranted = true;
+    other.regranted = true;
+    other.ensureSaveSet();
+    ensureSaveSet();
+    const bool no_keep = envOn("NO_FLASH_KEEP");
+    const bool want_acts = envOnDef("NE_KEEP_ACTS", true);
+    const char* drop = getenv("NO_KEEP_TIER");
+    if (no_keep) return;
+    Stack* pair[2] = {&other, this};
+    bool any = false;
+    bool locked[2][KEEP_NTIER] = {};
+    size_t given_back = 0;
+    for (int s = 0; s < 2; ++s) {
+      for (int t = 0; t < KEEP_NTIER; ++t)
+        if (pair[s]->tstride[t] && !pair[s]->full(t)) any = true;
+      for (size_t k = 0; k < pair[s]->fslots.size(); ++k)
+        if (!pair[s]->forig[k]) locked[s][pair[s]->ftier[k]] = true;
+      for (int t = 0; t < KEEP_NTIER; ++t)
+        if (!locked[s][t] && pair[s]->tbase[t]) {
+          CU(cudaFree(pair[s]->tbase[t]));
+          given_back += (size_t)pair[s]->tdepth[t] * pair[s]->tstride[t];
+          pair[s]->tbase[t] = nullptr; pair[s]->tdepth[t] = 0;
+        }
+    }
+    if (!any) return;
+    size_t freeb = 0, totalb = 0;
+    CU(cudaMemGetInfo(&freeb, &totalb));
+    size_t margin = totalb / 16;
+    if (const char* kb = getenv("REGRANT_BUDGET_MB"))
+      margin = freeb > (size_t)atoll(kb) * 1000000
+                   ? freeb - (size_t)atoll(kb) * 1000000 : 0;
+    size_t budget = freeb > margin ? freeb - margin : 0;
+    for (int t = 0; t < KEEP_NTIER; ++t) {
+      if (drop && atoi(drop) == t) continue;
+      if ((t == KEEP_ACTS || t == KEEP_TMUL_T) && !want_acts) continue;
+      if (t == KEEP_RELU && !envOn("NE_KEEP_RELU")) continue;
+      for (int s = 0; s < 2; ++s) {
+        Stack* stp = pair[s];
+        if (!stp->tstride[t] || locked[s][t] || stp->full(t)) continue;
+        int n = (int)std::min((size_t)stp->depth, budget / stp->tstride[t]);
+        if (keepWholeOnly(t) && n < stp->depth) n = 0;
+        while (n > 0 && cudaMalloc(&stp->tbase[t], (size_t)n * stp->tstride[t]) != cudaSuccess) {
+          cudaGetLastError();
+          stp->tbase[t] = nullptr; n /= 2;
+          if (keepWholeOnly(t)) { n = 0; break; }
+        }
+        stp->tdepth[t] = stp->tbase[t] ? n : 0;
+        stp->tbytes[t] = (size_t)stp->tdepth[t] * stp->tstride[t];
+        budget -= stp->tbytes[t];
+      }
+    }
+    for (int s = 0; s < 2; ++s) {
+      Stack* stp = pair[s];
+      for (int t = 0; t < KEEP_NTIER; ++t)
+        if (stp->tstride[t] && !locked[s][t])
+          fprintf(stderr, "stack: regrant tier '%s' now %d of %d depths "
+                  "(%.2f GB free after handing %.2f GB back, %.2f GB held "
+                  "back)\n", keepName(t), stp->tdepth[t], stp->depth,
+                  freeb / 1e9, given_back / 1e9, margin / 1e9);
+      for (size_t k = 0; k < stp->fslots.size(); ++k)
+        if (stp->full(stp->ftier[k]) && stp->forig[k] && !stp->shared_scratch) {
+          CU(cudaFree(stp->forig[k]));
+          stp->forig[k] = nullptr;
+        }
+    }
   }
 
   // setWeights() allocates and converts a fresh set of device buffers each

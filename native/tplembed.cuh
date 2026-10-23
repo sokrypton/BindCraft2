@@ -43,7 +43,22 @@ struct TplEmbed {
   tplstack::TplStack stack;
 
   template <class EvoBlock>
-  void adoptScratch(EvoBlock& b) { stack.adoptScratch(b); }
+  void adoptScratch(EvoBlock& b) {
+    stack.adoptScratch(b);
+    if (b.p1 && b.chainBytes() * 2 >= queryElems() * 4) {
+      if (qn && qn != b.p1) CU(cudaFree(qn));
+      qn = b.p1;
+      dqn = nblean::on() ? nullptr : qn;
+    }
+    if (b.p1b && b.chainBytes() >= pairElems() * 4) {
+      if (actb && actb != b.p1b) CU(cudaFree(actb));
+      actb = b.p1b;
+      if (!nblean::on()) {
+        if (dactb && dactb != b.p1b + pairElems()) CU(cudaFree(dactb));
+        dactb = b.p1b + pairElems();
+      }
+    }
+  }
 
   float *lnS = nullptr, *lnO = nullptr;     // query_embedding_norm
   float *w8 = nullptr, *b8 = nullptr;       // template_pair_embedding_8
@@ -65,10 +80,17 @@ struct TplEmbed {
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
     stack.alloc(N, depth, s);
-    for (auto q : {&qn, &dqn}) CU(cudaMalloc(q, queryElems() * 4));
-    for (auto q : {&act, &emb, &pre, &dact}) CU(cudaMalloc(q, pairElems() * 4));
+    CU(cudaMalloc(&qn, queryElems() * 4));
+    for (auto q : {&act, &emb, &pre}) CU(cudaMalloc(q, pairElems() * 4));
     CU(cudaMalloc(&actb, pairElems() * 2));
-    CU(cudaMalloc(&dactb, pairElems() * 2));
+    if (!nblean::on()) {
+      dqn = qn;
+      CU(cudaMalloc(&dact, pairElems() * 4));
+      CU(cudaMalloc(&dactb, pairElems() * 2));
+    } else {
+      dqn = dact = nullptr;
+      dactb = nullptr;
+    }
     CU(cudaMalloc(&mu, (size_t)N * N * 4));
     CU(cudaMalloc(&rs, (size_t)N * N * 4));
     CU(cudaMalloc(&mu2, (size_t)N * N * 4));

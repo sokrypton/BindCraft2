@@ -177,18 +177,30 @@ struct QuatRigid {
   float *flat = nullptr, *rotu = nullptr, *transu = nullptr;
   float *dflat = nullptr, *drotu = nullptr, *dtransu = nullptr;
 
-  void alloc(int N_, cudaStream_t s = nullptr) {
+  void alloc(int N_, cudaStream_t s = nullptr, QuatRigid* donor = nullptr) {
     N = N_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
     CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));   // Precision.HIGHEST
     size_t n = N;
-    CU(cudaMalloc(&flat, n * 6 * 4));
-    CU(cudaMalloc(&rotu, n * 9 * 4));
-    CU(cudaMalloc(&transu, n * 3 * 4));
-    CU(cudaMalloc(&dflat, n * 6 * 4));
-    CU(cudaMalloc(&drotu, n * 9 * 4));
-    CU(cudaMalloc(&dtransu, n * 3 * 4));
+    if (donor && nblean::on()) {
+      flat = donor->flat; rotu = donor->rotu; transu = donor->transu;
+    } else {
+      CU(cudaMalloc(&flat, n * 6 * 4));
+      CU(cudaMalloc(&rotu, n * 9 * 4));
+      CU(cudaMalloc(&transu, n * 3 * 4));
+    }
+    if (donor) {
+      dflat = donor->dflat; drotu = donor->drotu; dtransu = donor->dtransu;
+      return;
+    }
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dflat, n * 6 * 4));
+      CU(cudaMalloc(&drotu, n * 9 * 4));
+      CU(cudaMalloc(&dtransu, n * 3 * 4));
+    } else {
+      dflat = drotu = dtransu = nullptr;
+    }
   }
 
   void setStream(cudaStream_t s) {

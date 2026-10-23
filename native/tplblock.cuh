@@ -68,9 +68,14 @@ struct TplBlock {
   void alloc(int N_, cudaStream_t s = nullptr) {
     N = N_; st = s;
     size_t np = (size_t)N * N * CZ;
-    for (auto q : {&p2b, &p3b, &p4b, &p5b, &p6b, &dp})
+    for (auto q : {&p2b, &p3b, &p4b, &p5b, &p6b})
       CU(cudaMalloc(q, np * 2));
-    CU(cudaMalloc(&ddrop, np * 2));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dp, np * 2));
+      CU(cudaMalloc(&ddrop, np * 2));
+    } else {
+      dp = ddrop = nullptr;
+    }
     tmo.need_out = tmi.need_out = false;
     tmo.alloc(N, true);
     tmi.alloc(N, false);

@@ -110,15 +110,20 @@ struct StructureModule {
     stack.pos_scale = pos_scale;
     stack.alloc(N, depth, s);
     size_t nc = (size_t)N * C, np = (size_t)N * N * CZ;
-    for (auto q : {&initial, &act0, &dact0, &dinitial}) CU(cudaMalloc(q, nc * 4));
+    for (auto q : {&initial, &act0}) CU(cudaMalloc(q, nc * 4));
     CU(cudaMalloc(&pairN, np * 4));
-    CU(cudaMalloc(&dpairN, np * 4));
     for (auto q : {&muS, &rsS}) CU(cudaMalloc(q, (size_t)N * 4));
     for (auto q : {&muP, &rsP}) CU(cudaMalloc(q, (size_t)N * N * 4));
     CU(cudaMalloc(&rot0, (size_t)N * 9 * 4));
     CU(cudaMalloc(&trans0, (size_t)N * 3 * 4));
-    CU(cudaMalloc(&drot0, (size_t)N * 9 * 4));
-    CU(cudaMalloc(&dtrans0, (size_t)N * 3 * 4));
+    if (!nblean::on()) {
+      for (auto q : {&dact0, &dinitial}) CU(cudaMalloc(q, nc * 4));
+      CU(cudaMalloc(&dpairN, np * 4));
+      CU(cudaMalloc(&drot0, (size_t)N * 9 * 4));
+      CU(cudaMalloc(&dtrans0, (size_t)N * 3 * 4));
+    } else {
+      dact0 = dinitial = dpairN = drot0 = dtrans0 = nullptr;
+    }
   }
 
   // REBIND THE STREAM.  Every buffer in here comes from plain cudaMalloc,

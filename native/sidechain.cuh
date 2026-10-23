@@ -124,9 +124,14 @@ struct Sidechain {
     CU(cudaMalloc(&rF, nc * 4));
     CU(cudaMalloc(&raw, (size_t)N * NANG * 4));
     CU(cudaMalloc(&ang, (size_t)N * NANG * 4));
-    CU(cudaMalloc(&dtmp, nc * 4)); CU(cudaMalloc(&dtmp2, nc * 4));
-    CU(cudaMalloc(&dtmp3, nc * 4));
-    CU(cudaMalloc(&draw, (size_t)N * NANG * 4));
+    CU(cudaMalloc(&dtmp, nc * 4));
+    if (!nblean::on()) {
+      CU(cudaMalloc(&dtmp2, nc * 4));
+      CU(cudaMalloc(&dtmp3, nc * 4));
+      CU(cudaMalloc(&draw, (size_t)N * NANG * 4));
+    } else {
+      dtmp2 = dtmp3 = draw = nullptr;
+    }
   }
 
   void gemm(int M, int Nn, int K, const float* A, const float* B, float* D,
