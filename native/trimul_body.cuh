@@ -131,38 +131,35 @@ __global__ void lnBwdK(const __nv_bfloat16* __restrict__ dx,
 // 256 B away, so a warp issued 32 transactions for 64 useful bytes and the
 // kernel ran at 123 GB/s.  Splitting it costs one extra pass over a 16.8 MB
 // tensor and makes every access coalesced.
-__global__ void centerStatsK(const __nv_bfloat16* __restrict__ t, float* __restrict__ cmu,
-                             float* __restrict__ crstd, int M, int Mt) {
-  if ((Mt & 1) == 0) {
+__global__ void centerStatsK(
+    const __nv_bfloat16* __restrict__ t, float* __restrict__ cmu,
+    float* __restrict__ crstd, int M, int Mt) {
+  if ((Mt & 1) == 0 && (M & 1) == 0) {
     size_t ij0 = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2;
-    if (ij0 + 1 < (size_t)M) {
-      float s0 = 0.f, s1 = 0.f;
-#pragma unroll 8
-      for (int c = 0; c < I; ++c) {
-        __nv_bfloat162 v2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
-        s0 += __bfloat162float(v2.x);
-        s1 += __bfloat162float(v2.y);
-      }
-      float m0 = s0 / I, m1 = s1 / I;
-      float s2_0 = 0.f, s2_1 = 0.f;
-#pragma unroll 8
-      for (int c = 0; c < I; ++c) {
-        __nv_bfloat162 v2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
-        float d0 = __bfloat162float(v2.x) - m0;
-        float d1 = __bfloat162float(v2.y) - m1;
-        s2_0 += d0 * d0;
-        s2_1 += d1 * d1;
-      }
-      *(float2*)&cmu[ij0] = make_float2(m0, m1);
-      *(float2*)&crstd[ij0] = make_float2(rsqrtf(s2_0 / I + LN_EPS),
-                                          rsqrtf(s2_1 / I + LN_EPS));
-      return;
-    }
     if (ij0 >= (size_t)M) return;
+    float s0 = 0.f, s1 = 0.f;
+#pragma unroll 8
+    for (int c = 0; c < I; ++c) {
+      __nv_bfloat162 v2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+      s0 += __bfloat162float(v2.x);
+      s1 += __bfloat162float(v2.y);
+    }
+    float m0 = s0 / I, m1 = s1 / I;
+    float s2_0 = 0.f, s2_1 = 0.f;
+#pragma unroll 8
+    for (int c = 0; c < I; ++c) {
+      __nv_bfloat162 v2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+      float d0 = __bfloat162float(v2.x) - m0;
+      float d1 = __bfloat162float(v2.y) - m1;
+      s2_0 += d0 * d0;
+      s2_1 += d1 * d1;
+    }
+    *(float2*)&cmu[ij0] = make_float2(m0, m1);
+    *(float2*)&crstd[ij0] = make_float2(rsqrtf(s2_0 / I + LN_EPS),
+                                        rsqrtf(s2_1 / I + LN_EPS));
+    return;
   }
-  size_t ij = ((Mt & 1) == 0)
-                  ? ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2
-                  : ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
+  size_t ij = ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
   if (ij >= (size_t)M) return;
   // TWO PASSES: mean((x-mu)^2), which is what AF2 computes
   // (use_fast_variance=False), NOT E[x^2] - E[x]^2.
@@ -200,22 +197,19 @@ __global__ void centerWriteK(const __nv_bfloat16* __restrict__ t,
                              const float* __restrict__ cmu, const float* __restrict__ crstd,
                              __nv_bfloat16* __restrict__ cn, int M, int Mt) {
   if ((Mt & 1) == 0) {
-    __shared__ float tile2[TILE][2 * TILE + 2];
+    __shared__ __nv_bfloat16 tile2[TILE][2 * TILE + 2];
     int ij0 = blockIdx.x * (2 * TILE), c0 = blockIdx.y * TILE;
     int ij_in = ij0 + threadIdx.x * 2;
 #pragma unroll
     for (int j = 0; j < TILE; j += 8) {
       int c = c0 + threadIdx.y + j;
-      float v0 = 0.f, v1 = 0.f;
+      __nv_bfloat162 b2 = __floats2bfloat162_rn(0.f, 0.f);
       if (ij_in + 1 < M) {
-        __nv_bfloat162 b2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij_in];
-        v0 = __bfloat162float(b2.x);
-        v1 = __bfloat162float(b2.y);
+        b2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij_in];
       } else if (ij_in < M) {
-        v0 = __bfloat162float(t[(size_t)c * Mt + ij_in]);
+        b2.x = t[(size_t)c * Mt + ij_in];
       }
-      tile2[threadIdx.y + j][threadIdx.x * 2] = v0;
-      tile2[threadIdx.y + j][threadIdx.x * 2 + 1] = v1;
+      *(__nv_bfloat162*)&tile2[threadIdx.y + j][threadIdx.x * 2] = b2;
     }
     __syncthreads();
     int tid = threadIdx.y * TILE + threadIdx.x;
@@ -228,8 +222,8 @@ __global__ void centerWriteK(const __nv_bfloat16* __restrict__ t,
       int r = j + r_sub, ij = ij0 + r;
       if (ij < M) {
         float m = cmu[ij], rs = crstd[ij];
-        float y0 = (tile2[cl][r] - m) * rs * sc2.x + of2.x;
-        float y1 = (tile2[cl + 1][r] - m) * rs * sc2.y + of2.y;
+        float y0 = (__bfloat162float(tile2[cl][r]) - m) * rs * sc2.x + of2.x;
+        float y1 = (__bfloat162float(tile2[cl + 1][r]) - m) * rs * sc2.y + of2.y;
         *(__nv_bfloat162*)&cn[(size_t)ij * I + c_out] = __floats2bfloat162_rn(y0, y1);
       }
     }
@@ -386,53 +380,48 @@ __global__ void transposeRowToChanK(const __nv_bfloat16* __restrict__ src,
 #define PROBE_ONEPASS 0
 #endif
 template <bool ROWMAJ = false>
-__global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
-                             const __nv_bfloat16* __restrict__ t,
-                             const float* __restrict__ scale, const float* __restrict__ cmu,
-                             const float* __restrict__ crstd,
-                             __nv_bfloat16* __restrict__ dt, int M, int Mt,
-                             int Mdc) {
-  if (!ROWMAJ && !PROBE_ONEPASS && (Mt & 1) == 0 && (Mdc & 1) == 0) {
+__global__ void centerLnBwdK(
+    const __nv_bfloat16* __restrict__ dcnT,
+    const __nv_bfloat16* __restrict__ t,
+    const float* __restrict__ scale, const float* __restrict__ cmu,
+    const float* __restrict__ crstd,
+    __nv_bfloat16* __restrict__ dt, int M, int Mt,
+    int Mdc) {
+  if (!ROWMAJ && !PROBE_ONEPASS && (Mt & 1) == 0 && (Mdc & 1) == 0 && (M & 1) == 0) {
     size_t ij0 = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2;
-    if (ij0 + 1 < (size_t)M) {
-      float2 m2 = *(const float2*)&cmu[ij0];
-      float2 r2 = *(const float2*)&crstd[ij0];
-      float sum_d0 = 0.f, sum_dx0 = 0.f, sum_d1 = 0.f, sum_dx1 = 0.f;
-#pragma unroll 8
-      for (int c = 0; c < I; ++c) {
-        __nv_bfloat162 tv = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
-        __nv_bfloat162 dv = *(const __nv_bfloat162*)&dcnT[(size_t)c * Mdc + ij0];
-        float sc = scale[c];
-        float xhat0 = (__bfloat162float(tv.x) - m2.x) * r2.x;
-        float dxhat0 = __bfloat162float(dv.x) * sc;
-        sum_d0 += dxhat0; sum_dx0 += dxhat0 * xhat0;
-        float xhat1 = (__bfloat162float(tv.y) - m2.y) * r2.y;
-        float dxhat1 = __bfloat162float(dv.y) * sc;
-        sum_d1 += dxhat1; sum_dx1 += dxhat1 * xhat1;
-      }
-      float mean_d0 = sum_d0 / I, mean_dx0 = sum_dx0 / I;
-      float mean_d1 = sum_d1 / I, mean_dx1 = sum_dx1 / I;
-#pragma unroll 8
-      for (int c = 0; c < I; ++c) {
-        size_t o = (size_t)c * Mt + ij0;
-        __nv_bfloat162 tv = *(const __nv_bfloat162*)&t[o];
-        __nv_bfloat162 dv = *(const __nv_bfloat162*)&dcnT[(size_t)c * Mdc + ij0];
-        float sc = scale[c];
-        float xhat0 = (__bfloat162float(tv.x) - m2.x) * r2.x;
-        float dxhat0 = __bfloat162float(dv.x) * sc;
-        float xhat1 = (__bfloat162float(tv.y) - m2.y) * r2.y;
-        float dxhat1 = __bfloat162float(dv.y) * sc;
-        *(__nv_bfloat162*)&dt[o] = __floats2bfloat162_rn(
-            r2.x * (dxhat0 - mean_d0 - xhat0 * mean_dx0),
-            r2.y * (dxhat1 - mean_d1 - xhat1 * mean_dx1));
-      }
-      return;
-    }
     if (ij0 >= (size_t)M) return;
+    float2 m2 = *(const float2*)&cmu[ij0], r2 = *(const float2*)&crstd[ij0];
+    float sum_d0 = 0.f, sum_dx0 = 0.f, sum_d1 = 0.f, sum_dx1 = 0.f;
+#pragma unroll 8
+    for (int c = 0; c < I; ++c) {
+      __nv_bfloat162 tv = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+      __nv_bfloat162 dv = *(const __nv_bfloat162*)&dcnT[(size_t)c * Mdc + ij0];
+      float sc = scale[c];
+      float xhat0 = (__bfloat162float(tv.x) - m2.x) * r2.x;
+      float dxhat0 = __bfloat162float(dv.x) * sc;
+      sum_d0 += dxhat0; sum_dx0 += dxhat0 * xhat0;
+      float xhat1 = (__bfloat162float(tv.y) - m2.y) * r2.y;
+      float dxhat1 = __bfloat162float(dv.y) * sc;
+      sum_d1 += dxhat1; sum_dx1 += dxhat1 * xhat1;
+    }
+    float mean_d0 = sum_d0 / I, mean_dx0 = sum_dx0 / I;
+    float mean_d1 = sum_d1 / I, mean_dx1 = sum_dx1 / I;
+#pragma unroll 8
+    for (int c = 0; c < I; ++c) {
+      __nv_bfloat162 tv = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+      __nv_bfloat162 dv = *(const __nv_bfloat162*)&dcnT[(size_t)c * Mdc + ij0];
+      float sc = scale[c];
+      float xhat0 = (__bfloat162float(tv.x) - m2.x) * r2.x;
+      float dxhat0 = __bfloat162float(dv.x) * sc;
+      float xhat1 = (__bfloat162float(tv.y) - m2.y) * r2.y;
+      float dxhat1 = __bfloat162float(dv.y) * sc;
+      *(__nv_bfloat162*)&dt[(size_t)c * Mt + ij0] = __floats2bfloat162_rn(
+          r2.x * (dxhat0 - mean_d0 - xhat0 * mean_dx0),
+          r2.y * (dxhat1 - mean_d1 - xhat1 * mean_dx1));
+    }
+    return;
   }
-  size_t ij = (!ROWMAJ && !PROBE_ONEPASS && (Mt & 1) == 0 && (Mdc & 1) == 0)
-                  ? ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2
-                  : ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
+  size_t ij = ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
   if (ij >= (size_t)M) return;
   float m = cmu[ij], r = crstd[ij];
   float sum_d = 0.f, sum_dx = 0.f;
@@ -726,17 +715,15 @@ __global__ void __launch_bounds__(32 * WF, TM_PROJ_MINB) projGateK(
         int e0 = ((i % 4) * 4) * 16 + c;
         float bg = __bfloat162float(bcat[ggate * I + c0 + c]);
         float bp = __bfloat162float(bcat[gproj * I + c0 + c]);
-        float gq[4], pq[4];
+        float gq[4];
 #pragma unroll
-        for (int u = 0; u < 4; ++u) {
+        for (int u = 0; u < 4; ++u)
           gq[u] = sigmoidf(st[256 + e0 + u * 16] + bg);
-          pq[u] = st[e0 + u * 16] + bp;
-        }
         size_t o = (size_t)(c0 + c) * Mt + r0 + row;
-        __nv_bfloat162 w0 = __floats2bfloat162_rn(mk[row] * pq[0] * gq[0],
-                                                  mk[row + 1] * pq[1] * gq[1]);
-        __nv_bfloat162 w1 = __floats2bfloat162_rn(mk[row + 2] * pq[2] * gq[2],
-                                                  mk[row + 3] * pq[3] * gq[3]);
+        __nv_bfloat162 w0 = __floats2bfloat162_rn(mk[row] * (st[e0] + bp) * gq[0],
+                                                  mk[row + 1] * (st[e0 + 16] + bp) * gq[1]);
+        __nv_bfloat162 w1 = __floats2bfloat162_rn(mk[row + 2] * (st[e0 + 32] + bp) * gq[2],
+                                                  mk[row + 3] * (st[e0 + 48] + bp) * gq[3]);
         *(__nv_bfloat162*)(out + o) = w0;
         *(__nv_bfloat162*)(out + o + 2) = w1;
         if (KEEPG) {
@@ -1001,9 +988,9 @@ __global__ void TM_LB(32 * WG) combineDxK(
   for (int r = 0; r < RTG; ++r) nvcuda::wmma::fill_fragment(acc[r], 0.f);
 
   // dx += dp[.][.] @ wcatT[g*I ..][.], the 16 columns this warp owns
-#define TM_CONTRACT(SRC, G)                                                    \
+#define TM_CONTRACT(SRC, G, SYNC)                                              \
   do {                                                                         \
-    __syncthreads();                                                           \
+    if (SYNC) __syncthreads();                                                 \
     for (int kk = 0; kk < I / 16; ++kk) {                                      \
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __nv_bfloat16, \
                              nvcuda::wmma::row_major> fb;                      \
@@ -1015,8 +1002,9 @@ __global__ void TM_LB(32 * WG) combineDxK(
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16,               \
                              __nv_bfloat16, nvcuda::wmma::row_major> fa[RTG];  \
       _Pragma("unroll") for (int r = 0; r < RTG; ++r)                          \
-        nvcuda::wmma::load_matrix_sync(fa[TM_LOADALL ? r : 0],                 \
-            (SRC) + (size_t)(r * 16) * LDG + (PROBE_LDS ? 0 : kk) * 16, LDG);  \
+        if (TM_LOADALL)                                                        \
+          nvcuda::wmma::load_matrix_sync(fa[r],                                \
+              (SRC) + (size_t)(r * 16) * LDG + (PROBE_LDS ? 0 : kk) * 16, LDG);\
       _Pragma("unroll") for (int r = 0; r < RTG; ++r) {                        \
         if (!TM_LOADALL)                                                       \
           nvcuda::wmma::load_matrix_sync(fa[0],                                \
@@ -1079,21 +1067,22 @@ __global__ void TM_LB(32 * WG) combineDxK(
   if (TM_CDX4) {
     build(da, a, gl, dp0, dp1, false);
     build(db, bb, gr, dq0, dq1, false);
-    TM_CONTRACT(dp0, 0); TM_CONTRACT(dp1, 2);
-    TM_CONTRACT(dq0, 1); TM_CONTRACT(dq1, 3);
+    TM_CONTRACT(dp0, 0, true);  TM_CONTRACT(dp1, 2, false);
+    TM_CONTRACT(dq0, 1, false); TM_CONTRACT(dq1, 3, false);
   } else {
-    build(da, a, gl, dp0, dp1, false); TM_CONTRACT(dp0, 0);  TM_CONTRACT(dp1, 2);
-    build(db, bb, gr, dp0, dp1, true);  TM_CONTRACT(dp0, 1);  TM_CONTRACT(dp1, 3);
+    build(da, a, gl, dp0, dp1, false); TM_CONTRACT(dp0, 0, true); TM_CONTRACT(dp1, 2, false);
+    build(db, bb, gr, dp0, dp1, true);  TM_CONTRACT(dp0, 1, true); TM_CONTRACT(dp1, 3, false);
   }
   // group 4 is the output gate, already row-major and already a gradient
   __syncthreads();   // the group-1/3 contraction is still reading dp0
+#pragma unroll
   for (int i = tid; i < BMG * (C / 8); i += 32 * WG) {
     int row = i / (C / 8), c8 = (i % (C / 8)) * 8;
     *(uint4*)(dp0 + (size_t)row * LDG + c8) =
         row < nrow ? *(const uint4*)(dt2pre + (r0 + row) * C + c8)
                    : make_uint4(0u, 0u, 0u, 0u);
   }
-  TM_CONTRACT(dp0, 4);
+  TM_CONTRACT(dp0, 4, true);
 #undef TM_CONTRACT
 
   const int c0 = warp * 16;
@@ -1651,7 +1640,7 @@ struct TriMul {
         const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
         const int cw_tile = ((M & 1) == 0) ? (2 * TILE) : TILE;
         dim3 gt((pm + cw_tile - 1) / cw_tile, I / TILE);
-        const int cs_rows = ((M & 1) == 0) ? (pm + 1) / 2 : pm;
+        const int cs_rows = ((M & 1) == 0 && (pm & 1) == 0) ? (pm + 1) / 2 : pm;
         PROF_STEP("tm.f centerLn",
           if (!haveStats)
             centerStatsK<<<(cs_rows + 255) / 256, 256, 0, st>>>(t + p0, cmu + p0,

@@ -128,21 +128,25 @@ struct TplStack {
     // CHAIN THROUGH p1store, NOT THROUGH p6b.  With one block, p6b is both
     // this depth's output and the next depth's input, and forward() only
     // points p1b at what it is handed -- so the next block would overwrite
-    // its own input.  Copying each output into the next depth's input buffer
-    // breaks that, and the copy is the same np*2 the save already costs.
+    // its own input.  Writing each non-final block's output directly into
+    // p1store[b + 1] breaks that without a device-to-device copy.
+    __nv_bfloat16* const p6b_orig = blk.p6b;
     for (int b = 0; b < depth; ++b) {
       const __nv_bfloat16* in = pair;
       if (b) {
-        CU(cudaMemcpyAsync(p1store[b], blk.p6b, np * 2,
-                           cudaMemcpyDeviceToDevice, st));
+        if (blk.p6b != p1store[b])
+          CU(cudaMemcpyAsync(p1store[b], blk.p6b, np * 2,
+                             cudaMemcpyDeviceToDevice, st));
         in = p1store[b];
       } else if (for_bwd) {
         in = p1store[0];
       }
+      blk.p6b = (b + 1 < depth && p1store[b + 1] != in) ? p1store[b + 1] : p6b_orig;
       use(b);
       const bool last_bwd = for_bwd && (b == depth - 1);
       blk.forward(in, pair_mask, /*keepBwd=*/last_bwd, /*tail=*/true, /*haveMaskT=*/(b > 0));
     }
+    blk.p6b = p6b_orig;
   }
 
   void backward(const __nv_bfloat16* ct, const float* pair_mask,
@@ -157,14 +161,17 @@ struct TplStack {
       // intermediates live at once, which is exactly what cost a module scratch
       // set per depth; here only the last block's survive, and p1store holds
       // what is needed to regenerate the rest.
+      __nv_bfloat16* const p6b_orig = blk.p6b;
       for (int b = 0; b < depth; ++b) {
+        blk.p6b = (b + 1 < depth && p1store[b + 1] != p1store[b]) ? p1store[b + 1] : p6b_orig;
         use(b);
         const bool last = (b == depth - 1);
         blk.forward(p1store[b], pair_mask, /*keepBwd=*/last, /*tail=*/!last, /*haveMaskT=*/(b > 0));
-        if (b + 1 < depth)
+        if (b + 1 < depth && blk.p6b != p1store[b + 1])
           CU(cudaMemcpyAsync(p1store[b + 1], blk.p6b, np * 2,
                              cudaMemcpyDeviceToDevice, st));
       }
+      blk.p6b = p6b_orig;
     }
     // PASS 2 walks back, replaying each block immediately before its own
     // backward -- stack.cuh's pattern.  The block that pass 1 finished on is

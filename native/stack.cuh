@@ -1021,6 +1021,8 @@ struct Stack {
     // BLK_BF16CHAIN: from block 1 on, the previous block's output is ALREADY
     // bf16, so the narrowing below is a copy.  Only the stack's own input is
     // f32.
+    __nv_bfloat16* const p6b_orig = b.p6b;
+    float* const m3_orig = b.m3;
     const __nv_bfloat16* pb = nullptr;
     for (int i = 0; i < depth; ++i) {
       const __nv_bfloat16* p_in = nullptr;
@@ -1028,9 +1030,14 @@ struct Stack {
       if (save_full || !BLK_BF16CHAIN || save_probe) {
         // narrow on save: this IS the approximation, and it is also what
         // makes the forward and the replay see the same values
-        if (pb) CU(cudaMemcpyAsync(pin[i], pb, np * 2, cudaMemcpyDeviceToDevice, b.st));
-        else toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pin[i], p, np);
-        CU(cudaMemcpyAsync(min_[i], m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
+        if (pb) {
+          if (pb != pin[i])
+            CU(cudaMemcpyAsync(pin[i], pb, np * 2, cudaMemcpyDeviceToDevice, b.st));
+        } else {
+          toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pin[i], p, np);
+        }
+        if (m != min_[i])
+          CU(cudaMemcpyAsync(min_[i], m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
         if (save_probe)
           roundInPlaceK<<<(nm + 255) / 256, 256, 0, b.st>>>(min_[i], nm);
         p_in = pin[i];
@@ -1043,6 +1050,16 @@ struct Stack {
         p_in = pb;
         m_in = m;
       }
+      b.p6b = ((save_full || save_probe) && BLK_BF16CHAIN &&
+               i + 1 < depth && pin[i + 1] != p_in)
+                  ? pin[i + 1]
+                  : p6b_orig;
+      b.m3 = ((save_full || !BLK_BF16CHAIN || save_probe) && b.opm_first &&
+              !save_probe && i + 1 < depth && min_[i + 1] != m_in)
+                 ? min_[i + 1]
+                 : ((i == depth - 1 && b.opm_first && !save_probe && mout != m_in)
+                        ? mout
+                        : m3_orig);
       use(i);
       // THE COMMENT HERE SAID keepGates=false AND THE ARGUMENT WAS haveActs.
       // Nine positional arguments reach `haveActs`, not `keepGates`, so the
@@ -1066,9 +1083,12 @@ struct Stack {
       if (BLK_BF16CHAIN) pb = b.p6b; else p = b.p6;
       m = b.m3;
     }
+    b.p6b = p6b_orig;
+    b.m3 = m3_orig;
     if (BLK_BF16CHAIN) widenBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pout, pb, np);
     else CU(cudaMemcpyAsync(pout, p, np * 4, cudaMemcpyDeviceToDevice, b.st));
-    CU(cudaMemcpyAsync(mout, m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
+    if (m != mout)
+      CU(cudaMemcpyAsync(mout, m, nm * 4, cudaMemcpyDeviceToDevice, b.st));
   }
 
   // STRIDE REMAT's second forward.  The backward is walking down and has
@@ -1092,7 +1112,13 @@ struct Stack {
     // only on the way IN to a segment, which is its highest index
     if (i != depth - 1 && (i % k) != k - 1) return;
     const size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
+    __nv_bfloat16* const p6b_orig = b.p6b;
+    float* const m3_orig = b.m3;
     for (int j = s; j < i; ++j) {
+      b.p6b = (BLK_BF16CHAIN && pin[j + 1] != pin[j]) ? pin[j + 1] : p6b_orig;
+      b.m3 = (b.opm_first && !save_probe && min_[j + 1] != min_[j])
+                 ? min_[j + 1]
+                 : m3_orig;
       use(j);
       b.forward(pin[j], min_[j], pair_mask, msa_mask, /*tail*/true,
                 /*haveFlash*/false, /*haveStats*/false, /*haveBias*/false,
@@ -1100,16 +1126,21 @@ struct Stack {
                 /*haveRelu*/false, /*wantMask*/false,
                 /*keepGates*/false, /*keepFlash*/false,
                 /*haveOpmNz*/(j > s), /*haveMaskT*/(j > s));
-      if (BLK_BF16CHAIN)
-        CU(cudaMemcpyAsync(pin[j + 1], b.p6b, np * 2,
-                           cudaMemcpyDeviceToDevice, b.st));
-      else
+      if (BLK_BF16CHAIN) {
+        if (b.p6b != pin[j + 1])
+          CU(cudaMemcpyAsync(pin[j + 1], b.p6b, np * 2,
+                             cudaMemcpyDeviceToDevice, b.st));
+      } else {
         toBf16K<<<(np + 255) / 256, 256, 0, b.st>>>(pin[j + 1], b.p6, np);
-      CU(cudaMemcpyAsync(min_[j + 1], b.m3, nm * 4,
-                         cudaMemcpyDeviceToDevice, b.st));
+      }
+      if (b.m3 != min_[j + 1])
+        CU(cudaMemcpyAsync(min_[j + 1], b.m3, nm * 4,
+                           cudaMemcpyDeviceToDevice, b.st));
       if (save_probe)
         roundInPlaceK<<<(nm + 255) / 256, 256, 0, b.st>>>(min_[j + 1], nm);
     }
+    b.p6b = p6b_orig;
+    b.m3 = m3_orig;
   }
 
   // Must follow forward() with the same inputs.  b.dp / b.dm end up holding the

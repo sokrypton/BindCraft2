@@ -735,6 +735,7 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
         load_matrix_sync(bb, dOs + (size_t)lk * 16 * LDH + dt * 16, LDH);
         mma_sync(c, a, bb, c);
       }
+      FB_BAR();
       FB_STORE(Ss + (size_t)warp * 16 * LDF, c, LDF, mem_row_major);
       __syncwarp();
       // only N/BM query tiles contribute, so this is 2-4 deep, not N deep
@@ -761,7 +762,6 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
       }
       __syncwarp();
     }
-    FB_BAR();
 
     // dP = dO V^T
     fragment<matrix_a, 16, 16, 16, half, row_major> da[FB_HOISTA ? FD / 16 : 1];
@@ -934,6 +934,7 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
         load_matrix_sync(bq, Qs + (size_t)lk * 16 * LDH + dt * 16, LDH);
         mma_sync(c, a, bq, c);
       }
+      FB_BAR();
       FB_STORE(Ss + (size_t)warp * 16 * LDF, c, LDF, mem_row_major);
       __syncwarp();
       if (DO_DK) {
@@ -959,7 +960,6 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
       }
       __syncwarp();
     }
-    FB_BAR();
   }
 
 #if FB_REGDQ

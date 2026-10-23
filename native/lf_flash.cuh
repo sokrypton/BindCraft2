@@ -130,8 +130,13 @@ __device__ __forceinline__ void ldsm4t(uint32_t* r, const void* p) {
 }
 
 constexpr int FA_BK = 64;
+template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 ? D : D + 8; }
+template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
+  if constexpr (D == 32) return r * D + (c ^ (((r >> 1) & 3) << 3));
+  else return r * (D + 8) + c;
+}
 template <int D, int WARPS, int BK = FA_BK> __host__ __device__ constexpr size_t faStage() {
-  return (size_t)2 * BK * (D + 8) * 2 + (size_t)(16 * WARPS) * (BK + 8) * 2 + BK * 4;
+  return (size_t)2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * WARPS) * (BK + 8) * 2 + BK * 4;
 }
 
 // mask[r * n + j] (rows) or mask[j * n + r] (columns): the KEY's mask, the pair mask
@@ -169,7 +174,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     // backward recomputes P as exp2(S_log2 - lse) with the forward's own scores.
     half* __restrict__ avOut = nullptr, float* __restrict__ lseOut = nullptr,
     __nv_bfloat16* __restrict__ outBf16 = nullptr) {
-  constexpr int BQ = 16 * WARPS, LDK = D + 8, LDB = BK + 8, NT = WARPS * 32;
+  constexpr int BQ = 16 * WARPS, LDK = fa2Ldk<D>(), LDB = BK + 8, NT = WARPS * 32;
   static_assert(BK % 16 == 0, "a key tile is whole k16 steps of the PV product");
   constexpr size_t STAGE = faStage<D, WARPS, BK>();
   extern __shared__ __align__(16) unsigned char smem[];
@@ -206,7 +211,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
   for (int k = 0; k < KV_PER; ++k) {
     int u = k * NT + threadIdx.x, jj = u / (D / 8), c = (u % (D / 8)) * 8;
     kvJ[k] = (KV_CHUNKS % NT == 0 || u < KV_CHUNKS) ? jj : 1 << 30;
-    kvOff[k] = jj * LDK + c;
+    kvOff[k] = fa2Kv<D>(jj, c);
     kvSrc[k] = base + pos(jj) + Wd + c;
   }
   const half* bSrc[B_PER]; int bOff[B_PER], bC[B_PER]; bool bRow[B_PER];
@@ -216,21 +221,48 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     bRow[k] = i < n; bC[k] = c; bOff[k] = qi * LDB + c;
     bSrc[k] = biasHead + (i < n ? i : 0) * biasStride + c;
   }
+  const half* kvCur[KV_PER]; const half* bCur[B_PER];
+#pragma unroll
+  for (int k = 0; k < KV_PER; ++k) kvCur[k] = kvSrc[k];
+#pragma unroll
+  for (int k = 0; k < B_PER; ++k) bCur[k] = bSrc[k];
+  const size_t kvStep = pos(BK);
   auto issue = [&](int j0, int st) {
     half *K = Kst(st), *V = Vst(st), *B = Bst(st);
     bool last = j0 + BK > n;
+    if (!last) {
+#pragma unroll
+      for (int k = 0; k < KV_PER; ++k) {
+        if (KV_CHUNKS % NT == 0 || kvJ[k] < (1 << 30)) {
+          cpAsync16(K + kvOff[k], kvCur[k], true);
+          cpAsync16(V + kvOff[k], kvCur[k] + Wd, true);
+        }
+        kvCur[k] += kvStep;
+      }
+#pragma unroll
+      for (int k = 0; k < B_PER; ++k) {
+        cpAsync16(B + bOff[k], bRow[k] ? bCur[k] : biasHead, bRow[k]);
+        bCur[k] += BK;
+      }
+      if (MASKED && threadIdx.x < BK) {
+        int j = j0 + threadIdx.x;
+        Mst(st)[threadIdx.x] = mask[tr ? ((size_t)j * n + r) : (r * n + j)] > 0 ? 0.f : -1e9f;
+      }
+      cpCommit();
+      return;
+    }
 #pragma unroll
     for (int k = 0; k < KV_PER; ++k) {
       if (kvJ[k] >= (1 << 30)) continue;
-      bool ok = !last || j0 + kvJ[k] < n;
-      const half* src = ok ? kvSrc[k] + pos(j0) : base;
+      bool ok = j0 + kvJ[k] < n;
+      const half* src = ok ? kvCur[k] : base;
       cpAsync16(K + kvOff[k], src, ok);
       cpAsync16(V + kvOff[k], src + Wd, ok);
     }
 #pragma unroll
     for (int k = 0; k < B_PER; ++k) {
-      bool ok = bRow[k] && (!last || j0 + bC[k] < n);
-      cpAsync16(B + bOff[k], ok ? bSrc[k] + j0 : biasHead, ok);
+      bool ok = bRow[k] && j0 + bC[k] < n;
+      cpAsync16(B + bOff[k], ok ? bCur[k] : biasHead, ok);
     }
     if (MASKED && threadIdx.x < BK) {
       int j = j0 + threadIdx.x;
@@ -316,7 +348,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
         for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
           uint32_t kb[4];
-          ldsm4(kb, K + (nt * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+          ldsm4(kb, K + fa2Kv<D>(nt * 8 + (lane & 7), k2 * 32 + (lane >> 3) * 8));
           mma16816h(sh[nt], qa[k2 * 2], kb[0], kb[1]);
           if (k2 * 2 + 1 < D / 16) mma16816h(sh[nt], qa[k2 * 2 + 1], kb[2], kb[3]);
         }
@@ -343,7 +375,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
 #pragma unroll
         for (int et = 0; et < D / 8; et += 2) {
           uint32_t vb[4];
-          ldsm4t(vb, V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + (lane >> 4)) * 8);
+          ldsm4t(vb, V + fa2Kv<D>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + (lane >> 4)) * 8));
           mma16816(o[et], pa, vb[0], vb[1]);
           mma16816(o[et + 1], pa, vb[2], vb[3]);
         }
@@ -358,6 +390,7 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     const half* br0 = B + (warp * 16 + g) * LDB;
     const half* br1 = br0 + 8 * LDB;
     float sv[BK / 8][4];
+#pragma unroll
     for (int nt = 0; nt < BK / 8; ++nt) {
       int jj = nt * 8 + tig * 2;
       float2 u = __half22float2(*reinterpret_cast<const half2*>(br0 + jj));
@@ -371,9 +404,10 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
         if (jg + 1 >= n) { u.y = v.y = -INFINITY; }
       }
       sv[nt][0] = u.x; sv[nt][1] = u.y; sv[nt][2] = v.x; sv[nt][3] = v.y;
+#pragma unroll
       for (int k2 = 0; k2 < D / 32 + (D % 32 ? 1 : 0); ++k2) {
         uint32_t kb[4];
-        ldsm4(kb, K + (nt * 8 + (lane & 7)) * LDK + k2 * 32 + (lane >> 3) * 8);
+        ldsm4(kb, K + fa2Kv<D>(nt * 8 + (lane & 7), k2 * 32 + (lane >> 3) * 8));
         mma16816(sv[nt], qa[k2 * 2], kb[0], kb[1]);
         if (k2 * 2 + 1 < D / 16) mma16816(sv[nt], qa[k2 * 2 + 1], kb[2], kb[3]);
       }
@@ -393,19 +427,22 @@ __global__ void __launch_bounds__(WARPS * 32, MINB) flashGridHalf(const half* __
     float n0 = fmaxf(m0, t0), n1 = fmaxf(m1, t1);
     float c0 = exp2f(m0 - n0), c1 = exp2f(m1 - n1);
     m0 = n0; m1 = n1;
+#pragma unroll
     for (int et = 0; et < D / 8; ++et) { o[et][0] *= c0; o[et][1] *= c0; o[et][2] *= c1; o[et][3] *= c1; }
     lsum[0] *= c0; lsum[1] *= c0; lsum[2] *= c1; lsum[3] *= c1;
     // P = 2^(S - max), two at a time in f16 (ex2.approx.f16x2: half the SFU work, and the result
     // is already the packed A fragment the PV product reads); its row sums on the tensor cores
     // (P . ones), accumulated in f32 like O
+#pragma unroll
     for (int t = 0; t < BK / 16; ++t) {
       uint32_t pa[4] = { ex2h2(pack2(sv[2 * t][0] - n0, sv[2 * t][1] - n0)), ex2h2(pack2(sv[2 * t][2] - n1, sv[2 * t][3] - n1)),
                          ex2h2(pack2(sv[2 * t + 1][0] - n0, sv[2 * t + 1][1] - n0)),
                          ex2h2(pack2(sv[2 * t + 1][2] - n1, sv[2 * t + 1][3] - n1)) };
       mma16816(lsum, pa, ONES_H2, ONES_H2);
+#pragma unroll
       for (int et = 0; et < D / 8; et += 2) {
         uint32_t vb[4];
-        ldsm4t(vb, V + (t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDK + (et + (lane >> 4)) * 8);
+        ldsm4t(vb, V + fa2Kv<D>(t * 16 + ((lane >> 3) & 1) * 8 + (lane & 7), (et + (lane >> 4)) * 8));
         mma16816(o[et], pa, vb[0], vb[1]);
         mma16816(o[et + 1], pa, vb[2], vb[3]);
       }
@@ -662,11 +699,6 @@ __global__ void flashGridF32(const float* __restrict__ qkvg, const float* __rest
 // padded 80-byte rows were conflict-free to read and conflicting to write: --bench-grid 5.65 -> 5.24 ms at
 // 1,044 tokens, 0.204 -> 0.191 at 300, bit-identical. Otherwise D + 8 as before. (The same swizzle on the
 // bias tile - 128-byte rows, chunk ^ row & 7 - was measured 3.6% slower: wider rows, more address math.)
-template <int D> __host__ __device__ constexpr int fa2Ldk() { return D == 32 ? D : D + 8; }
-template <int D> __device__ __forceinline__ int fa2Kv(int r, int c) {
-  if constexpr (D == 32) return r * D + (c ^ (((r >> 1) & 3) << 3));
-  else return r * (D + 8) + c;
-}
 template <int D, int WARPS, int BK, int MT = 2, int RR = 1> __host__ __device__ constexpr size_t fa2Stage() {
   return (size_t)RR * 2 * BK * fa2Ldk<D>() * 2 + (size_t)(16 * MT * WARPS) * (BK + 8) * 2;
 }

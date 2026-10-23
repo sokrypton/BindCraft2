@@ -183,42 +183,36 @@ __global__ void softmaxK(float* __restrict__ logits, float* __restrict__ sums,
 }
 
 // the three contractions over keys, plus the localisation and the norms.
-// One block a (q, h); 128 threads.
+// Scalar and point contractions run one warp (32 threads) per (q, h); the pair
+// contraction runs one 128-thread block per query q across all H = 12 heads so
+// each pair[q, k, c] row is read once from HBM instead of 12 times.
 __global__ void gatherK(const float* __restrict__ attn,
                         const float* __restrict__ vs,
                         const float* __restrict__ vp,
-                        const float* __restrict__ pair,
                         const float* __restrict__ rot,
                         const float* __restrict__ trans,
                         float* __restrict__ rpg,
                         float* __restrict__ final_, int N) {
   int h = blockIdx.x % H, q = blockIdx.x / H;
-  int tid = threadIdx.x, nt = blockDim.x;
+  int tid = threadIdx.x;
   float* F = final_ + (size_t)q * OUTF;
 
-  // result_scalar [H][SV] -> the first H*SV columns
-  for (int c = tid; c < SV; c += nt) {
+  // result_scalar [H][SV] -> the first H*SV columns (SV = 16 <= 32)
+  if (tid < SV) {
     float acc = 0.f;
     for (int k = 0; k < N; ++k)
-      acc += attn[((size_t)q * N + k) * H + h] * vs[((size_t)k * H + h) * SV + c];
-    F[h * SV + c] = acc;
+      acc += attn[((size_t)q * N + k) * H + h] * vs[((size_t)k * H + h) * SV + tid];
+    F[h * SV + tid] = acc;
   }
-  // result_point_global [H][PV][3]
-  for (int e = tid; e < PV * 3; e += nt) {
+  // result_point_global [H][PV][3] (PV * 3 = 24 <= 32)
+  if (tid < PV * 3) {
     float acc = 0.f;
     for (int k = 0; k < N; ++k)
       acc += attn[((size_t)q * N + k) * H + h] *
-             vp[(((size_t)k * H + h) * PV) * 3 + e];
-    rpg[(((size_t)q * H + h) * PV) * 3 + e] = acc;
+             vp[(((size_t)k * H + h) * PV) * 3 + tid];
+    rpg[(((size_t)q * H + h) * PV) * 3 + tid] = acc;
   }
-  // result_attention_over_2d [H][CZ] -- the pair, averaged under the attention
-  for (int c = tid; c < CZ; c += nt) {
-    float acc = 0.f;
-    for (int k = 0; k < N; ++k)
-      acc += attn[((size_t)q * N + k) * H + h] * pair[((size_t)q * N + k) * CZ + c];
-    F[H * SV + 3 * H * PV + H * PV + h * CZ + c] = acc;
-  }
-  __syncthreads();
+  __syncwarp();
   // the local points and their norms.  THE CONCATENATION IS BY COMPONENT:
   // output_features gets x for every (h, p), then y for every (h, p), then z
   // -- because result_point_local is reshaped to [N, -1] per component before
@@ -238,6 +232,32 @@ __global__ void gatherK(const float* __restrict__ attn,
     F[base + 2 * H * PV + h * PV + p] = lz;
     F[base + 3 * H * PV + h * PV + p] = sqrtf(lx * lx + ly * ly + lz * lz + DIST_EPS);
   }
+}
+
+static const int IPA_KT = 32;
+__global__ void pairGatherK(const float* __restrict__ attn,
+                            const float* __restrict__ pair,
+                            float* __restrict__ final_, int N) {
+  __shared__ float as[IPA_KT][H];
+  int q = blockIdx.x, c = threadIdx.x;
+  float acc[H] = {};
+  const float* aq = attn + (size_t)q * N * H;
+  const float* pq = pair + (size_t)q * N * CZ + c;
+  for (int k0 = 0; k0 < N; k0 += IPA_KT) {
+    int kend = k0 + IPA_KT < N ? k0 + IPA_KT : N;
+    int kn = kend - k0;
+    for (int i = c; i < kn * H; i += CZ) as[i / H][i % H] = aq[k0 * H + i];
+    __syncthreads();
+    for (int dk = 0; dk < kn; ++dk) {
+      float p = pq[(size_t)(k0 + dk) * CZ];
+#pragma unroll
+      for (int h = 0; h < H; ++h) acc[h] += as[dk][h] * p;
+    }
+    __syncthreads();
+  }
+  float* F = final_ + (size_t)q * OUTF + H * SV + 4 * H * PV + c;
+#pragma unroll
+  for (int h = 0; h < H; ++h) F[h * CZ] = acc[h];
 }
 
 // ---------------------------------------------------------------- backward
@@ -749,7 +769,8 @@ struct IPA {
                                            attn, N);
     }
     softmaxK<<<(n * H + 7) / 8, 256, 0, st>>>(attn, sums, N);
-    gatherK<<<n * H, 128, 0, st>>>(attn, vs, vpg, pair, rot, trans, rpg, final_, N);
+    gatherK<<<n * H, 32, 0, st>>>(attn, vs, vpg, rot, trans, rpg, final_, N);
+    pairGatherK<<<n, CZ, 0, st>>>(attn, pair, final_, N);
     gemm(N, C, OUTF, final_, wo, out);
     addRowBiasK<<<((n * C) + 255) / 256, 256, 0, st>>>(out, bo, C, n * C);
   }
@@ -782,7 +803,7 @@ struct IPA {
       attnGradK<KPB><<<g, KPB * H, sh, st>>>(dfinal, drpg, vs, vpg, pair,
                                              dattn, N);
     }
-    dValueK<<<n * H, 64, 0, st>>>(attn, dfinal, drpg, dvs, dvpg, N);
+    dValueK<<<n * H, 32, 0, st>>>(attn, dfinal, drpg, dvs, dvpg, N);
     // the pair's two routes.  The averaged one lands first because it WRITES
     // through an accumulate, so dpair has to start at zero.
     if (!accPair) CU(cudaMemsetAsync(dpair, 0, n * n * CZ * 4, st));
