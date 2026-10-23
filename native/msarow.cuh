@@ -122,6 +122,7 @@ __global__ void nbbToHalfK(const __nv_bfloat16* __restrict__ src, half* __restri
                            size_t M) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= M) return;
+#pragma unroll
   for (int h = 0; h < H; ++h)
     dst[(size_t)h * M + ij] =
         __float2half(fmaxf(__bfloat162float(src[ij * H + h]) * LOG2E, -6e4f));
@@ -140,12 +141,14 @@ __global__ void dnbbToRowK(const float* __restrict__ dnbbF,
   if (ij >= M) return;
   const float sc = lscale[1];
   if (dnbbI) {
+#pragma unroll
     for (int h = 0; h < H; ++h) {
       size_t idx = (size_t)h * M + ij;
       float v = (float)dnbbI[idx] * (1.0f / 1099511627776.0f);
       dst[ij * H + h] = __float2bfloat16(v * sc);
     }
   } else {
+#pragma unroll
     for (int h = 0; h < H; ++h) {
       size_t idx = (size_t)h * M + ij;
       dst[ij * H + h] = __float2bfloat16(dnbbF[idx] * sc);

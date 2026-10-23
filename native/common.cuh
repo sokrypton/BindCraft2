@@ -894,15 +894,40 @@ __global__ void addDropNarrowBK(__nv_bfloat16* __restrict__ dst,
                                 const __nv_bfloat16* __restrict__ delta,
                                 int N, int C, const uint32_t* __restrict__ seedp, uint32_t depth,
                                 uint32_t mod, float rate, size_t n) {
+  if ((n & 1) == 0 && (C & 1) == 0) {
+    size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = i2 * 2;
+    if (i >= n) return;
+    uint32_t u = (uint32_t)i, c, rc;
+    if ((C & (C - 1)) == 0) {
+      c = u & (uint32_t)(C - 1);
+      rc = u >> (__ffs(C) - 1);
+    } else {
+      c = u % (uint32_t)C;
+      rc = u / (uint32_t)C;
+    }
+    uint32_t col = rc % (uint32_t)N;
+    uint32_t row = (PER_ROW && !TRANSPOSE_DELTA) ? 0u : (rc / (uint32_t)N);
+    uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
+    float s0 = dropScale(seedp, depth, mod, idx, rate);
+    float s1 = dropScale(seedp, depth, mod, idx + 1u, rate);
+    size_t di = TRANSPOSE_DELTA ? ((size_t)col * N + row) * C + c : i;
+    __nv_bfloat162 sv = *(const __nv_bfloat162*)(src + i);
+    __nv_bfloat162 dv = *(const __nv_bfloat162*)(delta + di);
+    *(__nv_bfloat162*)(dst + i) = __floats2bfloat162_rn(
+        __bfloat162float(sv.x) + s0 * __bfloat162float(dv.x),
+        __bfloat162float(sv.y) + s1 * __bfloat162float(dv.y));
+    return;
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  uint32_t c, rc;
+  uint32_t u = (uint32_t)i, c, rc;
   if ((C & (C - 1)) == 0) {
-    c = (uint32_t)i & (uint32_t)(C - 1);
-    rc = (uint32_t)(i >> (__ffs(C) - 1));
+    c = u & (uint32_t)(C - 1);
+    rc = u >> (__ffs(C) - 1);
   } else {
-    c = (uint32_t)(i % (size_t)C);
-    rc = (uint32_t)(i / (size_t)C);
+    c = u % (uint32_t)C;
+    rc = u / (uint32_t)C;
   }
   uint32_t col = rc % (uint32_t)N;
   uint32_t row = (PER_ROW && !TRANSPOSE_DELTA) ? 0u : (rc / (uint32_t)N);
@@ -936,15 +961,37 @@ __global__ void dropScaleBK(__nv_bfloat16* __restrict__ dst,
                             const __nv_bfloat16* __restrict__ src, int N, int C,
                             const uint32_t* __restrict__ seedp, uint32_t depth, uint32_t mod,
                             float rate, size_t n) {
+  if ((n & 1) == 0 && (C & 1) == 0) {
+    size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = i2 * 2;
+    if (i >= n) return;
+    uint32_t u = (uint32_t)i, c, rc;
+    if ((C & (C - 1)) == 0) {
+      c = u & (uint32_t)(C - 1);
+      rc = u >> (__ffs(C) - 1);
+    } else {
+      c = u % (uint32_t)C;
+      rc = u / (uint32_t)C;
+    }
+    uint32_t col = rc % (uint32_t)N;
+    uint32_t row = (PER_ROW && !TRANSPOSE_OUT) ? 0u : (rc / (uint32_t)N);
+    uint32_t idx = (PER_ROW ? col : row) * (uint32_t)C + c;
+    size_t di = TRANSPOSE_OUT ? ((size_t)col * N + row) * C + c : i;
+    __nv_bfloat162 sv = *(const __nv_bfloat162*)(src + i);
+    *(__nv_bfloat162*)(dst + di) = __floats2bfloat162_rn(
+        __bfloat162float(sv.x) * dropScale(seedp, depth, mod, idx, rate),
+        __bfloat162float(sv.y) * dropScale(seedp, depth, mod, idx + 1u, rate));
+    return;
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  uint32_t c, rc;
+  uint32_t u = (uint32_t)i, c, rc;
   if ((C & (C - 1)) == 0) {
-    c = (uint32_t)i & (uint32_t)(C - 1);
-    rc = (uint32_t)(i >> (__ffs(C) - 1));
+    c = u & (uint32_t)(C - 1);
+    rc = u >> (__ffs(C) - 1);
   } else {
-    c = (uint32_t)(i % (size_t)C);
-    rc = (uint32_t)(i / (size_t)C);
+    c = u % (uint32_t)C;
+    rc = u / (uint32_t)C;
   }
   uint32_t col = rc % (uint32_t)N;
   uint32_t row = (PER_ROW && !TRANSPOSE_OUT) ? 0u : (rc / (uint32_t)N);
@@ -963,13 +1010,13 @@ __global__ void dropScaleK(float* __restrict__ dst, const float* __restrict__ sr
                            uint32_t mod, float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  uint32_t c, rc;
+  uint32_t u = (uint32_t)i, c, rc;
   if ((C & (C - 1)) == 0) {
-    c = (uint32_t)i & (uint32_t)(C - 1);
-    rc = (uint32_t)(i >> (__ffs(C) - 1));
+    c = u & (uint32_t)(C - 1);
+    rc = u >> (__ffs(C) - 1);
   } else {
-    c = (uint32_t)(i % (size_t)C);
-    rc = (uint32_t)(i / (size_t)C);
+    c = u % (uint32_t)C;
+    rc = u / (uint32_t)C;
   }
   uint32_t col = rc % (uint32_t)N;
   uint32_t row = PER_ROW ? 0u : (rc / (uint32_t)N);
@@ -993,13 +1040,13 @@ __global__ void addDropNarrowK(float* __restrict__ dst,
                                uint32_t mod, float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  uint32_t c, rc;
+  uint32_t u = (uint32_t)i, c, rc;
   if ((C & (C - 1)) == 0) {
-    c = (uint32_t)i & (uint32_t)(C - 1);
-    rc = (uint32_t)(i >> (__ffs(C) - 1));
+    c = u & (uint32_t)(C - 1);
+    rc = u >> (__ffs(C) - 1);
   } else {
-    c = (uint32_t)(i % (size_t)C);
-    rc = (uint32_t)(i / (size_t)C);
+    c = u % (uint32_t)C;
+    rc = u / (uint32_t)C;
   }
   uint32_t col = rc % (uint32_t)N;
   uint32_t row = PER_ROW ? 0u : (rc / (uint32_t)N);
@@ -1224,13 +1271,38 @@ __global__ void addNarrowBK(__nv_bfloat16* __restrict__ dstb,
                             const __nv_bfloat16* __restrict__ srcb,
                             const __nv_bfloat16* __restrict__ delta, size_t n,
                             int N = 0, int C = 0) {
+  if ((n & 1) == 0 && (!TRANSPOSE_DELTA || (C & 1) == 0)) {
+    size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = i2 * 2;
+    if (i >= n) return;
+    size_t di = i;
+    if (TRANSPOSE_DELTA) {
+      uint32_t u = (uint32_t)i, c, rc;
+      if ((C & (C - 1)) == 0) {
+        c = u & (uint32_t)(C - 1);
+        rc = u >> (__ffs(C) - 1);
+      } else {
+        c = u % (uint32_t)C;
+        rc = u / (uint32_t)C;
+      }
+      uint32_t col = rc % (uint32_t)N, row = rc / (uint32_t)N;
+      di = ((size_t)col * N + row) * C + c;
+    }
+    __nv_bfloat162 sv = *(const __nv_bfloat162*)(srcb + i);
+    __nv_bfloat162 dv = *(const __nv_bfloat162*)(delta + di);
+    *(__nv_bfloat162*)(dstb + i) = __floats2bfloat162_rn(
+        __bfloat162float(sv.x) + __bfloat162float(dv.x),
+        __bfloat162float(sv.y) + __bfloat162float(dv.y));
+    return;
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   size_t di = i;
   if (TRANSPOSE_DELTA) {
-    int c = (int)(i % C);
-    size_t rc = i / C;
-    int col = (int)(rc % N), row = (int)(rc / N);
+    uint32_t u = (uint32_t)i;
+    int c = (int)(u % (uint32_t)C);
+    uint32_t rc = u / (uint32_t)C;
+    int col = (int)(rc % (uint32_t)N), row = (int)(rc / (uint32_t)N);
     di = ((size_t)col * N + row) * C + c;
   }
   dstb[i] = __float2bfloat16(__bfloat162float(srcb[i]) +
@@ -1335,6 +1407,25 @@ __global__ void addGateNarrowBK(__nv_bfloat16* __restrict__ dstb,
                                 const __nv_bfloat16* __restrict__ srcb,
                                 const __nv_bfloat16* __restrict__ o,
                                 const gt2_t* __restrict__ t2, size_t n) {
+  if ((n & 1) == 0) {
+    size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t i = i2 * 2;
+    if (i >= n) return;
+    __nv_bfloat162 ov = *(const __nv_bfloat162*)(o + i);
+#if TM_GATE8T
+    uchar2 tv = *(const uchar2*)(t2 + i);
+    float t0 = (float)tv.x * (1.f / 255.f), t1 = (float)tv.y * (1.f / 255.f);
+#else
+    __nv_bfloat162 tv = *(const __nv_bfloat162*)(t2 + i);
+    float t0 = __bfloat162float(tv.x), t1 = __bfloat162float(tv.y);
+#endif
+    float p0 = __bfloat162float(__float2bfloat16(__bfloat162float(ov.x) * t0));
+    float p1 = __bfloat162float(__float2bfloat16(__bfloat162float(ov.y) * t1));
+    __nv_bfloat162 sv = *(const __nv_bfloat162*)(srcb + i);
+    *(__nv_bfloat162*)(dstb + i) = __floats2bfloat162_rn(
+        __bfloat162float(sv.x) + p0, __bfloat162float(sv.y) + p1);
+    return;
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   // the product is rounded to bf16 before the add, exactly as the f32 path
@@ -1353,13 +1444,13 @@ __global__ void addDropGateNarrowBK(__nv_bfloat16* __restrict__ dstb,
                                     uint32_t depth, uint32_t mod, float rate, size_t n) {
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  uint32_t c, rc;
+  uint32_t u = (uint32_t)i, c, rc;
   if ((C & (C - 1)) == 0) {
-    c = (uint32_t)i & (uint32_t)(C - 1);
-    rc = (uint32_t)(i >> (__ffs(C) - 1));
+    c = u & (uint32_t)(C - 1);
+    rc = u >> (__ffs(C) - 1);
   } else {
-    c = (uint32_t)(i % (size_t)C);
-    rc = (uint32_t)(i / (size_t)C);
+    c = u % (uint32_t)C;
+    rc = u / (uint32_t)C;
   }
   uint32_t col = rc % (uint32_t)N;
   uint32_t row = PER_ROW ? 0u : (rc / (uint32_t)N);
@@ -1400,6 +1491,24 @@ __global__ void addOpmNarrowK(float* __restrict__ dst,
                               float eps, size_t n,
                               bool chain_bf16 = false) {
   static_assert((CZT & (CZT - 1)) == 0, "CZ a power of two, for the shift");
+  if constexpr (std::is_same<SRC, __nv_bfloat16>::value) {
+    if ((chain_bf16 || !dst) && (n & 1) == 0) {
+      size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      size_t i = i2 * 2;
+      if (i >= n) return;
+      const float denom = eps + nzbuf[i / CZT];
+      __nv_bfloat162 ov = *(const __nv_bfloat162*)(o + i);
+      __nv_bfloat162 sv = *(const __nv_bfloat162*)(src + i);
+      float2 bv = *(const float2*)(bias + (i & (CZT - 1)));
+      float v0 = __bfloat162float(__float2bfloat16(__bfloat162float(ov.x) + bv.x));
+      float v1 = __bfloat162float(__float2bfloat16(__bfloat162float(ov.y) + bv.y));
+      v0 = __bfloat162float(__float2bfloat16(v0 / denom));
+      v1 = __bfloat162float(__float2bfloat16(v1 / denom));
+      *(__nv_bfloat162*)(dstb + i) = __floats2bfloat162_rn(
+          __bfloat162float(sv.x) + v0, __bfloat162float(sv.y) + v1);
+      return;
+    }
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   const float nz = nzbuf[i / CZT];             // CZT is constant: a shift
@@ -1427,6 +1536,18 @@ __global__ void addConstNarrowK(float* __restrict__ dst,
                                 const float* __restrict__ k, int CZ_, size_t n,
                                 bool chain_bf16 = false) {
   static_assert((CZT & (CZT - 1)) == 0, "CZ a power of two, for the mask");
+  if constexpr (std::is_same<SRC, __nv_bfloat16>::value) {
+    if ((chain_bf16 || !dst) && (n & 1) == 0) {
+      size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+      size_t i = i2 * 2;
+      if (i >= n) return;
+      __nv_bfloat162 sv = *(const __nv_bfloat162*)(src + i);
+      float2 kv = *(const float2*)(k + (i & (CZT - 1)));
+      *(__nv_bfloat162*)(dstb + i) = __floats2bfloat162_rn(
+          __bfloat162float(sv.x) + kv.x, __bfloat162float(sv.y) + kv.y);
+      return;
+    }
+  }
   size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float w = widen(src[i]) + k[i & (CZT - 1)];

@@ -627,6 +627,10 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
                : make_uint4(0, 0, 0, 0);
       }
     }
+    if (FB_REGSM && tid < BN) {
+      int j = j0 + tid;
+      lseS[tid] = j < N ? 1e9f * (mask[(size_t)b * N + j] - 1.f) : 0.f;
+    }
     FB_BAR();
     // issued here, consumed at the top of the next iteration: everything
     // between is cover
@@ -659,15 +663,8 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
         for (int ebase = 0; ebase < 8; ebase += 4) {
           int cc = fragCol(lane, ebase);
           int j = j0 + nt * 16 + cc;
-          float mk0 = 0.f, mk1 = 0.f;
-          if (evenN && j < N) {
-            float2 m2 = *(const float2*)&mask[(size_t)b * N + j];
-            mk0 = 1e9f * (m2.x - 1.f);
-            mk1 = 1e9f * (m2.y - 1.f);
-          } else {
-            if (j < N) mk0 = 1e9f * (mask[(size_t)b * N + j] - 1.f);
-            if (j + 1 < N) mk1 = 1e9f * (mask[(size_t)b * N + j + 1] - 1.f);
-          }
+          float2 m2 = *(const float2*)(lseS + nt * 16 + cc);
+          float mk0 = m2.x, mk1 = m2.y;
 #pragma unroll
           for (int ed = 0; ed < 4; ed += 2) {
             int e = ebase + ed;
@@ -741,9 +738,12 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
       FB_STORE(Ss + (size_t)warp * 16 * LDF, c, LDF, mem_row_major);
       __syncwarp();
       // only N/BM query tiles contribute, so this is 2-4 deep, not N deep
-      if (DO_DV)
-        for (int e = lane; e < 16 * 16; e += 32) {
-          int rr = e / 16, cc = e % 16, j = j0 + kt * 16 + rr;
+      if (DO_DV) {
+        const int cc = lane & 15, r_base = lane >> 4;
+        const size_t col_off = (size_t)h * FD + dt * 16 + cc;
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          int rr = r_base + u * 2, j = j0 + kt * 16 + rr;
           if (j < N) {
             float g = Ss[(size_t)(warp * 16 + rr) * LDF + cc];
             if (dcomb) {
@@ -751,13 +751,14 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
                 __nv_bfloat162 v = __floats2bfloat162_rn(
                     g, Ss[(size_t)(warp * 16 + rr) * LDF + cc + 1]);
                 atomicAdd((__nv_bfloat162*)&dcomb[((size_t)b * N + j) * tot +
-                                                  2 * W + h * FD + dt * 16 + cc], v);
+                                                  2 * W + col_off], v);
               }
             } else if (g != 0.f) {
-              atomicAdd(&dV[((size_t)b * N + j) * W + h * FD + dt * 16 + cc], g);
+              atomicAdd(&dV[((size_t)b * N + j) * W + col_off], g);
             }
           }
         }
+      }
       __syncwarp();
     }
     FB_BAR();
@@ -860,24 +861,30 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
     } else if (!FB_REGDS) {
       // dS = P * (dP - D).  P's slot is reused: it is not read again.
       const int j = j0 + lane;
-      const bool j_ok = j < N;
+      if (j < N) {
+        size_t o_nbb = ((size_t)h * N + i0 + warp * 16) * N + j;
+        size_t o_ds = (((size_t)b * H + h) * N + i0 + warp * 16) * N + j;
 #pragma unroll
-      for (int r = 0; r < 16; ++r) {
-        int row = warp * 16 + r, i = i0 + row;
-        float v = 0.f;
-        if (j_ok && i < N) {
-          float p = __half2float(Ps[(size_t)row * LDH + lane]);
-          v = p * (Ss[(size_t)row * LDF + lane] - DS[row]);
-          if (DO_DS) dS[(((size_t)b * H + h) * N + i) * N + j] = __float2bfloat16(v);
-          if (NBB_ATOMIC) {
-            const size_t o = ((size_t)h * N + i) * N + j;
-            if (dnbbI) {
-              unsigned long long fx = (unsigned long long)nbbFixed(v, nullptr);
-              if (fx) atomicAdd((unsigned long long*)&dnbbI[o], fx);
-            } else if (v != 0.f) atomicAdd(&dnbb[o], v);
+        for (int r = 0; r < 16; ++r, o_nbb += N, o_ds += N) {
+          int row = warp * 16 + r, i = i0 + row;
+          float v = 0.f;
+          if (i < N) {
+            float p = __half2float(Ps[(size_t)row * LDH + lane]);
+            v = p * (Ss[(size_t)row * LDF + lane] - DS[row]);
+            if (DO_DS) dS[o_ds] = __float2bfloat16(v);
+            if (NBB_ATOMIC) {
+              if (dnbbI) {
+                unsigned long long fx = (unsigned long long)nbbFixed(v, nullptr);
+                if (fx) atomicAdd((unsigned long long*)&dnbbI[o_nbb], fx);
+              } else if (v != 0.f) atomicAdd(&dnbb[o_nbb], v);
+            }
           }
+          Ps[(size_t)row * LDH + lane] = __float2half(v);
         }
-        Ps[(size_t)row * LDH + lane] = __float2half(v);
+      } else {
+#pragma unroll
+        for (int r = 0; r < 16; ++r)
+          Ps[(size_t)(warp * 16 + r) * LDH + lane] = __float2half(0.f);
       }
     }
     FB_BAR();   // dK reads every warp's rows of dS
@@ -898,18 +905,18 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
 #pragma unroll
       for (int e = 0; e < 8; ++e) dqa[dt][e] += c.x[e];
 #else
-      {
-        FB_STORE(Ss + (size_t)warp * 16 * LDF, c, LDF, mem_row_major);
-        __syncwarp();
-        int cc = lane - dt * 16;
-        if (cc >= 0 && cc < 16) {
-#pragma unroll
-          for (int r = 0; r < 16; ++r) dq[r] += Ss[(size_t)(warp * 16 + r) * LDF + cc];
-        }
-        __syncwarp();
-      }
+      FB_STORE(Ss + (size_t)warp * 16 * LDF + dt * 16, c, LDF, mem_row_major);
 #endif
     }
+#if !FB_REGDQ
+    __syncwarp();
+    if (lane < FD) {
+#pragma unroll
+      for (int r = 0; r < 16; ++r)
+        dq[r] += Ss[(size_t)(warp * 16 + r) * LDF + lane];
+    }
+    __syncwarp();
+#endif
 
     // dK += dS^T Q -- the same [BN][FD] shape and the same warp mapping
     {
@@ -929,9 +936,12 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
       }
       FB_STORE(Ss + (size_t)warp * 16 * LDF, c, LDF, mem_row_major);
       __syncwarp();
-      if (DO_DK)
-        for (int e = lane; e < 16 * 16; e += 32) {
-          int rr = e / 16, cc = e % 16, j = j0 + kt * 16 + rr;
+      if (DO_DK) {
+        const int cc = lane & 15, r_base = lane >> 4;
+        const size_t col_off = (size_t)h * FD + dt * 16 + cc;
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+          int rr = r_base + u * 2, j = j0 + kt * 16 + rr;
           if (j < N) {
             float g = Ss[(size_t)(warp * 16 + rr) * LDF + cc];
             if (dcomb) {
@@ -939,13 +949,14 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
                 __nv_bfloat162 v = __floats2bfloat162_rn(
                     g, Ss[(size_t)(warp * 16 + rr) * LDF + cc + 1]);
                 atomicAdd((__nv_bfloat162*)&dcomb[((size_t)b * N + j) * tot +
-                                                  W + h * FD + dt * 16 + cc], v);
+                                                  W + col_off], v);
               }
             } else if (g != 0.f) {
-              atomicAdd(&dK[((size_t)b * N + j) * W + h * FD + dt * 16 + cc], g);
+              atomicAdd(&dK[((size_t)b * N + j) * W + col_off], g);
             }
           }
         }
+      }
       __syncwarp();
     }
     FB_BAR();

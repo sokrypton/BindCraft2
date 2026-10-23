@@ -420,7 +420,7 @@ struct Block {
     if (do_msa && n_msa > 0 && !pair_only && !haveOpmNz)
       opmNzK<<<((size_t)N * N + 255) / 256, 256, 0, st>>>(msa_mask, opmNz, N, S);
     size_t np = (size_t)N * N * CZ, nm = (size_t)S * N * CM;
-    int gp = (np + 255) / 256, gm = (nm + 255) / 256;
+    int gp = (np + 255) / 256, gp2 = (np / 2 + 255) / 256, gm = (nm + 255) / 256;
 
     auto copy = [&](float* d, const float* s, size_t n) {
       CU(cudaMemcpyAsync(d, s, n * 4, cudaMemcpyDeviceToDevice, st));
@@ -484,21 +484,21 @@ struct Block {
       } else { copyNarrowK<<<gm, 256, 0, st>>>(m3, m3b, m2, nm); }
       if (do_msa && n_msa > 0) {
         STEP("opm", opm_.forward(m3b, msa_mask, /*fusedOut*/true);
-                    addOpmNarrowK<__nv_bfloat16, CZ><<<gp, 256, 0, st>>>(p1, p1b, p0,
+                    addOpmNarrowK<__nv_bfloat16, CZ><<<(BLK_BF16CHAIN ? gp2 : gp), 256, 0, st>>>(p1, p1b, p0,
                                                       opm_.out, opm_.ob, opmNz,
                                                       opm::OPM_EPS, np, BLK_BF16CHAIN));
       } else { copyNarrowK<<<gp, 256, 0, st>>>(p1, p1b, p0, np); }
     } else {
     if (do_msa && n_msa > 0) {
       STEP("opm", opm_.forward(m0b, msa_mask, /*fusedOut*/true);
-                  addOpmNarrowK<__nv_bfloat16, CZ><<<gp, 256, 0, st>>>(p1, p1b, p0,
+                  addOpmNarrowK<__nv_bfloat16, CZ><<<(BLK_BF16CHAIN ? gp2 : gp), 256, 0, st>>>(p1, p1b, p0,
                                                     opm_.out, opm_.ob, opmNz,
                                                     opm::OPM_EPS, np, BLK_BF16CHAIN));
     } else if (pair_only) {
       // the OPM's whole contribution, as a constant. Dropping it instead
       // would silently change the model by rms 5.04 a block, four times.
       STEP("opm_const",
-        addConstNarrowK<__nv_bfloat16, CZ><<<gp, 256, 0, st>>>(p1, p1b, p0, opm_k, CZ, np, BLK_BF16CHAIN));
+        addConstNarrowK<__nv_bfloat16, CZ><<<(BLK_BF16CHAIN ? gp2 : gp), 256, 0, st>>>(p1, p1b, p0, opm_k, CZ, np, BLK_BF16CHAIN));
     } else {
       copyNarrowK<<<gp, 256, 0, st>>>(p1, p1b, p0, np);
     }
@@ -522,24 +522,24 @@ struct Block {
     }
     int k = do_pair ? n_pair : 0;
     if (k > 0) { STEP("trimul_out", tmo.forward(p1b, pair_mask, haveStats, fuseGate, keepGates, haveActs, haveT);
-                               if (fuseGate && BLK_BF16CHAIN) PROF_STEP("blk residual", addGateNarrowBK<<<gp, 256, 0, st>>>(p2b, p1b, tmo.o, tmo.t2, np));
+                               if (fuseGate && BLK_BF16CHAIN) PROF_STEP("blk residual", addGateNarrowBK<<<gp2, 256, 0, st>>>(p2b, p1b, tmo.o, tmo.t2, np));
                                else if (fuseGate) PROF_STEP("blk residual", addGateNarrowK<<<gp, 256, 0, st>>>(p2, p2b, p1, tmo.o, tmo.t2, np));
-                               else if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<true><<<gp, 256, 0, st>>>(p2b, p1b, tmo.out, N, CZ, drop_seed, drop_depth, DM_TMO, DROP_PAIR, np); else addNarrowBK<<<gp, 256, 0, st>>>(p2b, p1b, tmo.out, np); }
+                               else if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<true><<<gp2, 256, 0, st>>>(p2b, p1b, tmo.out, N, CZ, drop_seed, drop_depth, DM_TMO, DROP_PAIR, np); else addNarrowBK<<<gp2, 256, 0, st>>>(p2b, p1b, tmo.out, np); }
                                else addNarrowK<<<gp, 256, 0, st>>>(p2, p2b, p1, tmo.out, np)); }
     else copyNarrowK<<<gp, 256, 0, st>>>(p2, p2b, p1, np);
     if (k > 1) { STEP("trimul_in", tmi.forward(p2b, pair_mask, haveStats, fuseGate, keepGates, haveActs, haveT);
-                              if (fuseGate && BLK_BF16CHAIN) PROF_STEP("blk residual", addGateNarrowBK<<<gp, 256, 0, st>>>(p3b, p2b, tmi.o, tmi.t2, np));
+                              if (fuseGate && BLK_BF16CHAIN) PROF_STEP("blk residual", addGateNarrowBK<<<gp2, 256, 0, st>>>(p3b, p2b, tmi.o, tmi.t2, np));
                               else if (fuseGate) PROF_STEP("blk residual", addGateNarrowK<<<gp, 256, 0, st>>>(p3, p3b, p2, tmi.o, tmi.t2, np));
-                              else if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<true><<<gp, 256, 0, st>>>(p3b, p2b, tmi.out, N, CZ, drop_seed, drop_depth, DM_TMI, DROP_PAIR, np); else addNarrowBK<<<gp, 256, 0, st>>>(p3b, p2b, tmi.out, np); }
+                              else if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<true><<<gp2, 256, 0, st>>>(p3b, p2b, tmi.out, N, CZ, drop_seed, drop_depth, DM_TMI, DROP_PAIR, np); else addNarrowBK<<<gp2, 256, 0, st>>>(p3b, p2b, tmi.out, np); }
                               else addNarrowK<<<gp, 256, 0, st>>>(p3, p3b, p2, tmi.out, np)); }
     else copyNarrowK<<<gp, 256, 0, st>>>(p3, p3b, p2, np);
-    if (k > 2) { STEP("triattn_start", tas.forward(p3b, pair_mask, haveFlash, haveBias, keepFlash); PROF_STEP("blk residual", if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<true><<<gp, 256, 0, st>>>(p4b, p3b, tas.out, N, CZ, drop_seed, drop_depth, DM_TAS, DROP_PAIR, np); else addNarrowBK<<<gp, 256, 0, st>>>(p4b, p3b, tas.out, np); } else addNarrowK<<<gp, 256, 0, st>>>(p4, p4b, p3, tas.out, np))); }
+    if (k > 2) { STEP("triattn_start", tas.forward(p3b, pair_mask, haveFlash, haveBias, keepFlash); PROF_STEP("blk residual", if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<true><<<gp2, 256, 0, st>>>(p4b, p3b, tas.out, N, CZ, drop_seed, drop_depth, DM_TAS, DROP_PAIR, np); else addNarrowBK<<<gp2, 256, 0, st>>>(p4b, p3b, tas.out, np); } else addNarrowK<<<gp, 256, 0, st>>>(p4, p4b, p3, tas.out, np))); }
     else copyNarrowK<<<gp, 256, 0, st>>>(p4, p4b, p3, np);
-    if (k > 3) { STEP("triattn_end", tae.forward(p4b, pair_mask, haveFlash, haveBias, keepFlash, /*fusedTransposeOut=*/BLK_BF16CHAIN, haveMaskT); PROF_STEP("blk residual", if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<false, true><<<gp, 256, 0, st>>>(p5b, p4b, tae.out, N, CZ, drop_seed, drop_depth, DM_TAE, DROP_PAIR, np); else addNarrowBK<true><<<gp, 256, 0, st>>>(p5b, p4b, tae.out, np, N, CZ); } else addNarrowK<<<gp, 256, 0, st>>>(p5, p5b, p4, tae.out, np))); }
+    if (k > 3) { STEP("triattn_end", tae.forward(p4b, pair_mask, haveFlash, haveBias, keepFlash, /*fusedTransposeOut=*/BLK_BF16CHAIN, haveMaskT); PROF_STEP("blk residual", if (BLK_BF16CHAIN) { if (use_dropout) addDropNarrowBK<false, true><<<gp2, 256, 0, st>>>(p5b, p4b, tae.out, N, CZ, drop_seed, drop_depth, DM_TAE, DROP_PAIR, np); else addNarrowBK<true><<<gp2, 256, 0, st>>>(p5b, p4b, tae.out, np, N, CZ); } else addNarrowK<<<gp, 256, 0, st>>>(p5, p5b, p4, tae.out, np))); }
     else copyNarrowK<<<gp, 256, 0, st>>>(p5, p5b, p4, np);
     if (k > 4 && !haveRelu) {
       STEP("pair_trans", ptr.forward(p5b, tail, wantMask);
-                         if (tail && BLK_BF16CHAIN) addNarrowBK<<<gp, 256, 0, st>>>(p6b, p5b, ptr.out, np);
+                         if (tail && BLK_BF16CHAIN) addNarrowBK<<<gp2, 256, 0, st>>>(p6b, p5b, ptr.out, np);
                          else if (tail) addF32K<<<gp, 256, 0, st>>>(p6, p5, ptr.out, np));
     }
     else if (BLK_BF16CHAIN) CU(cudaMemcpyAsync(p6b, p5b, np * 2, cudaMemcpyDeviceToDevice, st));
@@ -557,7 +557,7 @@ struct Block {
     // is wrong.  It prices accK, which is 288 calls of 100 MB a stack.
     const bool noacc = envOn("NO_ACC");
     size_t np = (size_t)N * N * CZ, nm = (size_t)S * N * CM;
-    int gp = (np + 255) / 256, gm = (nm + 255) / 256;
+    int gp2 = (np / 2 + 255) / 256, gm = (nm + 255) / 256;
     if (ct_pair != dp) CU(cudaMemcpyAsync(dp, ct_pair, np * 2, cudaMemcpyDeviceToDevice, st));
     if (ct_msa != dm) CU(cudaMemcpyAsync(dm, ct_msa, nm * 4, cudaMemcpyDeviceToDevice, st));
     // NO CONVERSIONS HERE.  The replay that must precede this backward wrote
@@ -577,8 +577,8 @@ struct Block {
     // bf16 copy; it is NOT safe for a module that reads dout again later.
     int k = do_pair ? n_pair : 0, j = do_msa ? n_msa : 0;
     if (k > 4) { NAN_CHECK("before d:pair_trans"); STEP("d:pair_trans", ptr.backward(dp, p5b, dp, /*acc*/!noacc, /*use_bits*/haveReluB)); }
-    if (k > 3) { NAN_CHECK("before d:triattn_end"); STEP("d:triattn_end", (use_dropout ? (dropScaleBK<false, true><<<gp, 256, 0, st>>>(ddrop, dp, N, CZ, drop_seed, drop_depth, DM_TAE, DROP_PAIR, np), tae.backward(ddrop, p4b, pair_mask, dp, /*acc*/!noacc, /*alreadyTransposed*/true)) : tae.backward(dp, p4b, pair_mask, dp, /*acc*/!noacc))); }
-    if (k > 2) { NAN_CHECK("before d:triattn_start"); STEP("d:triattn_start", (use_dropout ? (dropScaleBK<true><<<gp, 256, 0, st>>>(ddrop, dp, N, CZ, drop_seed, drop_depth, DM_TAS, DROP_PAIR, np), tas.backward(ddrop, p3b, pair_mask, dp, /*acc*/!noacc)) : tas.backward(dp, p3b, pair_mask, dp, /*acc*/!noacc))); }
+    if (k > 3) { NAN_CHECK("before d:triattn_end"); STEP("d:triattn_end", (use_dropout ? (dropScaleBK<false, true><<<gp2, 256, 0, st>>>(ddrop, dp, N, CZ, drop_seed, drop_depth, DM_TAE, DROP_PAIR, np), tae.backward(ddrop, p4b, pair_mask, dp, /*acc*/!noacc, /*alreadyTransposed*/true)) : tae.backward(dp, p4b, pair_mask, dp, /*acc*/!noacc))); }
+    if (k > 2) { NAN_CHECK("before d:triattn_start"); STEP("d:triattn_start", (use_dropout ? (dropScaleBK<true><<<gp2, 256, 0, st>>>(ddrop, dp, N, CZ, drop_seed, drop_depth, DM_TAS, DROP_PAIR, np), tas.backward(ddrop, p3b, pair_mask, dp, /*acc*/!noacc)) : tas.backward(dp, p3b, pair_mask, dp, /*acc*/!noacc))); }
     if (k > 1) { NAN_CHECK("before d:trimul_in"); STEP("d:trimul_in", tmi.backward(dp, p2b, pair_mask, dp, /*acc*/!noacc, use_dropout ? drop_seed : nullptr, drop_depth, DM_TMI, DROP_PAIR)); }
     if (k > 0) { NAN_CHECK("before d:trimul_out"); STEP("d:trimul_out", tmo.backward(dp, p1b, pair_mask, dp, /*acc*/!noacc, use_dropout ? drop_seed : nullptr, drop_depth, DM_TMO, DROP_PAIR)); }
     // dp is now the gradient on p1 -- which the MSA row attention also read, so

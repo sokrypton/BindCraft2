@@ -199,28 +199,37 @@ __global__ void __launch_bounds__(32 * WD, TR_MASK_MINB) maskDxK(
       int row = i / 32, c = (i % 32) * 4;
       size_t o = (size_t)(r0 + row) * I + ch + c;
       __nv_bfloat16* dst = tile + (size_t)row * LDD + c;
-#pragma unroll
-      for (int w = 0; w < 2; ++w) {
-        __nv_bfloat162 v = __floats2bfloat162_rn(0.f, 0.f);
-        if (row < nrow) {
-          __nv_bfloat162 d = *(const __nv_bfloat162*)(dr + o + 2 * w);
-          bool p0, p1;
-          if (BITS) {
-            size_t b = o + 2 * w;
-            p0 = (hbit[b >> 5] >> (b & 31)) & 1u;
-            p1 = (hbit[(b + 1) >> 5] >> ((b + 1) & 31)) & 1u;
-          } else {
-            __nv_bfloat162 rr = *(const __nv_bfloat162*)(h + o + 2 * w);
-            p0 = __bfloat162float(rr.x) > 0.f;
-            p1 = __bfloat162float(rr.y) > 0.f;
-          }
-          v = __floats2bfloat162_rn(p0 ? __bfloat162float(d.x) : 0.f,
-                                    p1 ? __bfloat162float(d.y) : 0.f);
+      uint2 out4 = make_uint2(0u, 0u);
+      if (row < nrow) {
+        uint2 d4 = *(const uint2*)(dr + o);
+        __nv_bfloat162 d0 = *reinterpret_cast<const __nv_bfloat162*>(&d4.x);
+        __nv_bfloat162 d1 = *reinterpret_cast<const __nv_bfloat162*>(&d4.y);
+        bool p0, p1, p2, p3;
+        if (BITS) {
+          unsigned bw = hbit[o >> 5] >> (o & 31);
+          p0 = bw & 1u;
+          p1 = (bw >> 1) & 1u;
+          p2 = (bw >> 2) & 1u;
+          p3 = (bw >> 3) & 1u;
+        } else {
+          uint2 r4 = *(const uint2*)(h + o);
+          __nv_bfloat162 r0_ = *reinterpret_cast<const __nv_bfloat162*>(&r4.x);
+          __nv_bfloat162 r1_ = *reinterpret_cast<const __nv_bfloat162*>(&r4.y);
+          p0 = __bfloat162float(r0_.x) > 0.f;
+          p1 = __bfloat162float(r0_.y) > 0.f;
+          p2 = __bfloat162float(r1_.x) > 0.f;
+          p3 = __bfloat162float(r1_.y) > 0.f;
         }
-        *(__nv_bfloat162*)(dst + 2 * w) = v;
+        const __nv_bfloat16 z = __float2bfloat16(0.f);
+        __nv_bfloat162 v0 = make_bfloat162(p0 ? d0.x : z, p1 ? d0.y : z);
+        __nv_bfloat162 v1 = make_bfloat162(p2 ? d1.x : z, p3 ? d1.y : z);
+        out4.x = *reinterpret_cast<const unsigned*>(&v0);
+        out4.y = *reinterpret_cast<const unsigned*>(&v1);
       }
+      *(uint2*)dst = out4;
     }
     __syncthreads();
+#pragma unroll
     for (int kk = 0; kk < 8; ++kk) {
       nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
                              nvcuda::wmma::row_major> fb;

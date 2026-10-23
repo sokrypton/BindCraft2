@@ -113,7 +113,7 @@ __global__ void lnFwdHalfK(const __nv_bfloat16* __restrict__ pair,
   const int K = C / 32;
   const size_t base = (size_t)row * C;
   const size_t pbase = TRANSPOSE
-      ? ((size_t)(row % N) * N + (cr0 + row / N)) * C
+      ? ((size_t)((uint32_t)row % (uint32_t)N) * (uint32_t)N + ((uint32_t)cr0 + (uint32_t)row / (uint32_t)N)) * C
       : base;
   float v[K], s = 0.f;
 #pragma unroll
@@ -147,6 +147,7 @@ __global__ void nbbRowToChanHalfK(const half* __restrict__ src,
                                   half* __restrict__ dst, size_t M) {
   size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (ij >= M) return;
+#pragma unroll
   for (int h = 0; h < H; ++h)
     dst[(size_t)h * M + ij] =
         __float2half(fmaxf(__half2float(src[ij * H + h]) * LOG2E, -6e4f));
@@ -187,7 +188,9 @@ __global__ void lnBwdK(const __nv_bfloat16* __restrict__ dx,
   int lane = threadIdx.x & 31;
   const int K = C / 32;
   const size_t base = (size_t)row * C;
-  const size_t pbase = TRANSPOSE ? ((size_t)(row % N) * N + (row / N)) * C : base;
+  const size_t pbase = TRANSPOSE
+      ? ((size_t)((uint32_t)row % (uint32_t)N) * (uint32_t)N + ((uint32_t)row / (uint32_t)N)) * C
+      : base;
   float r = rstd[row], mu_ = mu[row];
   float xh[K], dxh[K], s1 = 0.f, s2 = 0.f;
 #pragma unroll
@@ -238,28 +241,41 @@ __global__ void dGateK(const __nv_bfloat16* __restrict__ dag,
                        half* __restrict__ davH,
                        __nv_bfloat16* __restrict__ dcomb,
                        float* __restrict__ Dv, int N_, size_t M) {
-  size_t ij = blockIdx.x;
+  constexpr int C2 = C / 2, D2 = D / 2, RPB = 256 / C2;
+  size_t ij = (size_t)blockIdx.x * RPB + threadIdx.x / C2;
   if (ij >= M) return;
   // ONE HEAD PER WARP WAS AN ASSUMPTION, NOT A FACT.  `h = c >> 5` and the
   // full-warp reduce below are both the statement D == 32.  At D = 16 two
   // heads share a warp: h collapsed them to one and the reduction summed
   // across the pair.  Segmenting by D is identical at D = 32 (D >> 1 == 16,
   // c % D == 0 <-> lane == 0) and correct for any D that divides the warp.
-  int c = threadIdx.x, h = c / D, sub = c % D;
+  int c2 = threadIdx.x % C2;
+  int c = c2 * 2, h = c2 / D2, sub = c2 % D2;
   size_t i = ij * C + c;
-  float g = sigmoidf(__half2float(qkvg[ij * QKVG + 3 * C + c]));
-  float d = __bfloat162float(dag[i]);
-  float dav = d * g;
-  davH[i] = __float2half(dav);
-  float av = __half2float(avH[i]);
-  dcomb[ij * TOT + 3 * C + c] = __float2bfloat16(d * av * g * (1.f - g));
-  // D = sum over this head's D channels of dav * av
-  float s = dav * av;
+  half2 q2 = *(const half2*)(qkvg + ij * QKVG + 3 * C + c);
+  float g0 = sigmoidf(__half2float(q2.x));
+  float g1 = sigmoidf(__half2float(q2.y));
+  __nv_bfloat162 d2 = *(const __nv_bfloat162*)(dag + i);
+  float d0 = __bfloat162float(d2.x);
+  float d1 = __bfloat162float(d2.y);
+  float dav0 = d0 * g0, dav1 = d1 * g1;
+  *(half2*)(davH + i) = __floats2half2_rn(dav0, dav1);
+  half2 av2 = *(const half2*)(avH + i);
+  float av0 = __half2float(av2.x);
+  float av1 = __half2float(av2.y);
+  *(__nv_bfloat162*)(dcomb + ij * TOT + 3 * C + c) =
+      __floats2bfloat162_rn(d0 * av0 * g0 * (1.f - g0),
+                            d1 * av1 * g1 * (1.f - g1));
+  // D = sum over this head's D channels of dav * av (preserving exact tree order)
+  float s0 = dav0 * av0, s1 = dav1 * av1;
 #pragma unroll
-  for (int o = D >> 1; o; o >>= 1) s += __shfl_down_sync(0xffffffff, s, o);
+  for (int o = D2 >> 1; o; o >>= 1) {
+    s0 += __shfl_down_sync(0xffffffff, s0, o);
+    s1 += __shfl_down_sync(0xffffffff, s1, o);
+  }
   if (sub == 0) {
     int b = (int)(ij / N_), r = (int)(ij % N_);
-    Dv[((size_t)b * H + h) * N_ + r] = s;
+    Dv[((size_t)b * H + h) * N_ + r] = s0 + s1;
   }
 }
 
@@ -1315,8 +1331,10 @@ struct TriAttn {
         PROF_STEP("ta.b gemm dag",
           lt.matmul((int)Mc, C, C, dxin + (size_t)cr0 * N * C, wo, dag, CUDA_R_16BF,
                     CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
+        constexpr int DG_RPB = 256 / (C / 2);
         PROF_STEP("ta.b gate",
-          dGateK<<<Mc, C, 0, st>>>(dag, avH + (size_t)cr0 * N * C,
+          dGateK<<<(Mc + DG_RPB - 1) / DG_RPB, 256, 0, st>>>(
+            dag, avH + (size_t)cr0 * N * C,
             qkvgAt(cr0), davH, dcomb,
             lseD + (size_t)cr0 * H * N, N, Mc));
         if (!envOn("PROBE_NOZERO")) {

@@ -133,7 +133,36 @@ __global__ void lnBwdK(const __nv_bfloat16* __restrict__ dx,
 // tensor and makes every access coalesced.
 __global__ void centerStatsK(const __nv_bfloat16* __restrict__ t, float* __restrict__ cmu,
                              float* __restrict__ crstd, int M, int Mt) {
-  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if ((Mt & 1) == 0) {
+    size_t ij0 = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (ij0 + 1 < (size_t)M) {
+      float s0 = 0.f, s1 = 0.f;
+#pragma unroll 8
+      for (int c = 0; c < I; ++c) {
+        __nv_bfloat162 v2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+        s0 += __bfloat162float(v2.x);
+        s1 += __bfloat162float(v2.y);
+      }
+      float m0 = s0 / I, m1 = s1 / I;
+      float s2_0 = 0.f, s2_1 = 0.f;
+#pragma unroll 8
+      for (int c = 0; c < I; ++c) {
+        __nv_bfloat162 v2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+        float d0 = __bfloat162float(v2.x) - m0;
+        float d1 = __bfloat162float(v2.y) - m1;
+        s2_0 += d0 * d0;
+        s2_1 += d1 * d1;
+      }
+      *(float2*)&cmu[ij0] = make_float2(m0, m1);
+      *(float2*)&crstd[ij0] = make_float2(rsqrtf(s2_0 / I + LN_EPS),
+                                          rsqrtf(s2_1 / I + LN_EPS));
+      return;
+    }
+    if (ij0 >= (size_t)M) return;
+  }
+  size_t ij = ((Mt & 1) == 0)
+                  ? ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2
+                  : ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
   if (ij >= (size_t)M) return;
   // TWO PASSES: mean((x-mu)^2), which is what AF2 computes
   // (use_fast_variance=False), NOT E[x^2] - E[x]^2.
@@ -170,14 +199,52 @@ __global__ void centerWriteK(const __nv_bfloat16* __restrict__ t,
                              const float* __restrict__ scale, const float* __restrict__ offset,
                              const float* __restrict__ cmu, const float* __restrict__ crstd,
                              __nv_bfloat16* __restrict__ cn, int M, int Mt) {
+  if ((Mt & 1) == 0) {
+    __shared__ float tile2[TILE][2 * TILE + 2];
+    int ij0 = blockIdx.x * (2 * TILE), c0 = blockIdx.y * TILE;
+    int ij_in = ij0 + threadIdx.x * 2;
+#pragma unroll
+    for (int j = 0; j < TILE; j += 8) {
+      int c = c0 + threadIdx.y + j;
+      float v0 = 0.f, v1 = 0.f;
+      if (ij_in + 1 < M) {
+        __nv_bfloat162 b2 = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij_in];
+        v0 = __bfloat162float(b2.x);
+        v1 = __bfloat162float(b2.y);
+      } else if (ij_in < M) {
+        v0 = __bfloat162float(t[(size_t)c * Mt + ij_in]);
+      }
+      tile2[threadIdx.y + j][threadIdx.x * 2] = v0;
+      tile2[threadIdx.y + j][threadIdx.x * 2 + 1] = v1;
+    }
+    __syncthreads();
+    int tid = threadIdx.y * TILE + threadIdx.x;
+    int cl = (tid & 15) * 2, r_sub = tid >> 4;
+    int c_out = c0 + cl;
+    float2 sc2 = *(const float2*)&scale[c_out];
+    float2 of2 = *(const float2*)&offset[c_out];
+#pragma unroll
+    for (int j = 0; j < 2 * TILE; j += 16) {
+      int r = j + r_sub, ij = ij0 + r;
+      if (ij < M) {
+        float m = cmu[ij], rs = crstd[ij];
+        float y0 = (tile2[cl][r] - m) * rs * sc2.x + of2.x;
+        float y1 = (tile2[cl + 1][r] - m) * rs * sc2.y + of2.y;
+        *(__nv_bfloat162*)&cn[(size_t)ij * I + c_out] = __floats2bfloat162_rn(y0, y1);
+      }
+    }
+    return;
+  }
   __shared__ float tile[TILE][TILE + 1];
   int ij0 = blockIdx.x * TILE, c0 = blockIdx.y * TILE;
+#pragma unroll
   for (int j = 0; j < TILE; j += 8) {
     int c = c0 + threadIdx.y + j, ij = ij0 + threadIdx.x;
     tile[threadIdx.y + j][threadIdx.x] =
         ij < M ? __bfloat162float(t[(size_t)c * Mt + ij]) : 0.f;
   }
   __syncthreads();
+#pragma unroll
   for (int j = 0; j < TILE; j += 8) {
     int ij = ij0 + threadIdx.y + j, c = c0 + threadIdx.x;
     if (ij < M)
@@ -268,14 +335,41 @@ __global__ void __launch_bounds__(256) centerFusedK(
 // Transpose it first, then both the statistics and the write are coalesced.
 __global__ void transposeRowToChanK(const __nv_bfloat16* __restrict__ src,
                                     __nv_bfloat16* __restrict__ dst, int M, int W) {
+  if ((M & 1) == 0) {
+    __shared__ __nv_bfloat16 tile2[TILE][2 * TILE + 2];
+    int ij0 = blockIdx.x * (2 * TILE), c0 = blockIdx.y * TILE;
+    int tid = threadIdx.y * TILE + threadIdx.x;
+    int cl = (tid & 15) * 2, r_sub = tid >> 4;
+    int c_in = c0 + cl;
+#pragma unroll
+    for (int j = 0; j < 2 * TILE; j += 16) {
+      int r = j + r_sub, ij = ij0 + r;
+      __nv_bfloat162 b2 = ij < M ? *(const __nv_bfloat162*)&src[(size_t)ij * W + c_in]
+                                 : __floats2bfloat162_rn(0.f, 0.f);
+      tile2[cl][r] = b2.x;
+      tile2[cl + 1][r] = b2.y;
+    }
+    __syncthreads();
+    int ij_out = ij0 + threadIdx.x * 2;
+#pragma unroll
+    for (int j = 0; j < TILE; j += 8) {
+      int c = c0 + threadIdx.y + j;
+      if (ij_out + 1 < M)
+        *(__nv_bfloat162*)&dst[(size_t)c * M + ij_out] =
+            *(const __nv_bfloat162*)&tile2[threadIdx.y + j][threadIdx.x * 2];
+    }
+    return;
+  }
   __shared__ float tile[TILE][TILE + 1];
   int ij0 = blockIdx.x * TILE, c0 = blockIdx.y * TILE;
+#pragma unroll
   for (int j = 0; j < TILE; j += 8) {
     int ij = ij0 + threadIdx.y + j, c = c0 + threadIdx.x;
     tile[threadIdx.y + j][threadIdx.x] =
         ij < M ? __bfloat162float(src[(size_t)ij * W + c]) : 0.f;
   }
   __syncthreads();
+#pragma unroll
   for (int j = 0; j < TILE; j += 8) {
     int c = c0 + threadIdx.y + j, ij = ij0 + threadIdx.x;
     if (ij < M) dst[(size_t)c * M + ij] = __float2bfloat16(tile[threadIdx.x][threadIdx.y + j]);
@@ -288,6 +382,9 @@ __global__ void transposeRowToChanK(const __nv_bfloat16* __restrict__ src,
 // 32 loads are 256 bytes apart -- but every byte of each 256-byte run is used
 // within sixteen iterations and the block's working set is 64 KB, so L1 is
 // meant to absorb it.  Measured, not assumed: see the README.
+#ifndef PROBE_ONEPASS
+#define PROBE_ONEPASS 0
+#endif
 template <bool ROWMAJ = false>
 __global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
                              const __nv_bfloat16* __restrict__ t,
@@ -295,7 +392,47 @@ __global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
                              const float* __restrict__ crstd,
                              __nv_bfloat16* __restrict__ dt, int M, int Mt,
                              int Mdc) {
-  size_t ij = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (!ROWMAJ && !PROBE_ONEPASS && (Mt & 1) == 0 && (Mdc & 1) == 0) {
+    size_t ij0 = ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    if (ij0 + 1 < (size_t)M) {
+      float2 m2 = *(const float2*)&cmu[ij0];
+      float2 r2 = *(const float2*)&crstd[ij0];
+      float sum_d0 = 0.f, sum_dx0 = 0.f, sum_d1 = 0.f, sum_dx1 = 0.f;
+#pragma unroll 8
+      for (int c = 0; c < I; ++c) {
+        __nv_bfloat162 tv = *(const __nv_bfloat162*)&t[(size_t)c * Mt + ij0];
+        __nv_bfloat162 dv = *(const __nv_bfloat162*)&dcnT[(size_t)c * Mdc + ij0];
+        float sc = scale[c];
+        float xhat0 = (__bfloat162float(tv.x) - m2.x) * r2.x;
+        float dxhat0 = __bfloat162float(dv.x) * sc;
+        sum_d0 += dxhat0; sum_dx0 += dxhat0 * xhat0;
+        float xhat1 = (__bfloat162float(tv.y) - m2.y) * r2.y;
+        float dxhat1 = __bfloat162float(dv.y) * sc;
+        sum_d1 += dxhat1; sum_dx1 += dxhat1 * xhat1;
+      }
+      float mean_d0 = sum_d0 / I, mean_dx0 = sum_dx0 / I;
+      float mean_d1 = sum_d1 / I, mean_dx1 = sum_dx1 / I;
+#pragma unroll 8
+      for (int c = 0; c < I; ++c) {
+        size_t o = (size_t)c * Mt + ij0;
+        __nv_bfloat162 tv = *(const __nv_bfloat162*)&t[o];
+        __nv_bfloat162 dv = *(const __nv_bfloat162*)&dcnT[(size_t)c * Mdc + ij0];
+        float sc = scale[c];
+        float xhat0 = (__bfloat162float(tv.x) - m2.x) * r2.x;
+        float dxhat0 = __bfloat162float(dv.x) * sc;
+        float xhat1 = (__bfloat162float(tv.y) - m2.y) * r2.y;
+        float dxhat1 = __bfloat162float(dv.y) * sc;
+        *(__nv_bfloat162*)&dt[o] = __floats2bfloat162_rn(
+            r2.x * (dxhat0 - mean_d0 - xhat0 * mean_dx0),
+            r2.y * (dxhat1 - mean_d1 - xhat1 * mean_dx1));
+      }
+      return;
+    }
+    if (ij0 >= (size_t)M) return;
+  }
+  size_t ij = (!ROWMAJ && !PROBE_ONEPASS && (Mt & 1) == 0 && (Mdc & 1) == 0)
+                  ? ((size_t)blockIdx.x * blockDim.x + threadIdx.x) * 2
+                  : ((size_t)blockIdx.x * blockDim.x + threadIdx.x);
   if (ij >= (size_t)M) return;
   float m = cmu[ij], r = crstd[ij];
   float sum_d = 0.f, sum_dx = 0.f;
@@ -324,9 +461,6 @@ __global__ void centerLnBwdK(const __nv_bfloat16* __restrict__ dcnT,
   // same trade and LOST.  ~5 ms expected for a kernel with a cross-thread
   // reduction and a losing precedent.  NOT BUILT.  The probe stays so the
   // next person can re-price it in thirty seconds instead of an hour.
-#ifndef PROBE_ONEPASS
-#define PROBE_ONEPASS 0
-#endif
 #pragma unroll 8
   for (int c = 0; c < I; ++c) {
     size_t o = (size_t)c * Mt + ij;
@@ -1000,20 +1134,35 @@ __global__ void dOutGateK(const __nv_bfloat16* __restrict__ dout,
                           const uint32_t* __restrict__ seedp = nullptr,
                           uint32_t depth = 0, uint32_t mod = 0,
                           float rate = 0.f, int N = 0, size_t p0 = 0) {
-  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t i2 = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  size_t i = i2 * 2;
   if (i >= n) return;
-  float g = __bfloat162float(dout[i]);
-  if (seedp) {
-    size_t gi = p0 * C + i;
-    int c = (int)(gi % C);
-    int col = (int)((gi / C) % N);
-    uint32_t idx = (uint32_t)(col * C + c);
-    g = __bfloat162float(__float2bfloat16(g * dropScale(seedp, depth, mod, idx, rate)));
+  __nv_bfloat162 dg2 = *(const __nv_bfloat162*)(dout + i);
+  float g0 = __bfloat162float(dg2.x);
+  float g1 = __bfloat162float(dg2.y);
+  if (seedp && rate > 0.f && seedp[1] != 0u) {
+    uint32_t rc = (uint32_t)(p0 + (i / C));
+    uint32_t c0 = (uint32_t)(i % C);
+    uint32_t col = rc % (uint32_t)N;
+    uint32_t base_idx = col * (uint32_t)C + c0;
+    g0 = __bfloat162float(__float2bfloat16(g0 * dropScale(seedp, depth, mod, base_idx, rate)));
+    g1 = __bfloat162float(__float2bfloat16(g1 * dropScale(seedp, depth, mod, base_idx + 1u, rate)));
   }
-  float s = gt2Load(t2[i]);
-  dO[i] = __float2bfloat16(g * s);
+#if TM_GATE8T
+  uchar2 t2v = *(const uchar2*)(t2 + i);
+  float s0 = (float)t2v.x * (1.f / 255.f);
+  float s1 = (float)t2v.y * (1.f / 255.f);
+#else
+  __nv_bfloat162 t2v = *(const __nv_bfloat162*)(t2 + i);
+  float s0 = __bfloat162float(t2v.x);
+  float s1 = __bfloat162float(t2v.y);
+#endif
+  *(__nv_bfloat162*)(dO + i) = __floats2bfloat162_rn(g0 * s0, g1 * s1);
   // d/d(pre_gl) of out = o * sigmoid(pre_gl)
-  dt2pre[i] = __float2bfloat16(g * __bfloat162float(o[i]) * s * (1.f - s));
+  __nv_bfloat162 ov = *(const __nv_bfloat162*)(o + i);
+  *(__nv_bfloat162*)(dt2pre + i) = __floats2bfloat162_rn(
+      g0 * __bfloat162float(ov.x) * s0 * (1.f - s0),
+      g1 * __bfloat162float(ov.y) * s1 * (1.f - s1));
 }
 
 __global__ void f32ToBf16K(const float* __restrict__ a, __nv_bfloat16* __restrict__ b,
@@ -1500,11 +1649,13 @@ struct TriMul {
     if (three_pass) {
       for (size_t p0 = 0; p0 < (size_t)M; p0 += tmRows) {
         const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
-        dim3 gt((pm + TILE - 1) / TILE, I / TILE);
+        const int cw_tile = ((M & 1) == 0) ? (2 * TILE) : TILE;
+        dim3 gt((pm + cw_tile - 1) / cw_tile, I / TILE);
+        const int cs_rows = ((M & 1) == 0) ? (pm + 1) / 2 : pm;
         PROF_STEP("tm.f centerLn",
           if (!haveStats)
-            centerStatsK<<<(pm + 255) / 256, 256, 0, st>>>(t + p0, cmu + p0,
-                                                           crstd + p0, pm, M);
+            centerStatsK<<<(cs_rows + 255) / 256, 256, 0, st>>>(t + p0, cmu + p0,
+                                                                crstd + p0, pm, M);
           centerWriteK<<<gt, bt, 0, st>>>(t + p0, cn_scale, cn_offset, cmu + p0,
                                           crstd + p0, cn, pm, M));
         PROF_STEP("tm.f gemm out",
@@ -1543,7 +1694,8 @@ struct TriMul {
     for (size_t p0 = 0; p0 < (size_t)M; p0 += tmRows) {
       const int pm = (int)(((size_t)M - p0 < tmRows) ? (size_t)M - p0 : tmRows);
       const size_t pc = (size_t)pm * C;
-      dim3 gt((pm + TILE - 1) / TILE, I / TILE);
+      const int tr_tile = ((pm & 1) == 0) ? (2 * TILE) : TILE;
+      dim3 gt((pm + tr_tile - 1) / tr_tile, I / TILE);
     const __nv_bfloat16* dxin;
     if constexpr (std::is_same<DT, __nv_bfloat16>::value) {
       dxin = dout + p0 * C;              // already the GEMM's width
@@ -1553,10 +1705,10 @@ struct TriMul {
       dxin = dx;
     }
     PROF_STEP("tm.b dOutGate",
-      dOutGateK<<<(pc + 255) / 256, 256, 0, st>>>(dxin, o + p0 * C, t2 + p0 * C,
-                                                  dO, dt2pre + p0 * C, pc,
-                                                  drop_seed, drop_depth,
-                                                  drop_mod, drop_rate, N, p0));
+      dOutGateK<<<(pc / 2 + 255) / 256, 256, 0, st>>>(dxin, o + p0 * C, t2 + p0 * C,
+                                                      dO, dt2pre + p0 * C, pc,
+                                                      drop_seed, drop_depth,
+                                                      drop_mod, drop_rate, N, p0));
     // CHANNEL-MAJOR STRAIGHT OUT OF THE GEMM.  centerLnBwdK reads its
     // cotangent as [I][M], to match `t`, and that used to be arranged by
     // writing dcn [M][I] and transposing it through HBM -- 33.6 MB each way,
@@ -1581,9 +1733,10 @@ struct TriMul {
       // `dcnT` is the chunk's own buffer, so its channel stride is pm, while
       // `t` and `dt` keep M.  Two strides, which is why centerLnBwdK takes
       // both: handing it one is a silently wrong read of 128 planes.
-      centerLnBwdK<false><<<(pm + 255) / 256, 256, 0, st>>>(dcnT, t + p0, cn_scale,
-                                                            cmu + p0, crstd + p0,
-                                                            dt + p0, pm, M, pm));
+      const int cb_rows = (!PROBE_ONEPASS && (M & 1) == 0 && (pm & 1) == 0) ? (pm + 1) / 2 : pm;
+      centerLnBwdK<false><<<(cb_rows + 255) / 256, 256, 0, st>>>(dcnT, t + p0, cn_scale,
+                                                                 cmu + p0, crstd + p0,
+                                                                 dt + p0, pm, M, pm));
     }
     PROF_STEP("tm.b bmm",
       if (outgoing) {
