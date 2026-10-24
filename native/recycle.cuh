@@ -125,24 +125,34 @@ struct Recycle {
   // dgramK masks on the runtime length.
   bool prev_zero = false;
 
-  void alloc(int N_, cudaStream_t s) {
+  void alloc(int N_, cudaStream_t s, float* lnbuf_ = nullptr,
+             float* prev_pair_ = nullptr, float* dg_ = nullptr,
+             float* stats_ = nullptr) {
     N = N_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, s));
     const size_t n1 = (size_t)N, nn = (size_t)N * N;
     if (!prev_zero) {
       CU(cudaMalloc(&pb, n1 * 3 * 4));
-      CU(cudaMalloc(&dg, nn * DBINS * 4));
-      CU(cudaMalloc(&lnbuf, nn * 128 * 4));
+      if (dg_) nbrealloc::adoptPtr((void**)&dg, dg_, nn * DBINS * 4);
+      else     CU(cudaMalloc(&dg, nn * DBINS * 4));
+      if (lnbuf_) nbrealloc::adoptPtr((void**)&lnbuf, lnbuf_, nn * 128 * 4);
+      else        CU(cudaMalloc(&lnbuf, nn * 128 * 4));
       CU(cudaMalloc(&prev_pos, n1 * ATOM * 3 * 4));
     }
     if (!prev_zero) {
-      CU(cudaMalloc(&prev_pair, nn * 128 * 4));
+      if (prev_pair_) nbrealloc::adoptPtr((void**)&prev_pair, prev_pair_, nn * 128 * 4);
+      else            CU(cudaMalloc(&prev_pair, nn * 128 * 4));
       CU(cudaMalloc(&prev_msa0, n1 * 256 * 4));
     }
     if (!prev_zero) {
-      CU(cudaMalloc(&mu, nn * 4));
-      CU(cudaMalloc(&rstd, nn * 4));
+      if (stats_) {
+        nbrealloc::adoptPtr((void**)&mu, stats_, nn * 4);
+        nbrealloc::adoptPtr((void**)&rstd, stats_ + nn, nn * 4);
+      } else {
+        CU(cudaMalloc(&mu, nn * 4));
+        CU(cudaMalloc(&rstd, nn * 4));
+      }
     }
   }
 

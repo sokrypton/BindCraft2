@@ -394,7 +394,7 @@ struct Stack {
     // called, and `no_keep` here meant the first grant said nothing either.
     // Zero tiers, in silence, costing 181 ms a step at complex 215.  Say it
     // instead, and name the thing that has to happen next.
-    if (defer_keep)
+    if (defer_keep && !nbrealloc::active())
       fprintf(stderr, "stack: first grant took NO keep tiers (defer_keep) -- "
               "regrant() must be called on a save forward or this stack "
               "replays every block for the life of the process\n");

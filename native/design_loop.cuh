@@ -60,7 +60,7 @@ struct DeviceState {
   float *c_expres = nullptr, *c_dgram = nullptr;
   float* d_sequence = nullptr;
 
-  void alloc(const dsin::State& h) {
+  void alloc(const dsin::State& h, bool lean = false) {
     n = h.n; nmax = h.nmax;
     const size_t n1 = nmax, nn = (size_t)nmax * nmax;
     auto F = [&](float** p, size_t k) { CU(::cudaMalloc(p, k * 4)); CU(cudaMemset(*p, 0, k * 4)); };
@@ -74,12 +74,14 @@ struct DeviceState {
     F(&aa_bias, dsin::NAA);
     F(&o_atoms, n1 * 37 * 3); F(&o_plddt, n1); F(&o_pae, nn); F(&o_ptm, 1);
     F(&o_iptm, 1); F(&o_iptm_res, n1); F(&o_expres, n1);
-    F(&o_dgram, nn * design_step::DBINS);
     CU(::cudaMalloc(&o_amask, n1 * 37)); CU(cudaMemset(o_amask, 0, n1 * 37));
-    F(&c_atoms, n1 * 37 * 3); F(&c_plddt, n1); F(&c_pae, nn); F(&c_ptm, 1);
-    F(&c_iptm, 1); F(&c_iptm_res, n1); F(&c_expres, n1);
-    F(&c_dgram, nn * design_step::DBINS);
-    F(&d_sequence, n1 * dsin::NAA);
+    if (!lean) {
+      F(&o_dgram, nn * design_step::DBINS);
+      F(&c_atoms, n1 * 37 * 3); F(&c_plddt, n1); F(&c_pae, nn); F(&c_ptm, 1);
+      F(&c_iptm, 1); F(&c_iptm_res, n1); F(&c_expres, n1);
+      F(&c_dgram, nn * design_step::DBINS);
+      F(&d_sequence, n1 * dsin::NAA);
+    }
     // THE RUNTIME LENGTH LIVES ON THE DEVICE, which is what lets one
     // allocation serve every length -- see design_step.cuh's note on in.n.
     CU(cudaMemcpy(n_dev, &n, 4, cudaMemcpyHostToDevice));
@@ -141,33 +143,34 @@ struct DeviceState {
 // redraws the design model and the dropout.
 struct OutputSnapshot {
   size_t n1 = 0, nn = 0;
-  float *atoms = nullptr, *plddt = nullptr, *pae = nullptr, *ptm = nullptr;
-  float *iptm = nullptr, *iptm_res = nullptr, *expres = nullptr, *dgram = nullptr;
-  bool* amask = nullptr;
+  std::vector<float> atoms, plddt, pae, ptm, iptm, iptm_res, expres, dgram;
+  std::vector<uint8_t> amask;
   void alloc(const DeviceState& d) {
     n1 = (size_t)d.nmax; nn = n1 * n1;
-    auto F = [&](float** p, size_t k) { CU(::cudaMalloc(p, k * 4)); };
-    F(&atoms, n1 * 37 * 3); F(&plddt, n1); F(&pae, nn); F(&ptm, 1);
-    F(&iptm, 1); F(&iptm_res, n1); F(&expres, n1);
-    F(&dgram, nn * design_step::DBINS);
-    CU(::cudaMalloc(&amask, n1 * 37));
+    atoms.resize(n1 * 37 * 3); plddt.resize(n1); pae.resize(nn); ptm.resize(1);
+    iptm.resize(1); iptm_res.resize(n1); expres.resize(n1);
+    if (d.o_dgram) dgram.resize(nn * design_step::DBINS);
+    amask.resize(n1 * 37);
   }
-  static void copy(float* dst, const float* src, size_t k) {
-    CU(cudaMemcpy(dst, src, k * 4, cudaMemcpyDeviceToDevice));
+  static void saveF(std::vector<float>& dst, const float* src, size_t k) {
+    if (src) CU(cudaMemcpy(dst.data(), src, k * 4, cudaMemcpyDeviceToHost));
+  }
+  static void restF(float* dst, const std::vector<float>& src, size_t k) {
+    if (dst) CU(cudaMemcpy(dst, src.data(), k * 4, cudaMemcpyHostToDevice));
   }
   void save(const DeviceState& d) {
-    copy(atoms, d.o_atoms, n1 * 37 * 3); copy(plddt, d.o_plddt, n1);
-    copy(pae, d.o_pae, nn); copy(ptm, d.o_ptm, 1); copy(iptm, d.o_iptm, 1);
-    copy(iptm_res, d.o_iptm_res, n1); copy(expres, d.o_expres, n1);
-    copy(dgram, d.o_dgram, nn * design_step::DBINS);
-    CU(cudaMemcpy(amask, d.o_amask, n1 * 37, cudaMemcpyDeviceToDevice));
+    saveF(atoms, d.o_atoms, n1 * 37 * 3); saveF(plddt, d.o_plddt, n1);
+    saveF(pae, d.o_pae, nn); saveF(ptm, d.o_ptm, 1); saveF(iptm, d.o_iptm, 1);
+    saveF(iptm_res, d.o_iptm_res, n1); saveF(expres, d.o_expres, n1);
+    if (d.o_dgram) saveF(dgram, d.o_dgram, nn * design_step::DBINS);
+    CU(cudaMemcpy(amask.data(), d.o_amask, n1 * 37, cudaMemcpyDeviceToHost));
   }
   void restore(DeviceState& d) const {
-    copy(d.o_atoms, atoms, n1 * 37 * 3); copy(d.o_plddt, plddt, n1);
-    copy(d.o_pae, pae, nn); copy(d.o_ptm, ptm, 1); copy(d.o_iptm, iptm, 1);
-    copy(d.o_iptm_res, iptm_res, n1); copy(d.o_expres, expres, n1);
-    copy(d.o_dgram, dgram, nn * design_step::DBINS);
-    CU(cudaMemcpy(d.o_amask, amask, n1 * 37, cudaMemcpyDeviceToDevice));
+    restF(d.o_atoms, atoms, n1 * 37 * 3); restF(d.o_plddt, plddt, n1);
+    restF(d.o_pae, pae, nn); restF(d.o_ptm, ptm, 1); restF(d.o_iptm, iptm, 1);
+    restF(d.o_iptm_res, iptm_res, n1); restF(d.o_expres, expres, n1);
+    if (d.o_dgram) restF(d.o_dgram, dgram, nn * design_step::DBINS);
+    CU(cudaMemcpy(d.o_amask, amask.data(), n1 * 37, cudaMemcpyHostToDevice));
   }
 };
 

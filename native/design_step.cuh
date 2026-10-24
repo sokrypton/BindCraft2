@@ -421,6 +421,7 @@ struct DesignStep {
     nbrealloc::allocN() = nmax_alloc;
     nbrealloc::Scope reuse;
     alloc(p, st);
+    if (trunk.psave && !predict_bound) trunk.restoreSaveSet();
   }
 
   // The length alloc() was FIRST called with -- the size of the buffers,
@@ -508,7 +509,12 @@ struct DesignStep {
     const size_t n1 = (size_t)N, nn = (size_t)N * N;
     CU(cudaMalloc(&pair_all, nn * (size_t)embed::CZ * 4));
     if (nblean::on()) {
-      extra.allocOneSave(nmax_alloc);
+      if (share_step && extra.b.chainBytes() <= cb_max) {
+        nbrealloc::adoptPtr((void**)&extra.p1save, (char*)pair_all + cb_max, cb_max);
+        CU(cudaMalloc(&extra.m1save, (size_t)nmax_alloc * embed::CM * 4));
+      } else {
+        extra.allocOneSave(nmax_alloc);
+      }
       extra.setSaveBuffers(extra.p1save, extra.m1save, /*single*/true);
       extra.save_full = false;
     } else {
@@ -559,9 +565,12 @@ struct DesignStep {
     t1d.alloc(N, s);  dstook("tpl1d");
     // Zero recycles is what design runs, and then the two normed buffers
     // hold zeros forever -- 277 MB of them at N=736.  See recycle.cuh.
-    rec.prev_zero = (p.recycles == 0);
-    rec.alloc(N, s);  dstook("recycle");
     const bool share_hd = share_step && extra.b.chainBytes() <= cb_max;
+    rec.prev_zero = (p.recycles == 0);
+    rec.alloc(N, s, share_hd ? sm.pairN : nullptr,
+              share_hd ? pair_all : nullptr,
+              share_hd ? (float*)extra.b.p1b : nullptr,
+              share_hd ? (float*)extra.b.p5b : nullptr);  dstook("recycle");
     hd.alloc(N, s, share_hd ? (float*)extra.b.p4b : nullptr,
              share_hd ? (void*)extra.b.p6b : nullptr,
              share_hd ? (void*)((char*)pair_all + cb_max) : nullptr);  dstook("heads");
@@ -760,7 +769,19 @@ struct DesignStep {
 
   void predictBuffers() {
     predict_bound = true;
-    trunk.allocOneSave(nmax_alloc);
+    if (trunk.psave) {
+      trunk.p1save = trunk.psave;
+      trunk.m1save = trunk.msave;
+    } else {
+      const size_t cb_max = (size_t)nmax_alloc * nmax_alloc * embed::CZ * 2;
+      if (envOnDef("NB_STEP_SHARE", true) && pair_all && trunk.b.chainBytes() <= cb_max) {
+        trunk.p1save = reinterpret_cast<__nv_bfloat16*>((char*)pair_all + cb_max);
+        if (!trunk.m1save)
+          CU(cudaMalloc(&trunk.m1save, (size_t)(plan.msa_rows + 1) * nmax_alloc * embed::CM * 4));
+      } else {
+        trunk.allocOneSave(nmax_alloc);
+      }
+    }
     trunk.setSaveBuffers(trunk.p1save, trunk.m1save, /*single*/true);
     trunk.useOwnOut(nmax_alloc);
     trunk.save_full = false;
