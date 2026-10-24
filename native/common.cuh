@@ -72,6 +72,14 @@ inline bool envOn(const char* name) {
 // nothing changes at all -- chunking costs 0.7-8.5% and buys nothing when the
 // step already fits.
 //
+// RE-MEASURED 2026-10-24, after 11c50d8's scratch sharing freed ~2.3x: the
+// default is now 768 -- complex 768 runs on the A10 with no chunking and no
+// stride (16.1 s against 20.2 with both), 832 needs one of them, and chunking
+// is the cheaper one (+6-8% a step against +12-15% for stride), so it turns
+// on first.  The 480 measurement above is history.  Callers scale this per
+// card by sqrt(budget): bc2's native.py (_chunk_threshold) and
+// bindcraft_cli.cu both export NB_CHUNK_N before the first alloc.
+//
 // NB_CHUNK_N moves the threshold (0 disables chunking entirely); each
 // module's own knob -- TM_ROWS, TA_ROWS, TR_ROWS -- still overrides the chunk
 // SIZE outright, at any length.
@@ -146,7 +154,7 @@ inline bool nbChunkOn(size_t n) {
 // fresh allocation and buys a gradient identical to the per-state path.
 inline bool nbChunkOnAt(size_t n) {
   static const char* e = getenv("NB_CHUNK_N");
-  static const size_t thresh = e ? (size_t)atoll(e) : 480;
+  static const size_t thresh = e ? (size_t)atoll(e) : 768;
   return thresh > 0 && n > thresh;
 }
 

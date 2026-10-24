@@ -767,6 +767,11 @@ struct Stack {
     return best;
   }
 
+  // THE 896 DEFAULT (was 512) is the A10 measurement from 2026-10-24: with
+  // chunking on, complex 896 still fits a full save-set (27.2 s); 960 dies
+  // asking XLA for the 11.3 GiB 48-slot set, which only the stride shrinks.
+  // Stride costs +12-15% a step, so it is the LAST saving to turn on.
+  // Callers export NB_STRIDE_N scaled per card (native.py, bindcraft_cli.cu).
   int strideK() const {
     static const char* e = getenv("NB_STRIDE");
     static const char* t = getenv("NB_STRIDE_N");
@@ -777,11 +782,11 @@ struct Stack {
     } else if (stride_override > 0) {
       k = stride_override;
     } else if (b) {
-      const int base = N > (t ? atoi(t) : 512) ? 4 : 1;
+      const int base = N > (t ? atoi(t) : 896) ? 4 : 1;
       const size_t slot = (size_t)N * N * block::CZ * 2;
       k = strideForBudget(depth, base, slot, (size_t)atoll(b));
     } else {
-      k = N > (t ? atoi(t) : 512) ? 4 : 1;  // no budget exported: as before
+      k = N > (t ? atoi(t) : 896) ? 4 : 1;  // no budget exported: as before
     }
     if (k < 1) k = 1;
     if (k > depth) k = depth;
