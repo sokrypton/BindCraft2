@@ -862,7 +862,11 @@ _A10_MAX_N = 608
 # Padded N above which the save-set goes stride-remat.  It is the OLD
 # ceiling on purpose: below it memory is not the binding constraint and the
 # stride is 21% of a step for nothing.
-_A10_STRIDE_N = 512
+_A10_STRIDE_N = 896
+# 896 since 2026-10-24 (was 512): after the native scratch sharing, complex
+# 768 runs on the A10 with no saving at all, chunking alone carries it to
+# 896, and only past that does the 48-slot save-set (11.3 GiB at 960) need
+# the stride.  Stride is +12-15% a step, chunking +6-8%, so chunking first.
 
 
 def _scaled(a10_value: int) -> int:
@@ -902,7 +906,7 @@ def _stride_threshold() -> int:
 @functools.lru_cache(maxsize=1)
 def _chunk_threshold() -> int:
     """Padded N above which the pair modules chunk themselves."""
-    return _scaled(480)
+    return _scaled(768)              # 480 before the scratch sharing
 
 
 _DECLINED_LENGTHS: set = set()
@@ -1209,7 +1213,7 @@ def _stride_k(depth: int, n: int) -> int:
         return max(1, min(int(env), depth))
     budget = int(os.environ.get('NB_BUDGET_BYTES') or 0)
     if not budget:
-        k = 4 if n > int(os.environ.get('NB_STRIDE_N') or 512) else 1
+        k = 4 if n > int(os.environ.get('NB_STRIDE_N') or 896) else 1
         return max(1, min(k, depth))
     # THE BUDGET RULE ONLY ESCALATES A SATURATED BASE, and that restraint is
     # what makes it safe.  Applied freely it moves lengths that work today:
@@ -1221,7 +1225,7 @@ def _stride_k(depth: int, n: int) -> int:
     #
     # So: below the threshold nothing changes at all, and at k = 4 the
     # stride only tightens if the save-set at k = 4 does not fit.
-    base = 4 if n > int(os.environ.get('NB_STRIDE_N') or 512) else 1
+    base = 4 if n > int(os.environ.get('NB_STRIDE_N') or 896) else 1
     if base < 4:
         return max(1, min(base, depth))
     slot = n * n * _PAIR_CHANNEL * 2        # bytes one save slot holds
