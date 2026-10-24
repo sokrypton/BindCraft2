@@ -409,8 +409,31 @@ inline cudaError_t freeUnlessReusing(void* p) {
   return ::cudaFree(p);
 }
 
+// The members the FIRST build adopted.  A re-derive (setN, reuse active)
+// may only re-adopt these, never start adopting something new.
+inline std::set<void**>& adoptedFirst() { static std::set<void**> s; return s; }
+
+// THE ADOPTION DECISION IS MADE ONCE, at the first build -- the object's
+// longest length.  Every guard at the call sites is written against the
+// CURRENT N, and a shorter re-derive passes guards the first build failed:
+// complex 160 -> binder alone 64 -> complex 160 moved triattn's dKf into
+// trimul's `da` at 64 and left it there at 160, where it no longer fits
+// (`cudaMemsetAsync ... invalid argument` in the backward).
+//
+// A re-derive re-points an adopted member (donor regions are carved at
+// length-dependent offsets) but leaves its pool SLOT as the first build
+// recorded it: rewriting the slot to the short length's region made the
+// next long re-derive GREW and orphan a fresh buffer every call -- 22
+// buffers and +80 MiB a call on complex + binder alone.
 inline void adoptPtr(void** dst, void* src, size_t n) {
   if (!src) return;
+  if (active()) {
+    if (!adoptedFirst().count(dst)) return;
+    *dst = src;
+    donated().insert(src);
+    return;
+  }
+  adoptedFirst().insert(dst);
   if (*dst && *dst != src) CU(freeUnlessReusing(*dst));
   *dst = src;
   donated().insert(src);

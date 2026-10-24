@@ -1392,6 +1392,12 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
     it->second->t1d_tab = t1;
     // The length this CALL is for.  A no-op unless the object is already at
     // it, which is the common case within one state.
+    // THE ALLOCATION LENGTH IS PER OBJECT.  nbrealloc::allocN() is one
+    // process-wide value that the chunk policies read at RUN time as well as
+    // at alloc (taChunkRows sizes the backward's chunks), so it has to be
+    // THIS object's for the whole call -- not whichever object last ran
+    // setN (the design object and the lean predict object are two).
+    nbrealloc::allocN() = it->second->nmax_alloc;
     if (oneObject()) it->second->setN(k.nmax);
     return it->second;
   }
@@ -1403,6 +1409,9 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   p.dropout = k.dropout != 0;
   p.lean = k.lean != 0;
   p.monomer = mono;
+  // a new object's policies follow its OWN length, not the last object's
+  // (with allocN == N every policy is the plain length-based one)
+  nbrealloc::allocN() = k.nmax;
   m->alloc(p, st);
   m->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post), W(k.emb), t, t1);
   g_ds[k] = m;
