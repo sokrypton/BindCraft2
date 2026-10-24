@@ -256,27 +256,20 @@ struct Block {
     // at N=640 for the pair.  NO_FUSE_OUTGATE turns that off, and then it is
     // not; the decision has to be made HERE because the buffer is allocated at
     // alloc() time now, not on first use.  See trimul_body.cuh.
+    const bool share_d = BLK_SHARE_DSCRATCH && (!donor || donor->N < N);
     tmo.need_out = tmi.need_out = envOn("NO_FUSE_OUTGATE");
     tmo.alloc(N, true);  if (donor) tmo.adoptScratchFrom(donor->tmo, "block.tmo"); took("trimul_out");
-    tmi.alloc(N, false); if (donor) tmi.adoptScratchFrom(donor->tmi, "block.tmi"); took("trimul_in");
-    tas.alloc(N, false); tas.allocOrientation(); if (donor) tas.adoptScratchFrom(donor->tas, "block.tas"); took("triattn_start");
-    tae.alloc(N, true);  tae.allocOrientation(); if (donor) tae.adoptScratchFrom(donor->tae, "block.tae"); took("triattn_end");
+    tmi.alloc(N, false); if (donor) tmi.adoptScratchFrom(donor->tmi, "block.tmi"); if (share_d) tmi.adoptBackwardScratch(tmo); took("trimul_in");
+    tas.alloc(N, false); tas.allocOrientation(); if (donor) tas.adoptScratchFrom(donor->tas, "block.tas"); if (share_d) tas.adoptBackwardFromTmul(tmo); took("triattn_start");
+    tae.alloc(N, true);  tae.allocOrientation(); if (donor) tae.adoptScratchFrom(donor->tae, "block.tae"); if (share_d) tae.adoptBackwardScratch(tas); took("triattn_end");
     ptr.is_pair = true;                       // KEEP_RELU, see transition.cuh
-    ptr.alloc(N * N, CZ, st); if (donor) ptr.adoptScratchFrom(donor->ptr, "block.ptr"); took("pair_trans");
+    ptr.alloc(N * N, CZ, st); if (donor) ptr.adoptScratchFrom(donor->ptr, "block.ptr"); if (share_d) ptr.adoptBlockScratch(tmo, tas); took("pair_trans");
     }
-    // THE PAIRS SHARE THEIR BACKWARD SCRATCH.  backward() runs
-    // d:pair_trans, d:triattn_end, d:triattn_start, d:trimul_in, d:trimul_out
-    // in that order on one stream, so the second instance of each pair is
-    // finished with its d* buffers before the first instance starts.  Only
-    // the BACKWARD ones: the forward intermediates these modules keep are
-    // written for all nine before any backward reads one, and the keep tiers
-    // are built from keepSlots() below, which this does not touch.
-    // ...and a donated block has already had this done to it, so doing it
-    // again would free the donor's buffers a second time.
-    if (BLK_SHARE_DSCRATCH && (!donor || donor->N < N)) {
-      tmi.adoptBackwardScratch(tmo);
-      tae.adoptBackwardScratch(tas);
-      took("shared d-scratch (negative = freed)");
+    if (BLK_SHARE_DSCRATCH && !pair_only) {
+      const auto& tm = (donor && donor->N >= N) ? donor->tmo : tmo;
+      opm_.adoptBlockScratch(tm);
+      row.adoptBlockScratch(tm);
+      took("shared msa d-scratch (negative = freed)");
     }
     // PUT EVERY MODULE ON ONE STREAM, here rather than only in the FFI path.
     // trimul::alloc and triattn::alloc each create a stream of their own (their
@@ -542,8 +535,8 @@ struct Block {
                          if (tail && BLK_BF16CHAIN) addNarrowBK<<<gp2, 256, 0, st>>>(p6b, p5b, ptr.out, np);
                          else if (tail) addF32K<<<gp, 256, 0, st>>>(p6, p5, ptr.out, np));
     }
-    else if (BLK_BF16CHAIN) CU(cudaMemcpyAsync(p6b, p5b, np * 2, cudaMemcpyDeviceToDevice, st));
-    else copy(p6, p5, np);
+    else if (tail && BLK_BF16CHAIN) CU(cudaMemcpyAsync(p6b, p5b, np * 2, cudaMemcpyDeviceToDevice, st));
+    else if (tail) copy(p6, p5, np);
   }
 
   // `ct_pair`/`ct_msa` are the cotangents on p6/m3; `dp`/`dm` end up holding

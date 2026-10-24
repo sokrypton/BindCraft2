@@ -299,8 +299,22 @@ inline void* donate(size_t n) {
   return best->base + off;
 }
 
-inline cudaError_t mallocReusing(void** p, size_t n) {
+inline std::map<void**, Slot>& poolMap() {
   static std::map<void**, Slot> pool;
+  return pool;
+}
+
+inline void* sharedWorkspace(size_t bytes = 64u << 20) {
+  static void* shared = nullptr;
+  if (!shared) {
+    CU(::cudaMalloc(&shared, bytes));
+    neverDonate(shared);
+  }
+  return shared;
+}
+
+inline cudaError_t mallocReusing(void** p, size_t n) {
+  auto& pool = poolMap();
   auto it = pool.find(p);
   if (active() && it != pool.end() && n <= it->second.n) {
     *p = it->second.p;
@@ -365,7 +379,17 @@ inline cublasStatus_t cublasCreateOnce(cublasHandle_t* h) {
   auto it = made.find((void*)h);
   if (active() && it != made.end()) { *h = it->second; return CUBLAS_STATUS_SUCCESS; }
   cublasStatus_t e = ::cublasCreate(h);
-  if (e == CUBLAS_STATUS_SUCCESS) made[(void*)h] = *h;
+  if (e == CUBLAS_STATUS_SUCCESS) {
+    ::cublasSetWorkspace(*h, sharedWorkspace(), 64u << 20);
+    made[(void*)h] = *h;
+  }
+  return e;
+}
+
+inline cublasStatus_t cublasSetStreamShared(cublasHandle_t h, cudaStream_t s) {
+  cublasStatus_t e = ::cublasSetStream(h, s);
+  if (e == CUBLAS_STATUS_SUCCESS)
+    ::cublasSetWorkspace(h, sharedWorkspace(), 64u << 20);
   return e;
 }
 
@@ -385,6 +409,23 @@ inline cudaError_t freeUnlessReusing(void* p) {
   return ::cudaFree(p);
 }
 
+inline void adoptPtr(void** dst, void* src, size_t n) {
+  if (!src) return;
+  if (*dst && *dst != src) CU(freeUnlessReusing(*dst));
+  *dst = src;
+  donated().insert(src);
+  if (n > 0) {
+    auto& slot = poolMap()[dst];
+    slot.p = src;
+    if (n > slot.n) slot.n = n;
+  }
+}
+
+inline size_t capacityOf(void* const* member, size_t fallback) {
+  auto it = poolMap().find(const_cast<void**>(member));
+  return (it != poolMap().end() && it->second.n > fallback) ? it->second.n : fallback;
+}
+
 // RAII so an abort inside alloc() cannot leave the whole process reusing.
 struct Scope {
   bool prev;
@@ -396,7 +437,10 @@ struct Scope {
 
 #define cudaMalloc(p, n) nbrealloc::mallocReusing((void**)(p), (n))
 #define cudaStreamCreate(s) nbrealloc::streamCreateOnce(s)
+#undef cublasCreate
 #define cublasCreate(h) nbrealloc::cublasCreateOnce(h)
+#undef cublasSetStream
+#define cublasSetStream(h, s) nbrealloc::cublasSetStreamShared((h), (s))
 #define cudaFree(p) nbrealloc::freeUnlessReusing(p)
 
 struct Tensor {

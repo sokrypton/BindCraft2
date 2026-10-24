@@ -43,20 +43,35 @@ struct TplEmbed {
   tplstack::TplStack stack;
 
   template <class EvoBlock>
-  void adoptScratch(EvoBlock& b) {
+  void adoptScratch(EvoBlock& b, float* qn_donor = nullptr) {
     stack.adoptScratch(b);
-    if (b.p1 && b.chainBytes() * 2 >= queryElems() * 4) {
-      if (qn && qn != b.p1) CU(cudaFree(qn));
-      qn = b.p1;
+    const size_t cb = b.chainBytes(), half_cb = cb / 2;
+    float* qd = qn_donor;
+    if (!qd && !b.tas.qkvg_chunked && b.tas.qkvgH && cb * 2 >= queryElems() * 4)
+      qd = (float*)((char*)b.tas.qkvgH + cb * 2);
+    if (qd && cb * 2 >= queryElems() * 4) {
+      nbrealloc::adoptPtr((void**)&qn, qd, cb * 2);
       dqn = nblean::on() ? nullptr : qn;
     }
-    if (b.p1b && b.chainBytes() >= pairElems() * 4) {
-      if (actb && actb != b.p1b) CU(cudaFree(actb));
-      actb = b.p1b;
-      if (!nblean::on()) {
-        if (dactb && dactb != b.p1b + pairElems()) CU(cudaFree(dactb));
-        dactb = b.p1b + pairElems();
-      }
+    if (cb >= pairElems() * 4) {
+      nbrealloc::adoptPtr((void**)&act, b.tmo.da ? b.tmo.da : b.tmo.a, cb);
+      nbrealloc::adoptPtr((void**)&pre, b.tmo.db ? b.tmo.db : b.tmo.bb, cb);
+      nbrealloc::adoptPtr((void**)&emb, b.tmo.dt ? b.tmo.dt : b.tmo.t, cb);
+      if (!nblean::on() && b.tmo.dt2pre)
+        nbrealloc::adoptPtr((void**)&dact, b.tmo.dt2pre, cb);
+    }
+    if (b.p1b && half_cb >= pairElems() * 2) {
+      nbrealloc::adoptPtr((void**)&actb, b.p1b, half_cb);
+      if (!nblean::on())
+        nbrealloc::adoptPtr((void**)&dactb, (char*)b.p1b + half_cb, half_cb);
+    }
+    const size_t stat_cap = half_cb / 4;
+    if (b.p5b && stat_cap >= (size_t)N * N * 4) {
+      char* p = (char*)b.p5b + half_cb;
+      nbrealloc::adoptPtr((void**)&mu,  p, stat_cap); p += stat_cap;
+      nbrealloc::adoptPtr((void**)&rs,  p, stat_cap); p += stat_cap;
+      nbrealloc::adoptPtr((void**)&mu2, p, stat_cap); p += stat_cap;
+      nbrealloc::adoptPtr((void**)&rs2, p, stat_cap);
     }
   }
 
@@ -75,12 +90,19 @@ struct TplEmbed {
   size_t queryElems() const { return (size_t)N * N * CQ; }
   size_t saveElems() const { return stack.saveElems(); }
 
-  void alloc(int N_, int depth_ = 2, cudaStream_t s = nullptr) {
+  template <class EvoBlock = void>
+  void alloc(int N_, int depth_ = 2, cudaStream_t s = nullptr,
+             EvoBlock* donor = nullptr, float* qn_donor = nullptr) {
     N = N_; depth = depth_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
-    stack.alloc(N, depth, s);
+    stack.alloc(N, depth, s, donor);
     CU(cudaMalloc(&qn, queryElems() * 4));
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor && qn_donor && donor->chainBytes() * 2 >= queryElems() * 4) {
+        nbrealloc::adoptPtr((void**)&qn, qn_donor, donor->chainBytes() * 2);
+      }
+    }
     for (auto q : {&act, &emb, &pre}) CU(cudaMalloc(q, pairElems() * 4));
     CU(cudaMalloc(&actb, pairElems() * 2));
     if (!nblean::on()) {
@@ -95,6 +117,9 @@ struct TplEmbed {
     CU(cudaMalloc(&rs, (size_t)N * N * 4));
     CU(cudaMalloc(&mu2, (size_t)N * N * 4));
     CU(cudaMalloc(&rs2, (size_t)N * N * 4));
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) adoptScratch(*donor, qn_donor);
+    }
   }
 
   // GUARDED FOR THE SAME REASON tplembed_ptm's is, in the other direction:

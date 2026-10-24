@@ -53,9 +53,10 @@ struct TplStack {
   size_t pairElems() const { return (size_t)N * N * CZ; }
   size_t saveElems() const { return pairElems(); }   // the input pair
 
-  void alloc(int N_, int depth_, cudaStream_t s = nullptr) {
+  template <class EvoBlock = void>
+  void alloc(int N_, int depth_, cudaStream_t s = nullptr, EvoBlock* donor = nullptr) {
     N = N_; depth = depth_; st = s;
-    blk.alloc(N, st);
+    blk.alloc(N, st, donor);
     slots = blk.weightSlots();
     // NOT UNCONDITIONALLY.  These are the per-depth WEIGHT pointers, which
     // have nothing to do with N, and alloc() runs a second time when the
@@ -72,6 +73,9 @@ struct TplStack {
     p1store.resize(depth, nullptr);
     for (int b = nblean::on() ? 1 : 0; b < depth; ++b)
       CU(cudaMalloc(&p1store[b], pairElems() * 2));
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) adoptScratch(*donor);
+    }
   }
 
   // the depth's weights, and its own dropout masks
@@ -81,7 +85,16 @@ struct TplStack {
   }
 
   template <class EvoBlock>
-  void adoptScratch(EvoBlock& b) { blk.adoptScratch(b); }
+  void adoptScratch(EvoBlock& b) {
+    blk.adoptScratch(b);
+    const size_t half_cb = b.chainBytes() / 2;
+    if (half_cb >= pairElems() * 2) {
+      if (p1store.size() > 0 && p1store[0] && b.p2b)
+        nbrealloc::adoptPtr((void**)&p1store[0], (char*)b.p2b + half_cb, half_cb);
+      if (p1store.size() > 1 && p1store[1] && b.p3b)
+        nbrealloc::adoptPtr((void**)&p1store[1], (char*)b.p3b + half_cb, half_cb);
+    }
+  }
 
   void setStream(cudaStream_t s) {
     st = s;

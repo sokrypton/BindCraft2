@@ -45,9 +45,16 @@ namespace stack {
 static block::Block* g_donor = nullptr;
 static int g_donor_N = 0;
 static bool g_donor_lean = false;
-static block::Block* g_root_donor = nullptr;
-static int g_root_donor_N = 0;
-static bool g_root_donor_lean = false;
+
+inline void clearDonor() {
+  g_donor = nullptr;
+  g_donor_N = 0;
+  g_donor_lean = false;
+}
+
+inline void updateDonor(const block::Block& b) {
+  if (g_donor && g_donor_N == b.N) *g_donor = b;
+}
 
 struct Stack {
   block::Block b;
@@ -79,6 +86,11 @@ struct Stack {
     if (!pown) CU(cudaMalloc(&pown, np * 4));
     if (!mown) CU(cudaMalloc(&mown, nm * 4));
     pout = pown; mout = mown;
+  }
+  void useBorrowedPairOut(float* p) {
+    size_t nm = (size_t)S * N * block::CM;
+    if (!mown) CU(cudaMalloc(&mown, nm * 4));
+    pout = p; mout = mown;
   }
   __nv_bfloat16* dpc = nullptr;
   float* dmc = nullptr;   // the cotangent carried between depths
@@ -134,28 +146,14 @@ struct Stack {
       if (forig[k]) *fslots[k] = forig[k];
     const bool share = envOnDef("NE_SHARE_BLOCK", true);
     const bool lean = nblean::on();
-    block::Block* donor = nullptr;
-    if (share) {
-      if (g_donor && g_donor_N == N && (!g_donor_lean || lean))
-        donor = g_donor;
-      else if (!nbrealloc::active() && g_root_donor && g_root_donor_N >= N &&
-               (!g_root_donor_lean || lean))
-        donor = g_root_donor;
-    }
-    const bool take = donor != nullptr;
-    b.alloc(N, S, st, donor);
+    const bool take = share && g_donor && g_donor_N == N &&
+                      (!g_donor_lean || lean);
+    b.alloc(N, S, st, take ? g_donor : nullptr);
     shared_scratch = take;
-    if (share && (!take || donor->N != N)) {
+    if (share && !take) {
       g_donor = new block::Block(b);
       g_donor_N = N; g_donor_lean = lean;
       // the DONOR's own forig buffers must outlive it too
-      shared_scratch = true;
-    }
-    if (share && !take && !nbrealloc::active() &&
-        (!g_root_donor || N > g_root_donor_N ||
-         (N == g_root_donor_N && g_root_donor_lean && !lean))) {
-      g_root_donor = new block::Block(b);
-      g_root_donor_N = N; g_root_donor_lean = lean;
       shared_scratch = true;
     }
     if (getenv("BLK_MEM") && take)
@@ -330,9 +328,14 @@ struct Stack {
       //     ever got that far.
       //
       // The arena is already the right bytes; only the stride moved.  So
-      // keep it and recompute how many depths now fit.
+      // keep it and recompute how many depths now fit -- but only at the
+      // primary allocation length, so an interleaved shorter state (e.g.
+      // binder_alone between complex forward and complex backward) does not
+      // overwrite the kept activations the primary state's skip_trunk
+      // backward is waiting to read.
+      const bool full_n = !nbrealloc::allocN() || N == nbrealloc::allocN();
       for (int t = 0; t < KEEP_NTIER; ++t)
-        tdepth[t] = (tbase[t] && tstride[t])
+        tdepth[t] = (full_n && tbase[t] && tstride[t])
                       ? (int)std::min((size_t)depth, tbytes[t] / tstride[t]) : 0;
     }
     const bool no_keep = envOn("NO_FLASH_KEEP") || defer_keep || nblean::on();
@@ -683,10 +686,15 @@ struct Stack {
   // the standalone harness has no one to hand it a save-set, so it makes its
   // own on first use.  The FFI never reaches this: it calls setSaveBuffers
   // (XLA's) or useOwnSaveSet() before the first forward.
+  int stride_override = 0;
+  __nv_bfloat16* p_scratch_slot = nullptr;
+
   void ensureSaveSet() {
-    if (pin[0] || psave) return;
+    if (psave) { setSaveBuffers(psave, msave); return; }
+    if (pin[0]) return;
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
-    CU(cudaMalloc(&psave, np * 2 * saveSlots()));
+    int p_slots = (p_scratch_slot && strideK() == 2 && depth == 4) ? 2 : saveSlots();
+    CU(cudaMalloc(&psave, np * 2 * p_slots));
     CU(cudaMalloc(&msave, nm * 4 * saveSlots()));
     setSaveBuffers(psave, msave);
   }
@@ -766,6 +774,8 @@ struct Stack {
     int k;
     if (e) {
       k = atoi(e);                          // an explicit override still wins
+    } else if (stride_override > 0) {
+      k = stride_override;
     } else if (b) {
       const int base = N > (t ? atoi(t) : 512) ? 4 : 1;
       const size_t slot = (size_t)N * N * block::CZ * 2;
@@ -804,8 +814,12 @@ struct Stack {
     }
     size_t np = (size_t)N * N * block::CZ, nm = (size_t)S * N * block::CM;
     for (int i = 0; i < depth; ++i) {
-      pin[i] = single ? p : p + (size_t)slotOf(i) * np;
-      min_[i] = single ? m : m + (size_t)slotOf(i) * nm;
+      int sl = slotOf(i);
+      if (!single && p == psave && p_scratch_slot && strideK() == 2 && depth == 4 && sl == 2)
+        pin[i] = p_scratch_slot;
+      else
+        pin[i] = single ? p : p + (size_t)sl * np;
+      min_[i] = single ? m : m + (size_t)sl * nm;
     }
   }
 

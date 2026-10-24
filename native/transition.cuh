@@ -371,12 +371,23 @@ struct Trans {
   // and only for the PAIR transition, whose M is N*N.  The MSA transition's
   // M is S*N, it is 2.2 ms of the stack, and `n` would be meaningless there.
   // TR_ROWS overrides at any length; TR_ROWS=0 forces it off.
+  static size_t trChunkAt(size_t m, bool pair) {
+    return (pair && nbChunkOnAt((size_t)llround(sqrt((double)m)))) ? m / 8 : m;
+  }
   static size_t trChunk(size_t m, bool pair) {
     const char* e = getenv("TR_ROWS");
     size_t r;
-    if (e) r = (size_t)atoll(e);
-    else if (pair && nbChunkOnAt((size_t)llround(sqrt((double)m)))) r = m / 8;
-    else r = 0;
+    if (e) {
+      r = (size_t)atoll(e);
+    } else if (pair) {
+      const size_t n = (size_t)llround(sqrt((double)m));
+      const size_t na = (size_t)nbrealloc::allocN();
+      const bool chunk = nbChunkOnAt(n) ||
+          (na > 0 && m > trChunkAt(na * na, true));
+      r = chunk ? m / 8 : 0;
+    } else {
+      r = 0;
+    }
     return (r > 0 && r < m) ? r : m;
   }
 
@@ -473,13 +484,34 @@ struct Trans {
         kept += mine[i].second;
         continue;
       }
-      if (*mine[i].first) CU(cudaFree(*mine[i].first));
-      *mine[i].first = *theirs[i].first;
+      nbrealloc::adoptPtr(mine[i].first, *theirs[i].first, theirs[i].second);
       took += mine[i].second;
     }
     if (getenv("DS_MEM"))
       fprintf(stderr, "  %s: took %.1f MB, kept %.1f MB (donor too small)\n",
               who, took / 1e6, kept / 1e6);
+  }
+
+  template <class Tmul, class Tattn>
+  void adoptBlockScratch(const Tmul& m, const Tattn& a) {
+    if (!is_pair || C != 128) return;
+    const size_t xcap = nbrealloc::capacityOf((void* const*)&a.xh, (size_t)a.taRows * a.N * 128 * 2);
+    if (trRows * C * 2 <= xcap)
+      nbrealloc::adoptPtr((void**)&xn, a.xh, xcap);
+    const size_t mcap = nbrealloc::capacityOf((void* const*)&m.da, (size_t)m.M * 128 * 2);
+    const size_t dtcap = nbrealloc::capacityOf((void* const*)&m.dt, (size_t)m.M * 130 * 2);
+    if ((size_t)M * C * 2 <= mcap && m.da)
+      nbrealloc::adoptPtr((void**)&out, m.da, mcap);
+    else if ((size_t)M * C * 2 <= nbrealloc::capacityOf((void* const*)&m.a, (size_t)m.M * 128 * 2) && m.a)
+      nbrealloc::adoptPtr((void**)&out, m.a, nbrealloc::capacityOf((void* const*)&m.a, (size_t)m.M * 128 * 2));
+    if (h_chunked && trRows * I * 2 <= mcap && m.db)
+      nbrealloc::adoptPtr((void**)&h, m.db, mcap);
+    if (trRows * C * 2 <= mcap)
+      nbrealloc::adoptPtr((void**)&dy, m.db, mcap);
+    if (trRows * C * 2 <= dtcap)
+      nbrealloc::adoptPtr((void**)&dxn, m.dt, dtcap);
+    if (trRows * I * 2 <= mcap)
+      nbrealloc::adoptPtr((void**)&dr, m.da, mcap);
   }
 
 

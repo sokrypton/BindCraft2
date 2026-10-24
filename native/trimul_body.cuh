@@ -1223,7 +1223,7 @@ struct TriMul {
       {(void**)&gl, mi * sizeof(gate_t)}, {(void**)&gr, mi * sizeof(gate_t)},
       {(void**)&t2, mc * sizeof(gt2_t)},
       {(void**)&dpre, (split_cdx && dpre) ? mp * 2 : 0},
-      {(void**)&da, da ? mi * 2 : 0}, {(void**)&db, db ? mi * 2 : 0}, {(void**)&dt, dt ? mi * 2 : 0},
+      {(void**)&da, da ? mi * 2 : 0}, {(void**)&db, db ? mi * 2 : 0}, {(void**)&dt, dt ? (size_t)M * (I + 2) * 2 : 0},
       {(void**)&dcn, (transpose_dcn && dcn) ? ri * 2 : 0}, {(void**)&dcnT, dcnT ? ri * 2 : 0},
       {(void**)&dO, dO ? rc * 2 : 0}, {(void**)&dt2pre, dt2pre ? mc * 2 : 0}, {(void**)&dx, dx ? rc * 2 : 0},
       {(void**)&mu, (size_t)M * 4}, {(void**)&rstd, (size_t)M * 4},
@@ -1256,8 +1256,7 @@ struct TriMul {
       // rest.  A donor buffer that is smaller (e.g. a chunked donor buffer
       // vs an unchunked shorter recipient) is likewise kept.
       if (!theirs[i].second || theirs[i].second < mine[i].second) continue;
-      if (*mine[i].first) CU(cudaFree(*mine[i].first));
-      *mine[i].first = *theirs[i].first;
+      nbrealloc::adoptPtr(mine[i].first, *theirs[i].first, theirs[i].second);
     }
   }
 
@@ -1393,7 +1392,7 @@ struct TriMul {
     // `dpre` exists only for the split path: combineDxK contracts each group
     // out of shared and never materialises it.
     if (split_cdx) B(&dpre, mp); else dpre = nullptr;
-    B(&da, mi); B(&db, mi); B(&dt, mi);
+    B(&da, mi); B(&db, mi); B(&dt, (size_t)M * (I + 2));
     // dcn (row-major) is the transpose path's staging and nothing else
     if (transpose_dcn) B(&dcn, ri); else dcn = nullptr;
     // dcnT is the channel-major copy of dcn; only the transpose path needs it
@@ -1506,11 +1505,19 @@ struct TriMul {
   // the replay writes all nine modules' before the first backward reads any.
   // 7 x N^2 x I x 2 = 118 MB at N=256.
   void adoptBackwardScratch(const TriMul& o) {
-    for (void* p : {(void*)da, (void*)db, (void*)dt, (void*)dcnT, (void*)dO,
-                    (void*)dt2pre, (void*)dx, (void*)dcn, (void*)dpre})
-      if (p) CU(cudaFree(p));
-    da = o.da; db = o.db; dt = o.dt; dcnT = o.dcnT;
-    dO = o.dO; dt2pre = o.dt2pre; dx = o.dx; dcn = o.dcn; dpre = o.dpre;
+    const size_t mc = (size_t)o.M * C, mi = (size_t)o.M * I, mp = (size_t)o.M * PRE;
+    const size_t rc = o.tmRows * C, ri = o.tmRows * I;
+    nbrealloc::adoptPtr((void**)&x,      o.x,      rc * 2);
+    nbrealloc::adoptPtr((void**)&cn,     o.cn,     ri * 2);
+    nbrealloc::adoptPtr((void**)&da,     o.da,     mi * 2);
+    nbrealloc::adoptPtr((void**)&db,     o.db,     mi * 2);
+    nbrealloc::adoptPtr((void**)&dt,     o.dt,     (size_t)o.M * (I + 2) * 2);
+    nbrealloc::adoptPtr((void**)&dcnT,   o.dcnT,   ri * 2);
+    nbrealloc::adoptPtr((void**)&dO,     o.dO,     rc * 2);
+    nbrealloc::adoptPtr((void**)&dt2pre, o.dt2pre, mc * 2);
+    nbrealloc::adoptPtr((void**)&dx,     o.dx,     rc * 2);
+    nbrealloc::adoptPtr((void**)&dcn,    o.dcn,    ri * 2);
+    nbrealloc::adoptPtr((void**)&dpre,   o.dpre,   mp * 2);
   }
 
   // RANGE PROBE (TM_RANGE=1): what the keep tier's bf16 tensors span, which

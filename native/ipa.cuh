@@ -534,12 +534,16 @@ struct IPA {
 
   void alloc(int N_, cudaStream_t s = nullptr, IPA* donor = nullptr) {
     N = N_; st = s;
-    CUB(cublasCreate(&cub));
-    CUB(cublasSetStream(cub, st));
-    // PRECISION IS PINNED.  PointProjection asks for Precision.HIGHEST, and
-    // TF32 would silently drop the mantissa to 10 bits on exactly the matmul
-    // whose output feeds a squared distance.
-    CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
+    if (donor) {
+      cub = donor->cub;
+    } else {
+      CUB(cublasCreate(&cub));
+      CUB(cublasSetStream(cub, st));
+      // PRECISION IS PINNED.  PointProjection asks for Precision.HIGHEST, and
+      // TF32 would silently drop the mantissa to 10 bits on exactly the matmul
+      // whose output feeds a squared distance.
+      CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
+    }
     size_t n = N;
     if (donor && nblean::on()) {
       qs = donor->qs; ks = donor->ks; vs = donor->vs;

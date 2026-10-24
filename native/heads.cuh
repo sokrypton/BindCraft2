@@ -72,15 +72,25 @@ struct Heads {
   float *muS = nullptr, *rsS = nullptr;
   float *dhalf = nullptr, *dtmp = nullptr, *dtmp2 = nullptr;
 
-  void alloc(int N_, cudaStream_t s = nullptr) {
+  void alloc(int N_, cudaStream_t s = nullptr, float* half_donor = nullptr,
+             void* dgram_donor = nullptr, void* pae_donor = nullptr) {
     N = N_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
     CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
     size_t np = (size_t)N * N;
-    CU(cudaMalloc(&half, np * NDGRAM * 4));
-    CU(cudaMalloc(&dgram, np * NDGRAM * 4));
-    CU(cudaMalloc(&pae, np * NPAE * 4));
+    if (half_donor)
+      nbrealloc::adoptPtr((void**)&half, half_donor, np * NDGRAM * 4);
+    else
+      CU(cudaMalloc(&half, np * NDGRAM * 4));
+    if (dgram_donor)
+      nbrealloc::adoptPtr((void**)&dgram, dgram_donor, np * NDGRAM * 4);
+    else
+      CU(cudaMalloc(&dgram, np * NDGRAM * 4));
+    if (pae_donor)
+      nbrealloc::adoptPtr((void**)&pae, pae_donor, np * NPAE * 4);
+    else
+      CU(cudaMalloc(&pae, np * NPAE * 4));
     // dhalf ALIASES half.  `half` is the distogram's pre-symmetrisation
     // logits: written by the gemm + addRowBiasK and consumed by symmetriseK,
     // all three in the forward, dead immediately after.  `dhalf` is its

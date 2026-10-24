@@ -456,15 +456,8 @@ struct DesignStep {
     };
     plan = p; st = s;
     const int N = p.nmax;
+    const bool share_step = envOnDef("NB_STEP_SHARE", true);
     emb.alloc(N, p.msa_rows, s);  dstook("embed");
-    // The template stack's buffers, by ledger position, so NB_TPL_SCRIBBLE
-    // can prove its scratch is throwaway without enumerating 60-odd members
-    // in a list that would drift.  See nbrealloc::scribble.
-    tpl_ledger_first = nbrealloc::ledger().size();
-    if (p.monomer) tplp.alloc(N, p.tpl_depth, s);
-    else           tpl.alloc(N, p.tpl_depth, s);
-    dstook("tplembed");
-    tpl_ledger_last = nbrealloc::ledger().size();
     // THE EXTRA-MSA STACK IS NOT A SMALL TRUNK.  It uses
     // msa_column_GLOBAL_attention, and its outer-product-mean comes first.
     // Allocating it like the trunk aborts in the Oracle looking for
@@ -475,6 +468,13 @@ struct DesignStep {
     trunk.b.opm_first = !p.monomer;
     emb.monomer = p.monomer;
     sm.pos_scale = p.monomer ? 10.f : foldit::POSITION_SCALE;
+    // BEFORE alloc().  do_atoms decides whether the last fold iteration
+    // ALLOCATES the atom builder's output at all -- ffi.cu's sm_get sets it
+    // before alloc for exactly this reason.  Setting it in setWeights
+    // instead leaves sm.outAtom() null, and the first thing that reads it
+    // is an illegal access with no symbol anywhere near the cause.
+    sm.do_atoms = true;              // bc2 reads final_atom_positions
+    sm.alloc(N, p.sm_depth, s);  dstook("structmod");
     // AND do_msa FALSE.  pair_only alone decides which modules are
     // ALLOCATED; it does not stop setWeights looking the msa modules up,
     // and the Oracle aborts on msa_column_attention -- which the extra
@@ -488,29 +488,54 @@ struct DesignStep {
     extra.defer_keep = p.defer_keep;
     trunk.defer_keep = p.defer_keep;
     evo_ledger_first = nbrealloc::ledger().size();
-    extra.alloc(N, 1, p.extra_depth, s);  dstook("extra stack");     // pair-only: one msa row
-    // THE SAME ORDERING FAILURE THE TRIMUL `out` BUFFER HAD, one stack up.
-    //
-    // Stack::alloc deliberately leaves the save set and pout/mout unallocated,
-    // because in the STAGED path XLA owns both and allocating them would be
-    // 3.62 GB thrown away (see stack.cuh).  The fused step hands the TRUNK
-    // XLA's buffers through setTrunkCarry -- but nothing ever hands them to
-    // `extra`, so its first forward fell into the lazy ensureSaveSet() /
-    // useOwnOut() inside forward_().  By then prealloc has given the rest of
-    // the card to XLA (17.89 GB taken, 4.44 left, XLA takes it) and a ~0.5 GB
-    // request mid-step has nowhere to go: `stack.cuh:540 cuda: out of memory`
-    // at complex 687.  Same bytes, asked for where there is room.
+    stack::clearDonor();
+    extra.alloc(N, 1, p.extra_depth, s);     // pair-only: one msa row
+    const size_t cb_max = (size_t)nmax_alloc * nmax_alloc * embed::CZ * 2;
+    if (share_step) {
+      if (sm.pairN && extra.b.chainBytes() <= cb_max) {
+        nbrealloc::adoptPtr((void**)&extra.b.tmo.o, sm.pairN, cb_max);
+        nbrealloc::adoptPtr((void**)&extra.b.tmi.o, (char*)sm.pairN + cb_max, cb_max);
+      }
+      if (!nblean::on() && sm.dpairN && extra.b.chainBytes() <= cb_max) {
+        nbrealloc::adoptPtr((void**)&extra.b.p2b, sm.dpairN, cb_max);
+        nbrealloc::adoptPtr((void**)&extra.b.p3b, (char*)sm.dpairN + cb_max, cb_max);
+      }
+      stack::updateDonor(extra.b);
+      if (extra.b.chainBytes() <= cb_max)
+        sm.adoptEvoScratch(extra.b.p1b, extra.b.p5b, cb_max, nmax_alloc);
+    }
+    dstook("extra stack");
+    const size_t n1 = (size_t)N, nn = (size_t)N * N;
+    CU(cudaMalloc(&pair_all, nn * (size_t)embed::CZ * 4));
     if (nblean::on()) {
       extra.allocOneSave(nmax_alloc);
       extra.setSaveBuffers(extra.p1save, extra.m1save, /*single*/true);
       extra.save_full = false;
     } else {
+      if (share_step && extra.b.chainBytes() <= cb_max) {
+        extra.stride_override = 2;
+        extra.p_scratch_slot = reinterpret_cast<__nv_bfloat16*>((char*)pair_all + cb_max);
+      }
       extra.ensureSaveSet();  dstook("extra saveset");
     }
-    extra.useOwnOut();  dstook("extra out");
+    if (share_step) extra.useBorrowedPairOut(pair_all);
+    else            extra.useOwnOut();
+    dstook("extra out");
     trunk.alloc(N, p.msa_rows + 1, p.trunk_depth, s);   // + the template row
     dstook("trunk stack");
     evo_ledger_last = nbrealloc::ledger().size();
+
+    // The template stack's buffers, by ledger position, so NB_TPL_SCRIBBLE
+    // can prove its scratch is throwaway without enumerating 60-odd members
+    // in a list that would drift.  See nbrealloc::scribble.
+    const bool tpl_share = envOnDef("NB_TPL_SHARE", true);
+    float* qn_donor = tpl_share ? sm.pairN : nullptr;
+    tpl_ledger_first = nbrealloc::ledger().size();
+    if (p.monomer) tplp.alloc(N, p.tpl_depth, s, tpl_share ? &extra.b : nullptr);
+    else           tpl.alloc(N, p.tpl_depth, s, tpl_share ? &extra.b : nullptr,
+                             qn_donor);
+    dstook("tplembed");
+    tpl_ledger_last = nbrealloc::ledger().size();
 
     // THE TEMPLATE PAIR STACK RUNS OUT OF THE EVOFORMER'S SCRATCH.
     //
@@ -528,7 +553,7 @@ struct DesignStep {
     // NB_TPL_SHARE=0 gives the template stack its own scratch back.
     if (envOnDef("NB_TPL_SHARE", true)) {
       if (plan.monomer) tplp.adoptScratch(extra.b);
-      else              tpl.adoptScratch(extra.b);
+      else              tpl.adoptScratch(extra.b, qn_donor);
       dstook("tplembed share");
     }
     t1d.alloc(N, s);  dstook("tpl1d");
@@ -536,17 +561,12 @@ struct DesignStep {
     // hold zeros forever -- 277 MB of them at N=736.  See recycle.cuh.
     rec.prev_zero = (p.recycles == 0);
     rec.alloc(N, s);  dstook("recycle");
-    // BEFORE alloc().  do_atoms decides whether the last fold iteration
-    // ALLOCATES the atom builder's output at all -- ffi.cu's sm_get sets it
-    // before alloc for exactly this reason.  Setting it in setWeights
-    // instead leaves sm.outAtom() null, and the first thing that reads it
-    // is an illegal access with no symbol anywhere near the cause.
-    sm.do_atoms = true;              // bc2 reads final_atom_positions
-    sm.alloc(N, p.sm_depth, s);  dstook("structmod");
-    hd.alloc(N, s);  dstook("heads");
+    const bool share_hd = share_step && extra.b.chainBytes() <= cb_max;
+    hd.alloc(N, s, share_hd ? (float*)extra.b.p4b : nullptr,
+             share_hd ? (void*)extra.b.p6b : nullptr,
+             share_hd ? (void*)((char*)pair_all + cb_max) : nullptr);  dstook("heads");
     // Every buffer is sized from NMAX.  None of them is sized from the
     // runtime length: that is what lets one allocation serve every length.
-    const size_t n1 = (size_t)N, nn = (size_t)N * N;
     CU(cudaMalloc(&feat, n1 * inputfeat::A * 4));
     CU(cudaMalloc(&prof, n1 * inputfeat::A * 4));
     CU(cudaMalloc(&msa_feat, n1 * inputfeat::MSA * 4));
@@ -562,8 +582,10 @@ struct DesignStep {
     CU(cudaMalloc(&per_align, n1 * 4));
     CU(cudaMalloc(&kab, 24 * 4));
     CU(cudaMalloc(&pair_mask, nn * 4));
-    CU(cudaMalloc(&tpl_out, nn * (size_t)embed::CZ * 4));
-    CU(cudaMalloc(&pair_all, nn * (size_t)embed::CZ * 4));
+    if (share_step)
+      nbrealloc::adoptPtr((void**)&tpl_out, sm.pairN, nn * (size_t)embed::CZ * 4);
+    else
+      CU(cudaMalloc(&tpl_out, nn * (size_t)embed::CZ * 4));
     CU(cudaMalloc(&aatype, n1 * 4));
     CU(cudaMalloc(&t_aatype, n1 * 4));
     CU(cudaMalloc(&offset, nn * 4));
@@ -591,10 +613,20 @@ struct DesignStep {
       // a forward-only gate cannot see: every one of these is a null pointer a
       // kernel writes through the first time a gradient is asked for.
       CU(cudaMalloc(&d_plddt_logits, n1 * heads::PL_BINS * 4));
-      CU(cudaMalloc(&d_pae_logits, nn * heads::NPAE * 4));
-      CU(cudaMalloc(&d_expres_logits, n1 * heads::NER * 4));
-      CU(cudaMalloc(&d_pair, nn * (size_t)embed::CZ * 4));
-      CU(cudaMalloc(&d_pair_sm, nn * (size_t)embed::CZ * 4));
+      if (share_step) {
+        nbrealloc::adoptPtr((void**)&d_pae_logits, sm.dpairN,
+                            nn * heads::NPAE * 4);
+        CU(cudaMalloc(&d_expres_logits, n1 * heads::NER * 4));
+        nbrealloc::adoptPtr((void**)&d_pair, pair_all,
+                            nn * (size_t)embed::CZ * 4);
+        nbrealloc::adoptPtr((void**)&d_pair_sm, sm.dpairN,
+                            nn * (size_t)embed::CZ * 4);
+      } else {
+        CU(cudaMalloc(&d_pae_logits, nn * heads::NPAE * 4));
+        CU(cudaMalloc(&d_expres_logits, n1 * heads::NER * 4));
+        CU(cudaMalloc(&d_pair, nn * (size_t)embed::CZ * 4));
+        CU(cudaMalloc(&d_pair_sm, nn * (size_t)embed::CZ * 4));
+      }
       // AND `d_tpl_query` IS THAT SAME BUFFER.  Both are "a module's pair
       // cotangent, written to its own buffer and then added into d_pair"
       // -- the structure module's at the top of the backward, the template
@@ -765,7 +797,7 @@ struct DesignStep {
   // is the one moment when no kept buffer is live, because the backward that
   // reads them has not run yet.
   void regrant() {
-    trunk.regrantWith(extra);
+    if (plan.nmax == nmax_alloc) trunk.regrantWith(extra);
   }
 
   void setStream(cudaStream_t s) {

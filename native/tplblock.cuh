@@ -65,7 +65,8 @@ struct TplBlock {
   static constexpr float DROP = 0.25f;
   enum { DM_TMO = 11, DM_TMI = 12, DM_TAS = 13, DM_TAE = 14 };
 
-  void alloc(int N_, cudaStream_t s = nullptr) {
+  template <class EvoBlock = void>
+  void alloc(int N_, cudaStream_t s = nullptr, EvoBlock* donor = nullptr) {
     N = N_; st = s;
     size_t np = (size_t)N * N * CZ;
     for (auto q : {&p2b, &p3b, &p4b, &p5b, &p6b})
@@ -76,13 +77,35 @@ struct TplBlock {
     } else {
       dp = ddrop = nullptr;
     }
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) adoptChainFrom(*donor);
+    }
     tmo.need_out = tmi.need_out = false;
     tmo.alloc(N, true);
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) tmo.adoptScratchFrom(donor->tmo, "tplblock.tmo");
+    }
     tmi.alloc(N, false);
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) tmi.adoptScratchFrom(donor->tmi, "tplblock.tmi");
+    }
     tas.alloc(N, false); tas.allocOrientation();
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) tas.adoptScratchFrom(donor->tas, "tplblock.tas");
+    }
     tae.alloc(N, true);  tae.allocOrientation();
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) tae.adoptScratchFrom(donor->tae, "tplblock.tae");
+    }
     ptr.is_pair = true;
     ptr.alloc((size_t)N * N, CZ, st, TRANS_FACTOR);
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) {
+        ptr.adoptScratchFrom(donor->ptr, "tplblock.ptr");
+        if (donor->tas.out && donor->chainBytes() >= (size_t)ptr.M * ptr.I * 2)
+          nbrealloc::adoptPtr((void**)&ptr.h, donor->tas.out, donor->chainBytes());
+      }
+    }
     // ONE STREAM, for the reason block.cuh gives at length: trimul::alloc and
     // triattn::alloc each make a stream of their own for their standalone
     // gates, and a block that never called setStream runs its modules
@@ -123,11 +146,13 @@ struct TplBlock {
     const Pair ps[] = {{&p2b, &b.p2b}, {&p3b, &b.p3b}, {&p4b, &b.p4b},
                        {&p5b, &b.p5b}, {&p6b, &b.p6b}, {&dp, &b.dp},
                        {&ddrop, &b.ddrop}};
+    const size_t half_cb = b.chainBytes() / 2;
     for (const Pair& q : ps) {
       if (!*q.theirs) continue;          // the donor does not have this one
-      if (*q.mine) CU(cudaFree(*q.mine));
-      *q.mine = *q.theirs;
+      nbrealloc::adoptPtr((void**)q.mine, *q.theirs, half_cb);
     }
+    if (!b.ddrop && b.p4b && b.chainBytes() >= 2 * np)
+      nbrealloc::adoptPtr((void**)&ddrop, (char*)b.p4b + half_cb, half_cb);
   }
 
   template <class EvoBlock>
@@ -138,6 +163,8 @@ struct TplBlock {
     tas.adoptScratchFrom(b.tas, "tplblock.tas");
     tae.adoptScratchFrom(b.tae, "tplblock.tae");
     ptr.adoptScratchFrom(b.ptr, "tplblock.ptr");
+    if (b.tas.out && b.chainBytes() >= (size_t)ptr.M * ptr.I * 2)
+      nbrealloc::adoptPtr((void**)&ptr.h, b.tas.out, b.chainBytes());
   }
 
   void setStream(cudaStream_t s) {

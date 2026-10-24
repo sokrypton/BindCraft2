@@ -384,6 +384,7 @@ __global__ void transposeMaskK(const float* __restrict__ src,
 
 // f32 gradients (dQ written, dK/dV accumulated by atomics) into the combined
 // gradient's q/k/v columns.
+template <bool ZERO_NBB = false>
 __global__ void scatterQKVK(const float* __restrict__ dQ, const float* __restrict__ dK,
                             const float* __restrict__ dV, __nv_bfloat16* __restrict__ dcomb,
                             size_t M, int tot, int C_) {
@@ -394,6 +395,8 @@ __global__ void scatterQKVK(const float* __restrict__ dQ, const float* __restric
   if (dQ) dcomb[r * tot + c] = __float2bfloat16(dQ[i]);
   dcomb[r * tot + C_ + c] = __float2bfloat16(dK[i]);
   dcomb[r * tot + 2 * C_ + c] = __float2bfloat16(dV[i]);
+  if (ZERO_NBB && 4 * C_ + c < tot)
+    dcomb[r * tot + 4 * C_ + c] = __float2bfloat16(0.f);
 }
 // dnbb arrives as f32 from the kernel's atomics; land it in the combined
 // gradient's bias columns.
@@ -734,24 +737,27 @@ struct TriAttn {
   // N/8 costs 12.7%.
   // Unset, it follows nbChunkOn(): N/4 above the threshold, whole below.
   // TA_ROWS overrides at any length; TA_ROWS=0 forces it off.
+  static int taChunkRowsAt(int n) {
+    return nbChunkOnAt((size_t)n) ? n / 4 : n;
+  }
   static int taChunkRows(int n) {
     const char* e = getenv("TA_ROWS");
-    // nbChunkOnAt, NOT nbChunkOn: the pin is deliberately not applied here.
-    //
-    // The claim above -- N/2 and N/4 bit-identical to the unchunked run --
-    // holds at the Evoformer's width and NOT at the template's.  Gated
-    // directly (realloc_gate GATE_TPL, 512 -> 128): with the chunk policy
-    // pinned the template stack differs, with TA_ROWS=0 it is bit-identical,
-    // and the full-step stage diff named `tpl_out` as the first stage to
-    // diverge with the embedder before it matching exactly.  So a short
-    // state must chunk as ITS length says, not as the allocation's does.
-    //
-    // The cost is that the row buffers grow when a short state runs
-    // unchunked where the long one chunked -- 224 rows against 608/4 = 152.
-    // That is one bounded fresh allocation, and the adopt in this file
-    // re-aliases after it, because a reuse pass re-runs alloc() in order.
-    const int r = e ? atoi(e) : (nbChunkOnAt((size_t)n) ? n / 4 : 0);
+    // nbChunkOnAt, NOT nbChunkOn: the pin is deliberately not applied when
+    // the unchunked short state fits inside the long state's chunk buffer.
+    // When it does NOT fit (e.g. 416*416 = 173056 > 200*800 = 160000), it
+    // must chunk so setN does not allocate fresh buffers on a full card.
+    const int na = nbrealloc::allocN();
+    const bool chunk = nbChunkOnAt((size_t)n) ||
+        (na > 0 && (size_t)n * n > (size_t)taChunkRowsAt(na) * na);
+    const int r = e ? atoi(e) : (chunk ? n / 4 : 0);
     return (r > 0 && r < n) ? r : n;
+  }
+  static bool taReplayOn(int n) {
+    if (const char* e = getenv("TA_REPLAY")) return atoi(e) != 0;
+    const char* t = getenv("NB_QKV_CHUNK_N");
+    const int thresh = t ? atoi(t) : 736;
+    const int na = nbrealloc::allocN() ? nbrealloc::allocN() : n;
+    return thresh > 0 && na > thresh;
   }
 
   void alloc(int N_, bool ending_) {
@@ -811,10 +817,10 @@ struct TriAttn {
     // yet buy a single residue, and a 7% regression for an unrealised benefit
     // is not something to ship.  Turn it on when something downstream cashes
     // the 558 MB in.
-    qkvg_chunked = (taRows < N_) && envOn("TA_REPLAY");
+    qkvg_chunked = (taRows < N_) && taReplayOn(N_);
     CU(cudaMalloc(&qkvgH, (size_t)(qkvg_chunked ? taRows : N_) * N_ * 4 * C * sizeof(half)));
     CU(cudaMalloc(&biasH, (size_t)H * M * sizeof(half)));
-    CU(cudaMalloc(&outH, mcChunk * sizeof(half)));
+    outH = nullptr;
     CU(cudaMalloc(&avH, mc * sizeof(half)));
     CU(cudaMalloc(&lseF, (size_t)N * H * N * sizeof(float)));
     // davH likewise: dGateK writes it, the flash backward reads it, one chunk.
@@ -874,7 +880,7 @@ struct TriAttn {
       {(void**)&nbbMH, (size_t)M * H * sizeof(half)},
       {(void**)&qkvgH, (size_t)(qkvg_chunked ? taRows : N) * N * 4 * C * sizeof(half)},
       {(void**)&biasH, (size_t)H * M * sizeof(half)},
-      {(void**)&outH, mcChunk * sizeof(half)},
+      {(void**)&outH, 0},
       {(void**)&avH, mc * sizeof(half)},
       {(void**)&lseF, (size_t)N * H * N * sizeof(float)},
       {(void**)&davH, davH ? chunkRows * N * C * sizeof(half) : 0},
@@ -903,8 +909,7 @@ struct TriAttn {
     for (size_t i = 0; i < mine.size(); ++i) {
       if (!mine[i].second || !theirs[i].second) continue;
       if (theirs[i].second < mine[i].second) continue;
-      if (*mine[i].first) CU(cudaFree(*mine[i].first));
-      *mine[i].first = *theirs[i].first;
+      nbrealloc::adoptPtr(mine[i].first, *theirs[i].first, theirs[i].second);
     }
   }
 
@@ -920,11 +925,57 @@ struct TriAttn {
   // the same way.  The transposed pair (doutT/dpairT) is NOT shared: only the
   // ending instance has it.  186 MB at N=256.
   void adoptBackwardScratch(const TriAttn& o) {
-    for (void* p : {(void*)dcomb, (void*)dag, (void*)dx, (void*)davH,
-                    (void*)dKf, (void*)dVf, (void*)dnbbF, (void*)dnbbI})
-      if (p) CU(cudaFree(p));
-    dcomb = o.dcomb; dag = o.dag; dx = o.dx; davH = o.davH;
-    dKf = o.dKf; dVf = o.dVf; dnbbF = o.dnbbF; dnbbI = o.dnbbI;
+    const size_t mc = (size_t)o.M * C;
+    const size_t chunkRows = (size_t)(TA_SWAP ? o.N : taChunkRows(o.N));
+    const size_t mcChunk = (size_t)o.taRows * o.N * C;
+    const size_t agcap = nbrealloc::capacityOf((void* const*)&o.ag, chunkRows * o.N * C * 2);
+    const size_t nbbcap = nbrealloc::capacityOf((void* const*)&o.nbbMH, (size_t)o.M * H * 2);
+    nbrealloc::adoptPtr((void**)&ag,    o.ag,    agcap);
+    nbrealloc::adoptPtr((void**)&out,   o.out,   mc * 2);
+    nbrealloc::adoptPtr((void**)&xh,    o.xh,    mcChunk * 2);
+    nbrealloc::adoptPtr((void**)&nbbMH, o.nbbMH, nbbcap);
+    if (qkvg_chunked && o.qkvg_chunked)
+      nbrealloc::adoptPtr((void**)&qkvgH, o.qkvgH,
+                          (size_t)o.taRows * o.N * 4 * C * 2);
+    nbrealloc::adoptPtr((void**)&dcomb, o.dcomb, chunkRows * o.N * TOT * 2);
+    nbrealloc::adoptPtr((void**)&dag,   o.dag,   chunkRows * o.N * C * 2);
+    nbrealloc::adoptPtr((void**)&dx,    o.dx,    mc * 2);
+    nbrealloc::adoptPtr((void**)&davH,  o.davH,  chunkRows * o.N * C * 2);
+    nbrealloc::adoptPtr((void**)&dKf,   o.dKf,   mcChunk * 4);
+    nbrealloc::adoptPtr((void**)&dVf,   o.dVf,   mcChunk * 4);
+    nbrealloc::adoptPtr((void**)&lseD,  o.lseD,  (size_t)o.N * H * o.N * 4);
+    nbrealloc::adoptPtr((void**)&dnbbF, o.dnbbF, (size_t)H * o.M * 4);
+    nbrealloc::adoptPtr((void**)&dnbbI, o.dnbbI, (size_t)H * o.M * 8);
+  }
+
+  template <class Tmul>
+  void adoptBackwardFromTmul(const Tmul& m) {
+    const size_t mcap = nbrealloc::capacityOf((void* const*)&m.da, (size_t)m.M * C * 2);
+    const size_t dtcap = nbrealloc::capacityOf((void* const*)&m.dt, (size_t)m.M * (C + 2) * 2);
+    const size_t chunkRows = (size_t)(TA_SWAP ? N : taChunkRows(N));
+    const size_t mcChunk = (size_t)taRows * N * C;
+    const size_t half_mcap = mcap / 2;
+    if (m.dt2pre && chunkRows * N * C * 2 <= half_mcap && (size_t)M * H * 2 <= half_mcap) {
+      nbrealloc::adoptPtr((void**)&ag, m.dt2pre, half_mcap);
+      nbrealloc::adoptPtr((void**)&nbbMH, (char*)m.dt2pre + half_mcap, half_mcap);
+    }
+    nbrealloc::adoptPtr((void**)&dx, m.dt2pre, mcap);
+    if (chunkRows * N * TOT * 2 <= dtcap)
+      nbrealloc::adoptPtr((void**)&dcomb, m.dt, dtcap);
+    if (mcChunk * 4 * 2 <= mcap && m.da) {
+      nbrealloc::adoptPtr((void**)&dKf, m.da, mcap / 2);
+      nbrealloc::adoptPtr((void**)&dVf, (char*)m.da + mcap / 2, mcap / 2);
+    }
+    const size_t c4 = mcap / 4, hm8 = mcap / 8, hm4 = mcap / 16;
+    if (chunkRows * N * C * 2 <= c4 && (size_t)H * M * 8 <= hm8 &&
+        (size_t)H * M * 4 <= hm4 && m.db) {
+      char* p = (char*)m.db;
+      nbrealloc::adoptPtr((void**)&dag,   p, c4);  p += c4;
+      nbrealloc::adoptPtr((void**)&davH,  p, c4);  p += c4;
+      nbrealloc::adoptPtr((void**)&dnbbI, p, hm8); p += hm8;
+      nbrealloc::adoptPtr((void**)&dnbbF, p, hm4); p += hm4;
+      nbrealloc::adoptPtr((void**)&lseD,  p, hm4);
+    }
   }
 
 
@@ -1322,11 +1373,6 @@ struct TriAttn {
             lt.matmul((int)Mc, QKVG, C, xh, wqkvgTh,
                       qkvgAt(cr0), CUDA_R_16F,
                       CUBLASLT_EPILOGUE_BIAS, bqkvgH, nullptr, st));
-          PROF_STEP("ta.b replay flash",
-            flashGridHalfAt<D, 8, 48>(
-                qkvgAt(cr0), biasH, N, mask, /*out*/nullptr, N, H,
-                cr0, crows, false, 1.f, nullptr,
-                avH + (size_t)cr0 * N * C, lseF + (size_t)cr0 * H * N));
         }
         PROF_STEP("ta.b gemm dag",
           lt.matmul((int)Mc, C, C, dxin + (size_t)cr0 * N * C, wo, dag, CUDA_R_16BF,
@@ -1355,7 +1401,7 @@ struct TriAttn {
         // the loop, once dnbb is complete.
         if (taRows < N) {
           PROF_STEP("ta.b scatterQKV",
-            scatterQKVK<<<((size_t)Mc * C + 255) / 256, 256, 0, st>>>(
+            scatterQKVK<true><<<((size_t)Mc * C + 255) / 256, 256, 0, st>>>(
                 nullptr, dKf, dVf, dcomb, Mc, TOT, C));
           PROF_STEP("ta.b gemm dx",
             lt.matmul((int)Mc, C, TOT, dcomb, wcat, dx + (size_t)cr0 * N * C,

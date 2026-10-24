@@ -283,6 +283,31 @@ struct MsaRow {
     }
   }
 
+  template <class Tmul>
+  void adoptBlockScratch(const Tmul& m) {
+    const size_t need = Mp * CZ * 2;
+    const size_t mcap = nbrealloc::capacityOf((void* const*)&m.db, (size_t)m.M * 128 * 2);
+    if (m.db && need <= mcap) {
+      nbrealloc::adoptPtr((void**)&pn, m.db, mcap);
+      if (dpn) nbrealloc::adoptPtr((void**)&dpn, m.db, mcap);
+    } else {
+      const size_t bcap = nbrealloc::capacityOf((void* const*)&m.bb, (size_t)m.M * 128 * 2);
+      if (m.bb && need <= bcap)
+        nbrealloc::adoptPtr((void**)&pn, m.bb, bcap);
+    }
+    const size_t dt2cap = nbrealloc::capacityOf((void* const*)&m.dt2pre, (size_t)m.M * 128 * 2);
+    const size_t hm2 = dt2cap / 16, hm4 = dt2cap / 8, hm8 = dt2cap / 4;
+    if (m.dt2pre && (size_t)H * Mp * 2 <= hm2 && (size_t)H * Mp * 4 <= hm4 &&
+        (size_t)H * Mp * 8 <= hm8) {
+      char* p = (char*)m.dt2pre;
+      nbrealloc::adoptPtr((void**)&nbb, p, hm2);
+      if (dnbbB) nbrealloc::adoptPtr((void**)&dnbbB, p, hm2);
+      p += hm2;
+      if (dnbbF) { nbrealloc::adoptPtr((void**)&dnbbF, p, hm4); p += hm4; }
+      if (dnbbI) { nbrealloc::adoptPtr((void**)&dnbbI, p, hm8); }
+    }
+  }
+
 
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };

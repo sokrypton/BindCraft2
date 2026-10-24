@@ -126,6 +126,28 @@ struct StructureModule {
     }
   }
 
+  void adoptEvoScratch(void* p1b, void* p5b, size_t cb_max, int nmax_alloc) {
+    if (!p1b || !p5b || depth < 1) return;
+    size_t slot = ((size_t)nmax_alloc * nmax_alloc * ipa::H * 4 + 255) & ~size_t(255);
+    if (5 * slot > cb_max) return;
+    if (nblean::on()) {
+      nbrealloc::adoptPtr((void**)&stack.it[0].attn.attn, p1b, slot);
+      for (int i = 1; i < depth; ++i) stack.it[i].attn.attn = stack.it[0].attn.attn;
+    } else {
+      for (int i = 0; i < 5 && i < depth; ++i)
+        nbrealloc::adoptPtr((void**)&stack.it[i].attn.attn, (char*)p1b + i * slot, slot);
+      for (int i = 5; i < 8 && i < depth; ++i)
+        nbrealloc::adoptPtr((void**)&stack.it[i].attn.attn, (char*)p5b + (i - 5) * slot, slot);
+    }
+    nbrealloc::adoptPtr((void**)&stack.it[0].attn.a2d, (char*)p5b + 3 * slot, slot);
+    if (!nblean::on())
+      nbrealloc::adoptPtr((void**)&stack.it[0].attn.dattn, (char*)p5b + 4 * slot, slot);
+    for (int i = 1; i < depth; ++i) {
+      stack.it[i].attn.a2d = stack.it[0].attn.a2d;
+      stack.it[i].attn.dattn = stack.it[0].attn.dattn;
+    }
+  }
+
   // REBIND THE STREAM.  Every buffer in here comes from plain cudaMalloc,
   // which is not stream-ordered, and the stream is used for nothing but
   // kernel launches and cublasSetStream.  So a module allocated on one

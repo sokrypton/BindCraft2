@@ -202,6 +202,20 @@ struct Opm {
     CU(cudaMalloc(&mu, Mm * 4)); CU(cudaMalloc(&rstd, Mm * 4));
   }
 
+  template <class Tmul>
+  void adoptBlockScratch(const Tmul& m) {
+    const size_t need = Mp * CZ * 2;
+    const size_t mcap = nbrealloc::capacityOf((void* const*)&m.da, (size_t)m.M * 128 * 2);
+    if (m.da && need <= mcap) {
+      nbrealloc::adoptPtr((void**)&out, m.da, mcap);
+      if (dT) nbrealloc::adoptPtr((void**)&dT, m.da, mcap);
+    } else {
+      const size_t acap = nbrealloc::capacityOf((void* const*)&m.a, (size_t)m.M * 128 * 2);
+      if (m.a && need <= acap)
+        nbrealloc::adoptPtr((void**)&out, m.a, acap);
+    }
+  }
+
 
   void setWeights(Oracle& o, const std::string& P) {
     auto dev = [&](const std::string& k) { o[k].to_device(); return o[k].dev; };

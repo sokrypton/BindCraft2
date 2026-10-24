@@ -159,15 +159,19 @@ struct TplEmbedPtm {
   template <class EvoBlock>
   void adoptScratch(EvoBlock& b) {
     stack.adoptScratch(b);
-    if (b.p1 && b.chainBytes() * 2 >= pairElems() * 8) {
-      if (pre && pre != b.p1) CU(cudaFree(pre));
-      if (emb && emb != b.p1 + pairElems()) CU(cudaFree(emb));
-      pre = b.p1;
-      emb = b.p1 + pairElems();
+    const size_t cb = b.chainBytes(), half_cb = cb / 2;
+    if (cb >= pairElems() * 4) {
+      nbrealloc::adoptPtr((void**)&act, b.tmo.da ? b.tmo.da : b.tmo.a, cb);
+      nbrealloc::adoptPtr((void**)&pre, b.tmo.db ? b.tmo.db : b.tmo.bb, cb);
+      nbrealloc::adoptPtr((void**)&emb, b.tmo.dt ? b.tmo.dt : b.tmo.t, cb);
     }
-    if (b.p1b && b.chainBytes() >= pairElems() * 2) {
-      if (actb && actb != b.p1b) CU(cudaFree(actb));
-      actb = b.p1b;
+    if (b.p1b && half_cb >= pairElems() * 2)
+      nbrealloc::adoptPtr((void**)&actb, b.p1b, half_cb);
+    const size_t stat_cap = half_cb / 4;
+    if (b.p5b && stat_cap >= (size_t)N * N * 4) {
+      char* p = (char*)b.p5b + half_cb;
+      nbrealloc::adoptPtr((void**)&mu, p, stat_cap); p += stat_cap;
+      nbrealloc::adoptPtr((void**)&rs, p, stat_cap);
     }
   }
 
@@ -182,7 +186,9 @@ struct TplEmbedPtm {
   size_t pairElems() const { return (size_t)N * N * CT; }
   size_t outElems() const { return (size_t)N * N * CQ; }
 
-  void alloc(int N_, int depth_ = 2, cudaStream_t s = nullptr) {
+  template <class EvoBlock = void>
+  void alloc(int N_, int depth_ = 2, cudaStream_t s = nullptr,
+             EvoBlock* donor = nullptr) {
     N = N_; depth = depth_; st = s;
     CUB(cublasCreate(&cub));
     CUB(cublasSetStream(cub, st));
@@ -190,11 +196,14 @@ struct TplEmbedPtm {
     // its own: the flag decides what the block does and must not change
     // under a built object.
     stack.blk.attn_first = true;
-    stack.alloc(N, depth, s);
+    stack.alloc(N, depth, s, donor);
     for (auto q : {&act, &pre, &emb}) CU(cudaMalloc(q, pairElems() * 4));
     CU(cudaMalloc(&actb, pairElems() * 2));
     CU(cudaMalloc(&mu, (size_t)N * N * 4));
     CU(cudaMalloc(&rs, (size_t)N * N * 4));
+    if constexpr (!std::is_void<EvoBlock>::value) {
+      if (donor) adoptScratch(*donor);
+    }
   }
 
   // A NEVER-ALLOCATED OBJECT STILL GETS ITS STREAM SET.  DesignStep holds

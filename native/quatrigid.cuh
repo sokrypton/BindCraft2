@@ -179,9 +179,13 @@ struct QuatRigid {
 
   void alloc(int N_, cudaStream_t s = nullptr, QuatRigid* donor = nullptr) {
     N = N_; st = s;
-    CUB(cublasCreate(&cub));
-    CUB(cublasSetStream(cub, st));
-    CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));   // Precision.HIGHEST
+    if (donor) {
+      cub = donor->cub;
+    } else {
+      CUB(cublasCreate(&cub));
+      CUB(cublasSetStream(cub, st));
+      CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));   // Precision.HIGHEST
+    }
     size_t n = N;
     if (donor && nblean::on()) {
       flat = donor->flat; rotu = donor->rotu; transu = donor->transu;

@@ -193,9 +193,13 @@ struct FoldIteration {
 
   void alloc(int N_, cudaStream_t s = nullptr, FoldIteration* donor = nullptr) {
     N = N_; st = s;
-    CUB(cublasCreate(&cub));
-    CUB(cublasSetStream(cub, st));
-    CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
+    if (donor) {
+      cub = donor->cub;
+    } else {
+      CUB(cublasCreate(&cub));
+      CUB(cublasSetStream(cub, st));
+      CUB(cublasSetMathMode(cub, CUBLAS_PEDANTIC_MATH));
+    }
     attn.alloc(N, s, donor ? &donor->attn : nullptr);
     rig.alloc(N, s, donor ? &donor->rig : nullptr);
     if (do_atoms) {
