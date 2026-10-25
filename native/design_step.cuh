@@ -199,6 +199,29 @@ __global__ void idxToFloatK(const int32_t* __restrict__ src,
   if (i < n) dst[i] = (float)src[i];
 }
 
+// THE MONOMER GRAPH HAS NO CHAIN ENCODING, so a complex reaches it only
+// through the residue numbering.  bc2's monomer_chain_break_indices renumbers
+// every multi-chain complex before a monomer model sees it: start at 0, keep
+// each step inside a chain, and step MONOMER_CHAIN_GAP + 1 = 50 at every
+// chain start.  Without it a binder numbered 1..L and a target in its PDB
+// numbering OVERLAP, and the model folds the binder onto the target (the
+// driver's every monomer refold: pLDDT 0.35, ~2000 clashes).  One chain is
+// left alone, as bc2 does; padded rows keep theirs (masked).  Idempotent, so
+// the FFI path, which bc2 already renumbered, is unchanged.
+__global__ void monomerChainBreakK(const int32_t* __restrict__ ridx,
+                                   const int32_t* __restrict__ asym,
+                                   const int32_t* __restrict__ n_dev,
+                                   int32_t* __restrict__ out, int N) {
+  if (blockIdx.x || threadIdx.x) return;
+  const int n = min(*n_dev, N);
+  bool multi = false;
+  for (int i = 1; i < n; ++i) multi |= asym[i] != asym[i - 1];
+  for (int i = 0; i < N; ++i)
+    out[i] = (!multi || i >= n) ? ridx[i]
+           : i == 0 ? 0
+           : out[i - 1] + (asym[i] != asym[i - 1] ? 50 : ridx[i] - ridx[i - 1]);
+}
+
 // TARGET_FEAT IS 21 WIDE, THE SEQUENCE FEATURES ARE 20.  modules_multimer
 // pads with a zero column before the three Linears
 // (`jnp.pad(batch["target_feat"], [[0,0],[0,1]])`), and the native embedder
@@ -354,6 +377,7 @@ struct DesignStep {
   float *tpl_out = nullptr;    // the template embedding's contribution
   float *kab = nullptr;        // [24] the Kabsch stats and rotation
   int32_t *aatype = nullptr, *t_aatype = nullptr, *offset = nullptr;
+  int32_t *ridx_mono = nullptr;   // the monomer renumbering, monomerChainBreakK
   // the index features widened for the embedder; sym_id is asym_id, which is
   // what bc2's alphafold_input_features sets it to unconditionally
   float *ridx_f = nullptr, *asym_f = nullptr, *ent_f = nullptr;
@@ -598,6 +622,7 @@ struct DesignStep {
     CU(cudaMalloc(&aatype, n1 * 4));
     CU(cudaMalloc(&t_aatype, n1 * 4));
     CU(cudaMalloc(&offset, nn * 4));
+    CU(cudaMalloc(&ridx_mono, n1 * 4));
     CU(cudaMalloc(&a14_37, n1 * inputfeat::ATOM14 * 4));
     CU(cudaMalloc(&a37_14, n1 * inputfeat::ATOM * 4));
     CU(cudaMalloc(&ridx_f, n1 * 4));
@@ -932,15 +957,23 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
       in.sequence, in.flags, in.aa_bias, sc, seqfeat::OMITTED_HALF,
       feat, prof, N, in.scalars);
 
-  // 2. aatype, the residue_constants gathers, the template arrays
+  // 2. aatype, the residue_constants gathers, the template arrays.  Every
+  //    read of the numbering below is the model's, so a monomer reads bc2's
+  //    renumbered complex (monomerChainBreakK).
+  const int32_t* ridx = in.residue_index;
+  if (plan.monomer) {
+    monomerChainBreakK<<<1, 1, 0, st>>>(in.residue_index, in.asym_id, in.n,
+                                        ridx_mono, N);
+    ridx = ridx_mono;
+  }
   inputfeat::perResidueK<<<g1, 128, 0, st>>>(
       feat, in.atoms, in.atom_mask, in.flags, in.seq_mask, tables, in.n,
       aatype, a14e, a37e, a14_37, a37_14, t_aatype, t_pos, t_mask,
-      pbeta, pbeta_m, N, in.residue_index, plan.flexibility);
+      pbeta, pbeta_m, N, ridx, plan.flexibility);
   inputfeat::chainLenK<<<N, 32, 0, st>>>(
       in.asym_id, in.seq_mask, in.n, chain_len, N);
   inputfeat::offsetK<<<gn, 128, 0, st>>>(
-      in.residue_index, in.asym_id, in.flags, in.seq_mask, chain_len, in.n,
+      ridx, in.asym_id, in.flags, in.seq_mask, chain_len, in.n,
       offset, N, plan.cyclic_mode);
   inputfeat::msaFeatK<<<(int)(((size_t)N * inputfeat::MSA + 127) / 128),
                         128, 0, st>>>(feat, prof, in.n, msa_feat, N);
@@ -960,7 +993,7 @@ inline void DesignStep::runOnce(const Inputs& in, const Outputs& out,
     roundBf16K<<<(int)((n21 + 255) / 256), 256, 0, st>>>(tf21, n21);
     roundBf16K<<<(int)((nmf + 255) / 256), 256, 0, st>>>(msa_feat, nmf);
   }
-  idxToFloatK<<<g1, 128, 0, st>>>(in.residue_index, ridx_f, N);
+  idxToFloatK<<<g1, 128, 0, st>>>(ridx, ridx_f, N);
   idxToFloatK<<<g1, 128, 0, st>>>(in.asym_id, asym_f, N);
   idxToFloatK<<<g1, 128, 0, st>>>(in.entity_id, ent_f, N);
   emb.forward(tf21, msa_feat, ridx_f, asym_f, ent_f, /*sym*/asym_f, offset);
