@@ -107,6 +107,25 @@ def resolved_attention_route(design_settings, alphafold_model, key: jax.Array) -
     alphafold_model.sequence_gradients(protein_states, losses, model=alphafold_model.models[0], compile_only=True)
     return alphafold_model.last_attention_backend
 
+def declare_longest_native_length(design_settings, alphafold_model, key: jax.Array) -> None:
+    """The native design object is allocated ONCE, at the first length it is asked for, and only ever re-derives shorter.
+
+    A campaign draws its binder length per trajectory, so the first trajectory sized it and the first longer one
+    (here the compile-ahead of the next length bucket) died: `design_step: setN(256) past the allocation's 224`, or an
+    illegal address when a model swap came first. The longest length any trajectory can draw is known before the
+    first one runs, so it is declared before anything traces."""
+    if not getattr(alphafold_model, 'native_installed', False):
+        return
+    from bindcraft.af2 import pad_design_chains
+    from bindcraft.af.native_step import pad_to_tile, set_alloc_floor
+    from bindcraft.protein import Protein
+    protein_states, _multi_chain_binders, _losses = initialize_design_trajectory(design_settings, key)
+    if design_settings.binder.lengths and not design_settings.binder.scaffold:
+        longest = Protein.empty(max(design_settings.binder.lengths), key)
+        protein_states = {state: {name: longest if name in design_settings.binder_chains else protein for name, protein in complex_.items()} for state, complex_ in protein_states.items()}
+    padded = pad_design_chains(protein_states, alphafold_model.length_bucket_size, alphafold_model.target_pad_length)
+    set_alloc_floor(pad_to_tile(max(sum(len(protein) for protein in complex_.values()) for complex_ in padded.values())))
+
 def compile_next_length_bucket(design_settings, alphafold_model, key: jax.Array, trajectory_number: int) -> threading.Thread:
     def compile_gradient_graph() -> None:
         try:
@@ -143,6 +162,7 @@ def write_trajectory_design(design_settings, protein_states, predictions, trajec
 def run_campaign_arm(settings: dict, project_folder: str, alphafold_model, validation_model, mpnn_model, key: jax.Array, max_trajectories: int | None, build_validation_model, autotune: bool=True, closing: bool=True, metadata: dict[str, str] | None=None) -> int:
     requested_designs = int(settings.get('number_of_final_designs', 1))
     design_settings = build_design_settings(settings)
+    declare_longest_native_length(design_settings, alphafold_model, key)
     target_chain_prefix = design_settings.target_chain_prefix
     receptor_chains = receptor_chain_layouts(design_settings)
     trajectories_dir = stage_folder(project_folder, TRAJECTORY_STAGE)
