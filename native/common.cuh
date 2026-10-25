@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -223,6 +224,22 @@ struct Slot { void* p; size_t n; };
 // are that module's, without enumerating them by hand in a header that will
 // drift.  tplembed uses that to prove its scratch is throwaway.
 inline std::vector<Slot>& ledger() { static std::vector<Slot> v; return v; }
+// WHERE EACH LIVE POINTER SITS IN IT, so a free is a lookup.  The free
+// below used to SCAN the ledger, which only grows (a freed slot is nulled,
+// never erased -- the evo/tpl ranges are indices into it): every model swap
+// frees one model's packs and allocates the next, so each swap cost
+// packs x ledger and the C++ driver's default campaign, which resamples a
+// model every step, slowed quadratically until trajectory 11 looked hung
+// (100% CPU in DesignStep::setWeights, 0% GPU).  A pointer can sit in
+// more than one slot (a donor's base is also the first range it donates).
+inline std::unordered_map<void*, std::vector<size_t>>& ledgerAt() {
+  static std::unordered_map<void*, std::vector<size_t>> m;
+  return m;
+}
+inline void ledgerPush(void* p, size_t n) {
+  ledgerAt()[p].push_back(ledger().size());
+  ledger().push_back(Slot{p, n});
+}
 
 // DONATION.  The template stack holds a second complete set of pair scratch
 // -- 6.2 GB at N=736 -- and never runs beside the Evoformer: it is first in
@@ -343,12 +360,12 @@ inline cudaError_t mallocReusing(void** p, size_t n) {
       *p = d;
       donated().insert(d);
       pool[p] = Slot{d, n};
-      ledger().push_back(Slot{d, n});
+      ledgerPush(d, n);
       return cudaSuccess;
     }
   }
   cudaError_t e = ::cudaMalloc(p, n);
-  if (e == cudaSuccess) { pool[p] = Slot{*p, n}; ledger().push_back(Slot{*p, n}); }
+  if (e == cudaSuccess) { pool[p] = Slot{*p, n}; ledgerPush(*p, n); }
   return e;
 }
 
@@ -412,8 +429,11 @@ inline cudaError_t freeUnlessReusing(void* p) {
   if (active()) return cudaSuccess;
   if (donated().count(p)) return cudaSuccess;   // not ours to free
   neverLend().erase(p);
-  for (Slot& s : ledger())
-    if (s.p == p) { s.p = nullptr; s.n = 0; }
+  auto at = ledgerAt().find(p);
+  if (at != ledgerAt().end()) {
+    for (size_t i : at->second) ledger()[i] = Slot{nullptr, 0};
+    ledgerAt().erase(at);
+  }
   return ::cudaFree(p);
 }
 
