@@ -76,7 +76,12 @@ struct Key {
   }
 };
 
-std::mutex g_mu;
+// RECURSIVE, because the design handlers hold it for the WHOLE call and
+// ds_get takes it again inside.  bc2 compiles the next length bucket on a
+// background thread, and that trace preallocates through ds_get: on the
+// shared object it swapped weights (freeing the packs) and re-derived the
+// length while the main thread was enqueuing a step on it.
+std::recursive_mutex g_mu;
 std::map<Key, stack::Stack*> g_stacks;
 std::map<std::string, Oracle*> g_weights;
 
@@ -120,7 +125,7 @@ double now_ms() {
 stack::Stack* get(int N, int S, int depth, const std::string& dir,
                   bool pair_only, bool opm_first, bool dropout,
                   bool defer_keep = false) {
-  std::lock_guard<std::mutex> lk(g_mu);
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
   Oracle*& w = g_weights[dir];
   if (!w) w = new Oracle(dir);
   Key k{N, S, depth, pair_only, opm_first, dropout, dir};
@@ -382,7 +387,7 @@ struct TKey {
 std::map<TKey, tplstack::TplStack*> g_tpl;
 
 tplstack::TplStack* tpl_get(int N, int depth, const std::string& dir) {
-  std::lock_guard<std::mutex> lk(g_mu);
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
   TKey k{N, depth, dir};
   auto it = g_tpl.find(k);
   if (it != g_tpl.end()) return it->second;
@@ -504,7 +509,7 @@ std::map<SKey, SmHeads*> g_sm;
 
 SmHeads* sm_get(int N, int depth, const std::string& dir,
                 cudaStream_t stream) {
-  std::lock_guard<std::mutex> lk(g_mu);
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
   SKey k{N, depth, dir};
   auto it = g_sm.find(k);
   if (it != g_sm.end()) { it->second->sm.setStream(stream);
@@ -661,7 +666,7 @@ std::map<EKey, embed::Embed*> g_emb;
 
 embed::Embed* emb_get(int N, int S, const std::string& dir,
                       cudaStream_t stream) {
-  std::lock_guard<std::mutex> lk(g_mu);
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
   EKey k{N, S, dir, stream};
   auto it = g_emb.find(k);
   if (it != g_emb.end()) return it->second;
@@ -745,7 +750,7 @@ std::map<TEKey, tplembed::TplEmbed*> g_te;
 
 tplembed::TplEmbed* te_get(int N, int depth, const std::string& dir,
                            cudaStream_t stream) {
-  std::lock_guard<std::mutex> lk(g_mu);
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
   TEKey k{N, depth, dir};
   auto it = g_te.find(k);
   if (it != g_te.end()) { it->second->setStream(stream); return it->second; }
@@ -1340,7 +1345,7 @@ static std::map<DsKey, design_step::DesignStep*> g_ds;
 design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
                                 tpl1d::Tables t1, cudaStream_t st,
                                 bool defer_keep = false) {
-  std::lock_guard<std::mutex> lk(g_mu);
+  std::lock_guard<std::recursive_mutex> lk(g_mu);
   auto W = [&](const std::string& d) -> Oracle& {
     Oracle*& w = g_weights[d];
     if (!w) w = new Oracle(d);
@@ -1396,8 +1401,27 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
     kk.trunk = kk.extra = kk.tpl = kk.post = kk.emb = regime;
   }
   auto it = g_ds.find(kk);
+  // A STEP THAT CAN DROP SERVES ONE THAT DOES NOT.  `dropout` in the key is
+  // whether the stacks reserved their mask scratch; whether a mask is drawn
+  // is seed[1], per call.  bc2's predicts (mutate, validation of the design
+  // model) ask with dropout 0 and built a second multimer object beside the
+  // design's -- 1.8 GB at complex 256, and the campaign ran out of memory at
+  // trajectory 7.  Only this direction: a no-dropout object has no masks.
+  if (share_models && it == g_ds.end() && !kk.dropout) {
+    DsKey kd = kk;
+    kd.dropout = 1;
+    it = g_ds.find(kd);
+  }
   if (it != g_ds.end()) {
     it->second->setStream(st);
+    // TOO LONG FOR THIS OBJECT: say so before the weights move, or the
+    // overflow surfaces as an illegal address in whatever runs next
+    if (oneObject() && k.nmax > it->second->nmax_alloc) {
+      fprintf(stderr, "design_step: NMAX %d past the allocation's %d -- the "
+              "caller must declare its longest length before the first "
+              "trace (bc2: set_alloc_floor)\n", k.nmax, it->second->nmax_alloc);
+      exit(1);
+    }
     // a no-op when this object already holds these weights
     if (share_models)
       it->second->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post),
@@ -1436,6 +1460,13 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   m->alloc(p, st);
   m->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post), W(k.emb), t, t1);
   g_ds[kk] = m;
+  // A NEW OBJECT IS ~2 GB AT COMPLEX 256, so say which key asked for it:
+  // a second one beside the design's is the first thing to look for when a
+  // campaign runs out of memory late.
+  fprintf(stderr, "native: design object #%zu built: %s nmax %d recycles %d "
+          "msa_rows %d dropout %d lean %d\n", g_ds.size(),
+          mono ? "monomer" : "multimer", k.nmax, k.recycles, k.msa_rows,
+          k.dropout, k.lean);
   return m;
 }
 
@@ -1772,6 +1803,7 @@ ffi::Error DesignStepPredictImpl(
           std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
+  std::lock_guard<std::recursive_mutex> call_lk(g_mu);   // see g_mu
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
   // bc2's cyclic_offset_mode, target_flexibility and initial_atom_pos
@@ -1863,6 +1895,7 @@ ffi::Error DesignStepImpl(
           std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
+  std::lock_guard<std::recursive_mutex> call_lk(g_mu);   // see g_mu
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
   // bc2's cyclic_offset_mode, target_flexibility and initial_atom_pos
@@ -1980,6 +2013,7 @@ ffi::Error DesignStepBwdImpl(
           std::string(trunk_dir),
           std::string(extra_dir), std::string(tpl_dir), std::string(post_dir),
           std::string(emb_dir)};
+  std::lock_guard<std::recursive_mutex> call_lk(g_mu);   // see g_mu
   auto* m = ds_get(k, t, t1, st);
   m->st = st;
   // bc2's cyclic_offset_mode, target_flexibility and initial_atom_pos
