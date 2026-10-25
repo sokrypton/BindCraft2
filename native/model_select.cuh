@@ -40,6 +40,21 @@ inline std::vector<std::string> multimerPool() {
   return p;
 }
 
+// bc2's MONOMER_POOL: what a monomer-validated campaign refolds on, and
+// where an exhausted multimer pool falls back
+inline std::vector<std::string> monomerPool() {
+  return {"model_1_ptm", "model_2_ptm"};
+}
+
+// params_<name>.npz beside the checkpoint the campaign was given
+inline std::string siblingParams(const std::string& params,
+                                 const std::string& name) {
+  const size_t slash = params.find_last_of('/');
+  const std::string dir = slash == std::string::npos ? std::string(".")
+                                                     : params.substr(0, slash);
+  return dir + "/params_" + name + ".npz";
+}
+
 // `sorted(random.Random(seed).sample(pool, k))`
 inline std::vector<std::string> sample(const std::vector<std::string>& pool,
                                        int k, int seed) {

@@ -507,7 +507,8 @@ inline void sample(const Weights& w, const Input& in,
                    const std::vector<int>* force = nullptr,
                    const std::vector<int>* order_in = nullptr,
                    std::vector<float>* out_logits = nullptr,
-                   const std::vector<std::vector<int>>* groups = nullptr) {
+                   const std::vector<std::vector<int>>* groups = nullptr,
+                   const std::vector<float>* free_bias = nullptr) {
   Features f;
   features(w, in, &f);
   const int L = f.L, K = f.K;
@@ -617,6 +618,13 @@ inline void sample(const Weights& w, const Input& in,
     // the bias: a fixed position is pinned to its own letter.  Added
     // BEFORE the mean, as bc2 adds it before `logits_t.mean(0)`.
     if (fixed[i]) logits[(size_t)fixed_aa_mpnn[i]] += 1e7f;
+    // and on every REDESIGNED row, bc2's `redesigned_amino_acid_bias`:
+    // log(w) per aa_bias letter and OMITTED_AMINO_ACID_LOGIT (-10000) per
+    // banned one, times the temperature (the draw divides by it, so the
+    // shift arrives as exactly log(w)).  Without it binder.json's {"C": 0}
+    // banned cysteine in the design stages and MPNN put it straight back.
+    else if (free_bias)
+      for (int v = 0; v < VOCAB; ++v) logits[(size_t)v] += (*free_bias)[(size_t)v];
     for (int v = 0; v < VOCAB; ++v) glog[(size_t)v] += logits[(size_t)v];
    }
    // the MEAN over the group, then ONE gumbel draw, and the argmax over

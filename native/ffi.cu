@@ -1378,9 +1378,30 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
     }
     t1.chi_pi_periodic = g_chipp;
   }
-  auto it = g_ds.find(k);
+  // ONE OBJECT PER REGIME, NOT PER MODEL.  bc2's default campaign designs
+  // on all five multimer models (resampled every call) and validates on two
+  // monomer ones, and keying on the weight directories built a design
+  // object PER MODEL -- 1.85 GB each at complex 224, so the fifth left
+  // 1.9 GB and the first validation died in structmod.  The C++ driver
+  // never had this: it swaps weights into one object (syncStepbWeights).
+  // Same here: the key names the REGIME (the object's shape depends on it),
+  // and a hit on another model's weights re-sets them.  Safe because no
+  // state that depends on the weights outlives a call -- the backward's
+  // trunk carry comes back from XLA's buffers, and one gradient call never
+  // mixes models.  NB_SHARE_MODELS=0 restores an object per model.
+  static const bool share_models = envOnDef("NB_SHARE_MODELS", true);
+  DsKey kk = k;
+  if (share_models) {
+    const std::string regime = mono ? "monomer" : "multimer";
+    kk.trunk = kk.extra = kk.tpl = kk.post = kk.emb = regime;
+  }
+  auto it = g_ds.find(kk);
   if (it != g_ds.end()) {
     it->second->setStream(st);
+    // a no-op when this object already holds these weights
+    if (share_models)
+      it->second->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post),
+                             W(k.emb), t, t1);
     // RE-SET THE TABLE POINTERS EVERY CALL.  setWeights STORES them
     // (`tables = t`, `t1d_tab = t1`) and they are device pointers into
     // XLA's buffers, which the trace-time prealloc does not have and which
@@ -1414,7 +1435,7 @@ design_step::DesignStep* ds_get(const DsKey& k, inputfeat::Tables t,
   nbrealloc::allocN() = k.nmax;
   m->alloc(p, st);
   m->setWeights(W(k.trunk), W(k.extra), W(k.tpl), W(k.post), W(k.emb), t, t1);
-  g_ds[k] = m;
+  g_ds[kk] = m;
   return m;
 }
 

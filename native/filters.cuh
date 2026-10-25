@@ -1278,11 +1278,12 @@ inline float cyclicClosureDistance(const std::vector<float>& atoms,
 // binder whose whole chain moved would otherwise be held entirely and
 // ProteinMPNN would be asked to redesign nothing.
 //
-// This is not an induced-fit feature.  `prepare_binder_redesign` computes
-// it whenever a binder_alone prediction exists, which is every campaign
-// that weights a loss on the free fold -- so on bc2's default campaign
-// ProteinMPNN is handed a partly frozen binder and the port was handing
-// it a free one.
+// This is not only an induced-fit feature: `imposed_residues` computes it
+// whenever a binder_alone prediction exists -- a hinge, a fold switch, a
+// binder_shapes free fold (required_final_states).  bc2's DEFAULT campaign
+// has none (every loss reads the complex; checked 2026-10-24 against
+// build_losses on the composed campaign), so there ProteinMPNN holds only
+// the interface.  The caller decides; this only computes the set.
 inline std::vector<char> inducedFitMobile(const std::vector<float>& atoms,
                                           const std::vector<float>& atom_mask,
                                           const std::vector<char>& is_binder,

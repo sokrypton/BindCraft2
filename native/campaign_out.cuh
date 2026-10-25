@@ -501,6 +501,41 @@ inline std::string acceptedTable(const std::string& project) {
   return stageTable(project, RANK_STAGE);
 }
 
+// ---- bc2's `redesigned_sequence`: one ProteinMPNN draw per sequence ----
+//
+// `distinct_sequence_candidates` skips a draw already made in this
+// trajectory or ANYWHERE in the project, which it reads off
+// `.redesigned_sequences.txt` -- seeded on first use from the refold and
+// accepted tables (`redesigned_binder_sequences`), appended per new draw,
+// all under the folder lock so workers sharing a campaign agree.  Returns
+// true when `sequence` was ALREADY drawn (and then records nothing).
+static const char* REDESIGNED_FILENAME = ".redesigned_sequences.txt";
+inline bool isFile(const std::string& path);   // below, with the directory helpers
+inline bool redesignedSequence(const std::string& project,
+                               const std::string& sequence) {
+  const std::string path = project + "/" + REDESIGNED_FILENAME;
+  const FolderLock hold(path);
+  if (!isFile(path)) {
+    std::set<std::string> seen;
+    for (const std::string& table : {stageTable(project, REFOLD_STAGE),
+                                     acceptedTable(project)})
+      for (const Row& r : readMetricRows(table).rows) {
+        std::string q = r.get("Binder_Sequence");
+        q.erase(std::remove(q.begin(), q.end(), '/'), q.end());
+        if (!q.empty()) seen.insert(q);
+      }
+    std::ofstream f(path);
+    for (const std::string& q : seen) f << q << "\n";
+  }
+  {
+    std::ifstream f(path);
+    std::string q;
+    while (f >> q) if (q == sequence) return true;
+  }
+  std::ofstream(path, std::ios::app) << sequence << "\n";
+  return false;
+}
+
 // ---- ranking ------------------------------------------------------------
 //
 // `on_target_mean(row, metric)`: a per-target metric is ONE cell holding

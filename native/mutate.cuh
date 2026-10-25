@@ -87,6 +87,15 @@ struct Semigreedy {
   bool scored = false;
   float best = 0.f;
   std::vector<float> best_logits;
+  // THE BANNED LETTERS, PER LETTER AND KEPT.  bc2 caches
+  // `omitted_amino_acid_mask(sequence).any(0)` once per chain (setdefault),
+  // so a ban survives the one-hot a mutation writes over its row.  Reading
+  // it off the row each time lost it the moment a row went one-hot, and
+  // the driver's raw logits never carried it to begin with.
+  std::vector<char> banned;
+  bool isBanned(const float* row, int a) const {
+    return omitted(row[a]) || (a < (int)banned.size() && banned[(size_t)a]);
+  }
 
   explicit Semigreedy(uint32_t seed, int binder_len)
       : rng(seed), plddt((size_t)binder_len, 0.f),
@@ -155,7 +164,7 @@ struct Semigreedy {
     std::vector<double> q((size_t)naa);
     double mx = -1e300;
     for (int a = 0; a < naa; ++a) {
-      double v = omitted(row[a]) ? (double)OMITTED_LOGIT : (double)row[a];
+      double v = isBanned(row, a) ? (double)OMITTED_LOGIT : (double)row[a];
       if (a == cur) v -= 1e8;
       q[a] = v; mx = std::max(mx, v);
     }
@@ -191,7 +200,7 @@ struct Semigreedy {
     std::vector<double> q((size_t)naa);
     double mx = -1e300;
     for (int a = 0; a < naa; ++a) {
-      double v = omitted(row[a]) ? (double)OMITTED_LOGIT : (double)row[a];
+      double v = isBanned(row, a) ? (double)OMITTED_LOGIT : (double)row[a];
       if (a == cur) v -= 1e8;
       q[a] = v; mx = std::max(mx, v);
     }
