@@ -674,7 +674,15 @@ class AlphaFoldDesignModel(DifferentiableProteinPredictor):
         loss_signature = tuple((name, losses[name].function, losses[name].required_states) for name in sorted(losses))
         state_subbatch_sizes = tuple((state_name, resolve_subbatch_size(sum(chain_lengths), subbatch_size)) for state_name, _, chain_lengths in complex_shapes)
         attention_backend = attention_backend or self.attention_backend
-        cache_key = model_family, complex_shapes, reference_shapes, loss_signature, state_subbatch_sizes, self.multi_chain_binders, self.num_recycle, self.target_flexibility, self.large_complex_initialization, attention_backend
+        # THE NATIVE STEP BAKES ITS MODEL'S WEIGHT DIRECTORIES into the
+        # compiled function (FFI attributes are static), so on that path the
+        # cache is per MODEL, not per family.  Keyed on the family alone, the
+        # first model of a pool served every later one: a five-model design
+        # ran model_1's network every step while XLA's side read the drawn
+        # model's parameters.  The kernels share one object across models
+        # (ffi.cu ds_get swaps the weights), so this costs compiles, not memory.
+        native_model = model if (self.native_installed and not _native_step_off()) else None
+        cache_key = model_family, complex_shapes, reference_shapes, loss_signature, state_subbatch_sizes, self.multi_chain_binders, self.num_recycle, self.target_flexibility, self.large_complex_initialization, attention_backend, native_model
         compiled_gradient = self.gradient_compile_cache.get(cache_key)
         if compiled_gradient is None:
             state_alphafold_runners = {state_name: self._alphafold_runner(model_family, subbatch_size, attention_backend) for state_name, subbatch_size in state_subbatch_sizes}
