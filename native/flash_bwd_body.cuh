@@ -602,6 +602,30 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
                : __float2half(0.f);                                            \
   }
   if (FB_PREFETCH) FB_LOAD_KV(0);
+  // THE BIAS, A TILE AHEAD.  The softmax below reads eight half2 of the pair
+  // bias a lane per key tile, and read in place they were exposed global
+  // latency on the critical path between S and P.  Issued one tile early, like
+  // K/V, they land under the previous tile's products: 1.09x on this kernel
+  // at N=256 (1.552 -> 1.422 ms), outputs bit-identical.  This is most of what
+  // a raw-PTX rewrite of the kernel bought (1.17x); the rest needed register
+  // layouts WMMA does not expose and was not worth a PTX kernel.
+  // Even N only -- the odd-N path reads the bias a half at a time, in place.
+  half2 bnx[2][2][2];   // [nt][ebase/4][ed/2], BN == 32 is two 16-key tiles
+  auto loadBias = [&](int jb) {
+#pragma unroll
+    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+      for (int eb = 0; eb < 2; ++eb)
+#pragma unroll
+        for (int ed = 0; ed < 2; ++ed) {
+          const int j = jb + nt * 16 + fragCol(lane, eb * 4);
+          const int i = ed ? i_e2 : i_e0;
+          const half* br = ed ? bias_e2 : bias_e0;
+          bnx[nt][eb][ed] = (i < N && j < N) ? *(const half2*)(br + j) : __floats2half2_rn(0.f, 0.f);
+        }
+  };
+  const bool evenN_ = (N & 1) == 0;
+  if (evenN_) loadBias(0);
 
 #if FB_UNROLLJ > 1
 #pragma unroll 2
@@ -631,7 +655,11 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
       int j = j0 + tid;
       lseS[tid] = j < N ? 1e9f * (mask[(size_t)b * N + j] - 1.f) : 0.f;
     }
+    half2 bcur[2][2][2];
+#pragma unroll
+    for (int a_ = 0; a_ < 8; ++a_) (&bcur[0][0][0])[a_] = (&bnx[0][0][0])[a_];
     FB_BAR();
+    if (evenN_ && j0 + BN < N) loadBias(j0 + BN);
     // issued here, consumed at the top of the next iteration: everything
     // between is cover
     if (FB_PREFETCH && j0 + BN < N) FB_LOAD_KV(j0 + BN);
@@ -675,7 +703,7 @@ __global__ void __launch_bounds__(32 * WARPS) flashBwdK(
             float p0 = 0.f, p1 = 0.f;
             if (i < N && j < N) {
               if (evenN) {
-                half2 b2 = *(const half2*)(bias_r + j);
+                half2 b2 = bcur[nt][ebase >> 2][ed >> 1];
                 float sv0 = c.x[e] * LOG2E_ + __low2float(b2) + mk0 * LOG2E_;
                 p0 = exp2f(sv0 - lse_r);
                 float sv1 = c.x[e + 1] * LOG2E_ + __high2float(b2) + mk1 * LOG2E_;
