@@ -29,24 +29,23 @@
 // log2-domain lse, dS = P (dP - D); dnbb [H][N][N] (or its int64 fixed point, nbbFixed's 2^40) accumulates dS over the
 // batch; q carries the softmax scale, so dQ = dS K and dK = dS^T Q unscaled.
 //
-// MEASURED HERE AGAINST flashBwdK (lfbwdgate.cu, A100 40 GB; the A10 these kernels were tuned on is not measured):
-//   D 32, N 256, 256 rows: flashBwdK + its dK/dV scatter 1.170 ms, this 0.506 (2.31x)
-//   D 16, N 256, 256 rows:                                0.685 ms,      0.385 (1.78x)
-//   D 32, N 522,  64 rows:                                1.281 ms,      0.625 (2.05x)
-//   D 16, N 522,  64 rows:                                0.740 ms,      0.507 (1.46x)
-// (against this directory's vendored flashBwdK, 7b6232f. ColabDesign2's 70f52d0 loads its pair bias a key tile ahead
-// and narrows the gap to 1.88 / 1.62 / 1.58 / 1.30x - its lf-flash-bwd branch has the same files.)
+// MEASURED (lfbwdgate.cu, A100 40 GB; the A10 these kernels were tuned on is not) against ColabDesign2's flashBwdK as of
+// 70f52d0 - this directory's vendored copy is older and slower, 2.29x / 1.78x at N 256:
+//   D 32, N 256, 256 rows: flashBwdK + its dK/dV scatter 0.951 ms, this 0.506 (1.88x)
+//   D 16, N 256, 256 rows:                                0.624 ms,      0.385 (1.62x)
+//   D 32, N 522,  64 rows:                                0.984 ms,      0.623 (1.58x)
+//   D 16, N 522,  64 rows:                                0.661 ms,      0.509 (1.30x)
 // gradients against flashBwdK's: dQ, dK rel rms 1.1e-3 (dS rounded to f16 for the dQ/dK products, bf16 outputs),
 // dV 4e-5, dnbb 2e-4.
 //
-// WIRING IT INTO triattn_body.cuh (not done: this box has none of the module oracles that gate it). In the row-chunk
-// loop, in place of the dKf/dVf memsets, flashBwdK and scatterQKVK:
-//   lfb::backward<D>(qkvgAt(cr0), 4 * C, biasH, davH, lseF + cr0 * H * N, lseD + cr0 * H * N, mask + cr0 * N,
-//                    dcomb, TOT, dnbbF or nullptr, dnbbI or nullptr, dKf /* as dQ's f32 scratch */, cnt, crows, N, H, st);
-// dQ, dK and dV are then all in dcomb's QKV columns, so after the loop only dnbb's columns are missing: the TA_SPLIT
-// branch without its scatterQKVK (nbbScatterK, then the dx GEMM). scatterDxK, which fuses the scatter into the GEMM,
-// reads dK/dV from f32 and does not apply. cnt is [crows][H] unsigned; dVf is no longer needed. msarow.cuh's call is the
-// same kernel at D 32 if its mask and lse follow the same convention (not checked).
+// WIRED IN: triattn_body.cuh (both widths) and msarow.cuh call it in place of flashBwdK - dQ, dK, dV land in dcomb
+// (msarow's unscaled by lscale[1] as they are written), so the dKf/dVf memsets, their unscaling, scatterQKVK and
+// scatterDxK do not run (dKf is dQ's f32 scratch); after the loop only dnbb's columns are scattered before the dx
+// GEMM. TA_FB_OLD=1 runs flashBwdK, the A/B. Against JAX oracles written by ColabDesign2's oracle.py at N 256 every
+// gradient is flashBwdK's to the fourth digit of its cosine; module backwards here (A100, this directory's flashBwdK ->
+// this): triattn starting 1.587 -> 0.980 ms, ending 1.686 -> 1.080, TA_ROWS=64 2.119 -> 1.323, NE_NONDET_NBB
+// 1.587 -> 0.985; block 5.272 -> 4.015; tplblock 2.578 -> 2.068; msarow (2 sequences) 0.248 -> 0.189.
+// (In ColabDesign2, whose flashBwdK is newer: triattn 1.259 -> 0.950, block 4.484 -> 3.866.)
 #pragma once
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -113,6 +112,8 @@ struct Args {
   float* dnbb; long long* dnbbI;         // [H][N][N]: one of the two (dnbbI: int64 fixed point, 2^40)
   unsigned* cnt;                         // [rows][H], zeroed: key blocks finished (the last narrows dQ)
   int N, H;
+  const float* oscale;                   // dQ, dK, dV multiplied by *oscale as they land (msarow's cotangent scale's
+                                         // inverse, lscale + 1); null: 1. dnbb is not scaled.
 };
 
 template <int D>
@@ -126,6 +127,7 @@ __global__ void __launch_bounds__(THREADS, 3) lfFlashBwdK(Args a) {
   uint16_t* Sb = Tb + 2 * QT * LB;                                // dS^T [BC][QT], 16-byte chunks XOR-swizzled by row
   float* QV = reinterpret_cast<float*>(Sb + BC * QT);             // [2][QT][4]: lse, D
   const int N = a.N, H = a.H, W = H * D;
+  const float osc = a.oscale ? *a.oscale : 1.f;
   const int nkb = (N + BC - 1) / BC;
   const int kb = blockIdx.x % nkb, h = (blockIdx.x / nkb) % H, b = blockIdx.x / (nkb * H);
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -347,7 +349,7 @@ __global__ void __launch_bounds__(THREADS, 3) lfFlashBwdK(Args a) {
         const int qq = i / (D / 4), c = (i % (D / 4)) * 4;
         const float4 v = __ldcg(reinterpret_cast<const float4*>(dqb + (size_t)qq * W + c));
         *reinterpret_cast<uint2*>(a.dcomb + ((size_t)b * N + qq) * a.tot + h * D + c) =
-            make_uint2(bf2(v.x, v.y), bf2(v.z, v.w));
+            make_uint2(bf2(v.x * osc, v.y * osc), bf2(v.z * osc, v.w * osc));
       }
     }
   }
@@ -359,8 +361,8 @@ __global__ void __launch_bounds__(THREADS, 3) lfFlashBwdK(Args a) {
     __nv_bfloat16* row = a.dcomb + ((size_t)b * N + kk) * a.tot + h * D;
 #pragma unroll
     for (int n = 0; n < D / 8; ++n) {
-      *reinterpret_cast<uint32_t*>(row + W + n * 8 + 2 * t) = bf2(dka[n][r * 2], dka[n][r * 2 + 1]);
-      *reinterpret_cast<uint32_t*>(row + 2 * W + n * 8 + 2 * t) = bf2(dva[n][r * 2], dva[n][r * 2 + 1]);
+      *reinterpret_cast<uint32_t*>(row + W + n * 8 + 2 * t) = bf2(dka[n][r * 2] * osc, dka[n][r * 2 + 1] * osc);
+      *reinterpret_cast<uint32_t*>(row + 2 * W + n * 8 + 2 * t) = bf2(dva[n][r * 2] * osc, dva[n][r * 2 + 1] * osc);
     }
   }
 }
@@ -372,7 +374,8 @@ inline size_t smem() { return 2 * (BC * LK<D>() + 4 * QT * LK<D>() + 2 * QT * LB
 template <int D>
 inline void backward(const half* qkvg, int projLD, const half* bias, const half* dO, const float* lse,
                      const float* Dv, const float* mask, __nv_bfloat16* dcomb, int tot, float* dnbb,
-                     long long* dnbbI, float* dq, unsigned* cnt, int rows, int N, int H, cudaStream_t st) {
+                     long long* dnbbI, float* dq, unsigned* cnt, int rows, int N, int H, cudaStream_t st,
+                     const float* oscale = nullptr) {
   static bool attr = false;
   if (!attr) {
     cudaFuncSetAttribute(lfFlashBwdK<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem<D>());
@@ -381,7 +384,7 @@ inline void backward(const half* qkvg, int projLD, const half* bias, const half*
   }
   cudaMemsetAsync(dq, 0, (size_t)rows * N * H * D * 4, st);
   cudaMemsetAsync(cnt, 0, (size_t)rows * H * 4, st);
-  Args a{qkvg, projLD, dO, bias, N % 8 == 0, mask, lse, Dv, dq, dcomb, tot, dnbb, dnbbI, cnt, N, H};
+  Args a{qkvg, projLD, dO, bias, N % 8 == 0, mask, lse, Dv, dq, dcomb, tot, dnbb, dnbbI, cnt, N, H, oscale};
   const size_t grid = (size_t)((N + BC - 1) / BC) * H * rows;
   lfFlashBwdK<D><<<(unsigned)grid, THREADS, smem<D>(), st>>>(a);
 }

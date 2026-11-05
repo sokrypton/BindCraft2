@@ -19,6 +19,7 @@
 #include "lt.cuh"
 #include "lf_flash.cuh"
 #include "flash_bwd.cuh"
+#include "lf_flash_bwd.cuh"
 
 namespace mrow {
 
@@ -199,6 +200,7 @@ struct MsaRow {
   // and that is what stopped a design trajectory reproducing.  See
   // nbbFixed in flash_bwd_body.cuh; NE_NONDET_NBB=1 restores them.
   long long* dnbbI = nullptr;
+  unsigned* lfCnt = nullptr;   // lf_flash_bwd's per-(row, head) key-block counter, [S][H]
   // dynamic loss scaling for the f16 attention backward: [0] scales the
   // cotangent down, [1] scales the three gradients back up.  See common.cuh.
   float* lscale = nullptr;
@@ -338,8 +340,13 @@ struct MsaRow {
     pickScaleK<<<1, 1, 0, st>>>(lmax, lscale, 1024.f);
     scaleHalfByK<<<(nmw + 255) / 256, 256, 0, st>>>(davH, lscale, nmw);
     fb::rowDotK<<<((size_t)S * N * H + 255) / 256, 256, 0, st>>>(davH, avH, Dv, N, H, D, S);
-    CU(cudaMemsetAsync(dKf, 0, Mm * W * 4, st));
-    CU(cudaMemsetAsync(dVf, 0, Mm * W * 4, st));
+    // THE BACKWARD IS lf_flash_bwd.cuh's: dQ, dK and dV land in dcomb unscaled (lscale[1]) as the kernel writes
+    // them, so neither the dKf/dVf memsets, their unscaling nor scatterQKVK runs. TA_FB_OLD runs flashBwdK, the A/B.
+    const bool lf = !envOn("TA_FB_OLD");
+    if (!lf) {
+      CU(cudaMemsetAsync(dKf, 0, Mm * W * 4, st));
+      CU(cudaMemsetAsync(dVf, 0, Mm * W * 4, st));
+    }
     CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * Mp * 4, st));
     if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * Mp * 8, st));
     static bool once = false;
@@ -350,20 +357,27 @@ struct MsaRow {
       once = true;
     }
     dim3 g((N + fb::BM - 1) / fb::BM, H, S);
-    fb::flashBwdK<true, true, false, true><<<g, 32 * fb::WARPS, fb::bwdSmem(), st>>>(
-        qkvgH, TOT, biasH, davH, lseF, Dv, mask, nullptr, dQf, dKf, dVf, N, H,
-        dnbbF, dnbbI);
+    if (lf) {
+      if (!lfCnt) CU(cudaMalloc(&lfCnt, (size_t)S * H * sizeof(unsigned)));
+      lfb::backward<D>(qkvgH, TOT, biasH, davH, lseF, Dv, mask, dcomb, TOT, dnbbF, dnbbI, dKf, lfCnt, S, N, H, st,
+                       lscale + 1);
+    } else
+      fb::flashBwdK<true, true, false, true><<<g, 32 * fb::WARPS, fb::bwdSmem(), st>>>(
+          qkvgH, TOT, biasH, davH, lseF, Dv, mask, nullptr, dQf, dKf, dVf, N, H,
+          dnbbF, dnbbI);
     if (dnbbI)
       fb::nbbFromFixedK<<<(int)(((size_t)H * Mp + 255) / 256), 256, 0, st>>>(
           dnbbI, dnbbF, (size_t)H * Mp);
     // and unscale the three gradients the kernel produced, before anything
     // reads them
-    scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dQf, lscale, 1, nmw);
-    scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dKf, lscale, 1, nmw);
-    scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dVf, lscale, 1, nmw);
+    if (!lf) {
+      scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dQf, lscale, 1, nmw);
+      scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dKf, lscale, 1, nmw);
+      scaleFloatByK<<<(nmw + 255) / 256, 256, 0, st>>>(dVf, lscale, 1, nmw);
+    }
     scaleFloatByK<<<((size_t)H * Mp + 255) / 256, 256, 0, st>>>(
         dnbbF, lscale, 1, (size_t)H * Mp);
-    scatterQKVK<<<(Mm * W + 255) / 256, 256, 0, st>>>(dQf, dKf, dVf, dcomb, Mm);
+    if (!lf) scatterQKVK<<<(Mm * W + 255) / 256, 256, 0, st>>>(dQf, dKf, dVf, dcomb, Mm);
     lt.matmul(Mm, CM, TOT, dcomb, wcat, dx, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
               nullptr, nullptr, st);
     lnBwdK<CM><<<(Mm + 7) / 8, 256, 0, st>>>(dx, msa, qn_s, mu, rstd, dmsa, Mm);
