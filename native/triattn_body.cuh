@@ -18,6 +18,7 @@
 
 #include "lf_flash.cuh"
 #include "flash_bwd.cuh"
+#include "lf_flash_bwd.cuh"
 
 namespace TA_NS {
 
@@ -650,6 +651,7 @@ struct TriAttn {
   cudaGraphExec_t graph = nullptr;
   int N, M;
   bool ending;
+  unsigned* lfCnt = nullptr;   // lf_flash_bwd's per-(row, head) key-block counter, [row chunk][H]
 
   const float *ln_scale, *ln_offset;
   // `w`/`dw` were the materialised [N][H][N][N] attention weights of the
@@ -1265,6 +1267,10 @@ struct TriAttn {
     // is 3.6 ms FASTER standalone and 3.4 ms SLOWER in the model -- see the
     // README.  The model is what ships.
     const bool probe = envOn("NO_DKV") || envOn("NO_DNBB") || envOn("TA_ZEROK");
+    // THE BACKWARD IS lf_flash_bwd.cuh's (a CTA a key block: dK and dV summed in registers and written into dcomb as
+    // bf16, so no dKf/dVf memsets, no scatter, no scatterDxK); TA_FB_OLD runs flashBwdK, the A/B it was decided on.
+    const bool lf = !probe && !envOn("TA_FB_OLD");
+    if (lf && !lfCnt) CU(cudaMalloc(&lfCnt, (size_t)taRows * H * sizeof(unsigned)));
     if (!envOn("PROBE_NOZERO")) {
       if (!envOn("TA_ZEROK")) {
         if (dnbbI) CU(cudaMemsetAsync(dnbbI, 0, (size_t)H * M * 8, st));
@@ -1383,6 +1389,16 @@ struct TriAttn {
             dag, avH + (size_t)cr0 * N * C,
             qkvgAt(cr0), davH, dcomb,
             lseD + (size_t)cr0 * H * N, N, Mc));
+        if (lf) {   // (dKf is dQ's f32 scratch: the kernel zeroes it and its counters)
+          PROF_STEP("ta.b flashBwd",
+            lfb::backward<D>(qkvgAt(cr0), 4 * C, biasH, davH, lseF + (size_t)cr0 * H * N, lseD + (size_t)cr0 * H * N,
+                             mask + (size_t)cr0 * N, dcomb, TOT, dnbbF, dnbbI, dKf, lfCnt, crows, N, H, st));
+          if (taRows < N)
+            PROF_STEP("ta.b gemm dx",
+              lt.matmul((int)Mc, C, TOT, dcomb, wcat, dx + (size_t)cr0 * N * C,
+                        CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT, nullptr, nullptr, st));
+          continue;
+        }
         if (!envOn("PROBE_NOZERO")) {
           CU(cudaMemsetAsync(dKf, 0, (size_t)Mc * C * 4, st));
           CU(cudaMemsetAsync(dVf, 0, (size_t)Mc * C * 4, st));
@@ -1410,7 +1426,7 @@ struct TriAttn {
       }
     // fixed point -> float, once, in a kernel nothing else races with
     // (when scatterDxK runs below, it reads and zeros dnbbI directly)
-    if (dnbbI && (taRows < N || envOn("TA_SPLIT") || probe))
+    if (dnbbI && (taRows < N || envOn("TA_SPLIT") || probe || lf))
       TA_FB::nbbFromFixedK<<<(int)(((size_t)H * M + 255) / 256), 256, 0, st>>>(
           dnbbI, dnbbF, (size_t)H * M);
     }
@@ -1423,6 +1439,12 @@ struct TriAttn {
             dnbbF, wcat, dx, M, H, C, TOT, QKVG));
       if (!dnbbI && !envOn("PROBE_NOZERO"))
         CU(cudaMemsetAsync(dnbbF, 0, (size_t)H * M * 4, st));
+    } else if (lf) {   // dQ, dK, dV, the gate already in dcomb: only dnbb's columns are missing
+      PROF_STEP("ta.b scatter",
+        nbbScatterK<<<((size_t)M * H + 255) / 256, 256, 0, st>>>(dnbbF, dcomb, M, TOT, QKVG, H));
+      PROF_STEP("ta.b gemm dx",
+        lt.matmul(M, C, TOT, dcomb, wcat, dx, CUDA_R_16BF, CUBLASLT_EPILOGUE_DEFAULT,
+                  nullptr, nullptr, st));
     } else
     // TA_SPLIT runs the old scatter-then-GEMM pair, which is the A/B this was
     // decided on and the fallback if a card ever disagrees.
