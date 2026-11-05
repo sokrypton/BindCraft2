@@ -34,6 +34,8 @@
 //   D 16, N 256, 256 rows:                                0.685 ms,      0.385 (1.78x)
 //   D 32, N 522,  64 rows:                                1.281 ms,      0.625 (2.05x)
 //   D 16, N 522,  64 rows:                                0.740 ms,      0.507 (1.46x)
+// (against this directory's vendored flashBwdK, 7b6232f. ColabDesign2's 70f52d0 loads its pair bias a key tile ahead
+// and narrows the gap to 1.88 / 1.62 / 1.58 / 1.30x - its lf-flash-bwd branch has the same files.)
 // gradients against flashBwdK's: dQ, dK rel rms 1.1e-3 (dS rounded to f16 for the dQ/dK products, bf16 outputs),
 // dV 4e-5, dnbb 2e-4.
 //
